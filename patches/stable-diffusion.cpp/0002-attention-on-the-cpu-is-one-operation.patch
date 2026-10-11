@@ -1,0 +1,46 @@
+SPDX-FileCopyrightText: 2023-2026 leejet and the stable-diffusion.cpp contributors
+SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+SPDX-License-Identifier: MIT AND GPL-3.0-or-later
+
+Attention on the CPU is one operation
+
+With SD_USE_SDASM defined, as stable-diffusion.assembly defines it for the library, ggml_ext_attention_ext() builds attention without a mask, of queries, keys and values in single precision, on the CPU backend, as one GGML_OP_FLASH_ATTN_EXT of the same queries, keys and values, at the same precision, unless flash attention or SageAttention was asked for: stable-diffusion.assembly computes it as the graph it replaces computes it, scores, scale, softmax and sum of the values, without the matrix of every score of every head that the graph writes to memory and reads back three times. The heads of q, k and v are views of them, which the operation reads where they are, rather than the copies the graph made of each, and its output is the layout the graph made of its own with a last copy. Where stable-diffusion.assembly's kernel does not take the operation, ggml's own flash attention computes it, from the same single-precision keys and values.
+
+The attention that flash attention or SageAttention was asked for is built as before, with its keys and values in FP16, and so is attention with a mask, a scale of the keys and values, or heads laid out by the caller.
+
+This is stable-diffusion.assembly's own patch, applied to the submodule by cmake/Patches.cmake when CMake configures, after patch 0001; it is not for upstream. stable-diffusion.cpp's part is under the MIT License, and the patch's under the GNU General Public License, version 3 or any later version.
+
+diff --git a/src/core/ggml_extend.cpp b/src/core/ggml_extend.cpp
+index 417d61d..a6e087f 100644
+--- a/src/core/ggml_extend.cpp
++++ b/src/core/ggml_extend.cpp
+@@ -647,6 +647,29 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
+     if (used_flash_attn != nullptr) {
+         *used_flash_attn = false;
+     }
++#ifdef SD_USE_SDASM
++    // stable-diffusion.assembly computes attention without a mask on the CPU as
++    // one operation, in single precision throughout, as the graph at the end of
++    // this function computes it (the scores, their scale, their softmax and the
++    // sum of the values by it), and reads the heads of q, k and v where they are.
++    if (!skip_reshape && mask == nullptr && !flash_attn && !sage_attn && kv_scale == 1.0f &&
++        q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v) && sd_backend_is_cpu(backend)) {
++        const int64_t L_q       = q->ne[1];
++        const int64_t L_k       = k->ne[1];
++        const int64_t N         = q->ne[2];
++        const int64_t d_head    = q->ne[0] / n_head;
++        const int64_t n_kv_head = k->ne[0] / d_head;
++        float scale             = (1.0f / sqrt((float)d_head));
++
++        ggml_tensor* q_heads = ggml_permute(ctx, ggml_reshape_4d(ctx, q, d_head, n_head, L_q, N), 0, 2, 1, 3);
++        ggml_tensor* k_heads = ggml_permute(ctx, ggml_reshape_4d(ctx, k, d_head, n_kv_head, L_k, N), 0, 2, 1, 3);
++        ggml_tensor* v_heads = ggml_permute(ctx, ggml_reshape_4d(ctx, v, d_head, n_kv_head, L_k, N), 0, 2, 1, 3);
++        ggml_tensor* kqv     = ggml_flash_attn_ext(ctx, q_heads, k_heads, v_heads, nullptr, scale, 0, 0);
++        ggml_prec_set_acc(kqv, GGML_PREC_F32);
++        return ggml_reshape_3d(ctx, kqv, d_head * n_head, L_q, N);  // [N, L_q, C]
++    }
++#endif
+     int64_t L_q;
+     int64_t L_k;
+     int64_t C;

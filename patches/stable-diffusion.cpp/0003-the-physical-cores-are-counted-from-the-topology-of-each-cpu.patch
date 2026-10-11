@@ -1,0 +1,23 @@
+SPDX-FileCopyrightText: 2023-2026 leejet and the stable-diffusion.cpp contributors
+SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+SPDX-License-Identifier: MIT
+
+The physical cores are counted from the topology of each CPU
+
+sd_get_num_physical_cores() counts, on Linux, the distinct sets of thread siblings that /sys/devices/system/cpu/cpu<N>/topology/thread_siblings lists, one for each core. It read /sys/devices/system/cpu<N>/topology/thread_siblings, which is no file, so it never found one and always fell back to half the logical processors. That is the number of cores only where every core runs two threads: an i7-1360P has four cores that run two and eight that run one, sixteen logical processors and twelve cores, and was given eight threads. With the path as it is, it is given twelve, which is the number sd-cli takes by default.
+
+A fault of stable-diffusion.cpp, which this patch fixes for stable-diffusion.assembly's builds; it is to be offered upstream, and goes away once it is there. Its change is offered under stable-diffusion.cpp's own license, the MIT License.
+
+diff --git a/src/core/util.cpp b/src/core/util.cpp
+index 5292c38..c4e29fb 100644
+--- a/src/core/util.cpp
++++ b/src/core/util.cpp
+@@ -342,7 +342,7 @@ int32_t sd_get_num_physical_cores() {
+     // enumerate the set of thread siblings, num entries is num cores
+     std::unordered_set<std::string> siblings;
+     for (uint32_t cpu = 0; cpu < UINT32_MAX; ++cpu) {
+-        std::ifstream thread_siblings("/sys/devices/system/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
++        std::ifstream thread_siblings("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
+         if (!thread_siblings.is_open()) {
+             break;  // no more cpus
+         }

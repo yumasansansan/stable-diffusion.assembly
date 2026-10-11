@@ -1,0 +1,51 @@
+SPDX-FileCopyrightText: 2023-2026 The ggml authors
+SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+SPDX-License-Identifier: MIT AND GPL-3.0-or-later
+
+The CPU backend offers its nodes to stable-diffusion.assembly with the nodes after them
+
+The loop of a graph over its nodes calls sdasm_compute_nodes() first, with the graph and the index of the node, which computes the node with stable-diffusion.assembly's kernels when they take it -- along with the nodes after it that change its output in place, element by element, the bias of a convolution or of a linear layer, the scale, the shift and the SiLU after a normalisation -- and says how many nodes of the graph that was, or 0, on every thread alike, when the kernels do not take the node. The loop then goes on past those nodes, or computes the node as it would have. A graph planned for the reference implementation (use_ref) is not offered.
+
+The backend declares the function and does not define it, as with patch 0001.
+
+This is stable-diffusion.assembly's own patch, applied to the submodule by cmake/Patches.cmake when CMake configures, after patch 0002; it is not for upstream. ggml's part is under the MIT License, and the patch's under the GNU General Public License, version 3 or any later version.
+
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index ec26c28..e9e755e 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1900,6 +1900,7 @@ static void ggml_compute_forward_mul_mat_id(
+ // (sources/sdasm.h of that project, which builds them into this library).
+ bool sdasm_compute_forward(const struct ggml_compute_params * params, struct ggml_tensor * node);
+ bool sdasm_work_size(const struct ggml_tensor * node, int n_threads, size_t * size);
++int sdasm_compute_nodes(const struct ggml_compute_params * params, const struct ggml_cgraph * graph, int index);
+ bool sdasm_profile_enabled(void);
+ uint64_t sdasm_profile_now(void);
+ void sdasm_profile_node(const struct ggml_cgraph * graph, const struct ggml_tensor * node, int fused, uint64_t nanoseconds);
+@@ -3337,13 +3338,21 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+ 
+         const uint64_t node_start = profiling ? sdasm_profile_now() : 0;
+ 
+-        // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
+-        // Try fused ops, fall back to normal compute
+-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+-        if (n_fused > 0) {
++        // stable-diffusion.assembly computes the node, with the nodes after it
++        // that change its output in place, when it takes it.
++        const int n_taken = cplan->use_ref ? 0 : sdasm_compute_nodes(&params, cgraph, node_n);
++        int n_fused = n_taken - 1;
++        if (n_taken > 0) {
+             node_n += n_fused;
+         } else {
+-            ggml_compute_forward(&params, node);
++            // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
++            // Try fused ops, fall back to normal compute
++            n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
++            if (n_fused > 0) {
++                node_n += n_fused;
++            } else {
++                ggml_compute_forward(&params, node);
++            }
+         }
+ 
+         if (state->ith == 0 && cplan->abort_callback &&

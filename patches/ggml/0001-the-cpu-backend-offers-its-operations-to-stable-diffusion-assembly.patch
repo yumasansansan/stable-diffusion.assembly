@@ -1,0 +1,48 @@
+SPDX-FileCopyrightText: 2023-2026 The ggml authors
+SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+SPDX-License-Identifier: MIT AND GPL-3.0-or-later
+
+The CPU backend offers its operations to stable-diffusion.assembly
+
+Before the CPU backend computes a node, it calls sdasm_compute_forward(), which computes the node with stable-diffusion.assembly's kernels and returns true when they take it, and returns false, on every thread alike, when they do not; the backend then computes the node as it would have. When it plans a graph, it asks sdasm_work_size() first how much of the work buffer a node needs, which answers for the nodes the kernels take, and asks the extra buffer types after, as before.
+
+The backend declares the two functions and does not define them: the code is stable-diffusion.assembly's (sources/hooks.cc), and it builds it into the backend. A build without it does not link.
+
+This is stable-diffusion.assembly's own patch, applied to the submodule by cmake/Patches.cmake when CMake configures; it is not for upstream. ggml's part is under the MIT License, and the patch's under the GNU General Public License, version 3 or any later version.
+
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 92de0631..d9aa7a82 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1896,6 +1896,11 @@ static void ggml_compute_forward_mul_mat_id(
+ 
+ /////////////////////////////////
+ 
++// stable-diffusion.assembly computes the operations it has kernels for
++// (sources/sdasm.h of that project, which builds them into this library).
++bool sdasm_compute_forward(const struct ggml_compute_params * params, struct ggml_tensor * node);
++bool sdasm_work_size(const struct ggml_tensor * node, int n_threads, size_t * size);
++
+ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
+     GGML_ASSERT(params);
+ 
+@@ -1903,6 +1908,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+         return;
+     }
+ 
++    if (sdasm_compute_forward(params, tensor)) {
++        return;
++    }
++
+     // extra_buffer op?
+     if (ggml_cpu_extra_compute_forward(params, tensor)) {
+         return;
+@@ -3017,7 +3026,7 @@ struct ggml_cplan ggml_graph_plan(
+ 
+         size_t cur = 0;
+ 
+-        if (!ggml_cpu_extra_work_size(n_threads, node, &cur)) {
++        if (!sdasm_work_size(node, n_threads, &cur) && !ggml_cpu_extra_work_size(n_threads, node, &cur)) {
+             switch (node->op) {
+                 case GGML_OP_CPY:
+                 case GGML_OP_DUP:

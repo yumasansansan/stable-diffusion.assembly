@@ -1,0 +1,221 @@
+# SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This file is part of stable-diffusion.assembly. The SPDX lines name its
+# copyright holder and its license, in the machine-readable form of the REUSE
+# specification: the GNU General Public License, version 3 or any later version
+# (LICENSES/GPL-3.0-or-later.txt).
+#
+# Measures the kernels on the processors of GitHub's runners, which are where
+# the kernels for AVX-512 and AMX can be run on the processors they are written
+# for, and timed: a run is started by hand (workflow_dispatch), with the number
+# of runners to measure on, and every runner tests and times the same build.
+#
+# GitHub's Ubuntu runners are virtual machines on processors of a few kinds,
+# AMD's and Intel's, with AVX-512 and without, and there is no asking for one:
+# a job gets whichever runner is free. So the measure jobs are many at once --
+# sixty by default -- and each records the processor it got with what it
+# measured; the summary job groups the runners by processor, and gives each
+# processor the median rate of each operation in each form, so that the levels
+# of the kernels written by hand (avx2, avx512, amx) are set against each other
+# on the same processor, and against the C++ kernels and ggml's own.
+#
+#  - The build job builds the Release configuration for AVX2 (x86-64-v3), the
+#    build that is shipped, which chooses its kernels by what the processor it
+#    runs on has, and keeps sdasm_bench, sdasm_ops_test and the OpenMP runtime
+#    they are linked with.
+#  - Each measure job runs ci/measure.sh with them: the tests of every
+#    operation in every form, at every level its processor has -- on a runner
+#    with AVX-512, the kernels for AVX2 are tested there as well, as a
+#    processor with AVX2 alone would run them -- and then the timing, on as many
+#    threads as the runner has. What it found is kept even when a test fails.
+#  - The summary job writes the tables of ci/measure_summary.py into the
+#    summary of the run, and keeps every rate of every runner in one file.
+#
+# The one action, actions/upload-artifact, keeps what the jobs pass on; it is
+# pinned to the commit of its release. The jobs download with gh.
+
+name: Measure
+
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: How many runners to measure on, all at once
+        default: '60'
+      forms:
+        description: The forms of the kernels to time (sdasm_bench --forms)
+        default: avx2,avx512,amx,cxx,upstream
+      seconds:
+        description: The seconds each operation is timed for in each form
+        default: '1'
+      only:
+        description: Only the operations whose names have this in them
+        default: ''
+      variants:
+        description: Variants of the kernels to time as well, separated by spaces (sdasm_bench --variant)
+        default: >-
+          f2x2:winograd=1 avx512-wide:isa=avx512,wide=1 avx512-narrow:isa=avx512,wide=0 avx512-bf16:isa=avx512,bf16=1
+          amx-attention-off:isa=amx,amx_attention=0 amx-queries128:isa=amx,amx_queries=128
+          amx-kc512:isa=amx,amx_kc=512 amx-mc64:isa=amx,amx_mc=64
+          amx-small-direct:isa=amx,winograd_small_tiles=0 amx-direct:isa=amx,winograd=0
+          amx-bf16-form:isa=amx,amx_fp16=0
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Release (ubuntu-26.04, avx2)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out
+        run: |
+          # The commit with its whole history, the submodules at depth 1, those of
+          # stable-diffusion.cpp that it builds with included.
+          git config --global core.autocrlf false
+          git -c init.defaultBranch=main init --quiet
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --quiet origin "$GITHUB_SHA"
+          git checkout --quiet --detach "$GITHUB_SHA"
+          git submodule update --init --depth 1 --jobs 4
+          git -C thirdparty/stable-diffusion.cpp submodule update --init --depth 1 --jobs 4 \
+            ggml thirdparty/libwebp thirdparty/libwebm
+          git log -1 --format='%H %s'
+
+      - name: Set up the toolchain
+        run: bash ci/setup.sh
+
+      - name: Build
+        run: bash ci/build.sh release avx2
+
+      - name: Pack the programs
+        run: |
+          # In a tar archive, which keeps them executable; with the OpenMP
+          # runtime they were linked with, which the runners that run them
+          # have not installed.
+          mkdir measure-tools
+          cp build/release/tools/sdasm_bench build/release/tests/sdasm_ops_test measure-tools/
+          runtime=$(ldd build/release/tools/sdasm_bench | awk '/libomp/ { print $3 }')
+          cp -L "$runtime" measure-tools/
+          tar -czf measure-tools.tar.gz measure-tools
+          ls -l measure-tools
+
+      - name: Keep the programs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: measure-tools
+          path: measure-tools.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  plan:
+    name: The runners to measure on
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      runners: ${{ steps.list.outputs.runners }}
+
+    steps:
+      - name: Number them
+        id: list
+        env:
+          RUNNERS: ${{ inputs.runners }}
+        run: |
+          # A matrix of 1 to the number asked for, which is at most 256, GitHub's
+          # limit on the jobs of a matrix.
+          if ! [[ $RUNNERS =~ ^[0-9]+$ ]] || [ "$RUNNERS" -lt 1 ] || [ "$RUNNERS" -gt 256 ]; then
+            echo "error: runners is to be a number from 1 to 256, not '$RUNNERS'" >&2
+            exit 1
+          fi
+          echo "runners=[$(seq -s , 1 "$RUNNERS")]" >> "$GITHUB_OUTPUT"
+
+  measure:
+    name: Measure (runner ${{ matrix.runner }})
+    needs: [build, plan]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.plan.outputs.runners) }}
+
+    steps:
+      - name: Check out
+        run: |
+          # The commit alone, for ci/: the programs come built.
+          git config --global core.autocrlf false
+          git -c init.defaultBranch=main init --quiet
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --quiet --depth 1 origin "$GITHUB_SHA"
+          git checkout --quiet --detach "$GITHUB_SHA"
+
+      - name: Download the programs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name measure-tools --dir .
+          tar -xzf measure-tools.tar.gz
+
+      - name: Test and time
+        env:
+          FORMS: ${{ inputs.forms }}
+          SECONDS_EACH: ${{ inputs.seconds }}
+          ONLY: ${{ inputs.only }}
+          VARIANTS: ${{ inputs.variants }}
+        run: |
+          read -r -a variants <<< "$VARIANTS"
+          bash ci/measure.sh measure-tools "measure-${{ matrix.runner }}" "$FORMS" "$SECONDS_EACH" "$ONLY" "${variants[@]}"
+
+      - name: Keep what was measured
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: measure-${{ matrix.runner }}
+          path: measure-${{ matrix.runner }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  summary:
+    name: Summary
+    needs: measure
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: Check out
+        run: |
+          git config --global core.autocrlf false
+          git -c init.defaultBranch=main init --quiet
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --quiet --depth 1 origin "$GITHUB_SHA"
+          git checkout --quiet --detach "$GITHUB_SHA"
+
+      - name: Download what the runners measured
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir results --pattern 'measure-[0-9]*'
+
+      - name: Summarize
+        run: python3 ci/measure_summary.py results measure.tsv | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep every rate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: measure-summary
+          path: measure.tsv
+          if-no-files-found: error
+          retention-days: 90

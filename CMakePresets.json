@@ -1,0 +1,111 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 29, "patch": 0 },
+
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "environment": {
+        "CC": "clang",
+        "CXX": "clang++",
+        "LDFLAGS": "-fuse-ld=lld"
+      },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_ASM_COMPILER": "clang",
+        "CMAKE_LINKER_TYPE": "LLD",
+        "CMAKE_EXE_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_MODULE_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fuse-ld=lld",
+        "CMAKE_AR": "llvm-ar",
+        "CMAKE_RANLIB": "llvm-ranlib",
+        "CMAKE_NM": "llvm-nm",
+        "CMAKE_OBJCOPY": "llvm-objcopy",
+        "CMAKE_OBJDUMP": "llvm-objdump",
+        "CMAKE_STRIP": "llvm-strip",
+        "CMAKE_READELF": "llvm-readelf",
+        "CMAKE_ADDR2LINE": "llvm-addr2line",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SDASM_WERROR": "ON",
+        "SDASM_PRESET": "${presetName}"
+      }
+    },
+
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "inherits": ["base"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "RelWithDebInfo",
+      "inherits": ["base"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "release",
+      "displayName": "Release (distribution: -O3, ThinLTO at level 3, no debug info)",
+      "inherits": ["base"],
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "emulated",
+      "displayName": "Release for x86-64-v3 with the tests, for Intel SDE's emulated processors (ci/emulated.sh)",
+      "inherits": ["base"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SDASM_ARCH": "avx2",
+        "SDASM_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "sanitize",
+      "displayName": "RelWithDebInfo with the address and undefined sanitizers",
+      "inherits": ["base"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "SDASM_SANITIZERS": "address,undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "displayName": "RelWithDebInfo with the thread and undefined sanitizers",
+      "inherits": ["base"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "SDASM_SANITIZERS": "thread,undefined"
+      }
+    }
+  ],
+
+  "buildPresets": [
+    { "name": "debug",          "configurePreset": "debug" },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
+    { "name": "release",        "configurePreset": "release" },
+    { "name": "emulated",       "configurePreset": "emulated" },
+    { "name": "sanitize",       "configurePreset": "sanitize", "environment": { "ASAN_OPTIONS": "detect_leaks=0" } },
+    { "name": "tsan",           "configurePreset": "tsan" }
+  ],
+
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error", "timeout": 1800 }
+    },
+    { "name": "debug",          "configurePreset": "debug",          "inherits": "base" },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "inherits": "base" },
+    { "name": "release",        "configurePreset": "release",        "inherits": "base" },
+    { "name": "emulated",       "configurePreset": "emulated",       "inherits": "base" },
+    { "name": "sanitize",       "configurePreset": "sanitize",       "inherits": "base",
+      "output": { "outputOnFailure": true, "verbosity": "verbose" } },
+    { "name": "tsan",           "configurePreset": "tsan",           "inherits": "base",
+      "output": { "outputOnFailure": true, "verbosity": "verbose" } }
+  ]
+}

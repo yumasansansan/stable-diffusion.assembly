@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This file is part of stable-diffusion.assembly. The SPDX lines name its
+# copyright holder and its license, in the machine-readable form of the REUSE
+# specification: the GNU General Public License, version 3 or any later version
+# (LICENSES/GPL-3.0-or-later.txt).
+#
+# stable-diffusion.cpp, which carries ggml and the libraries of its image and
+# video files as submodules of its own; the patches of patches/ go into it and
+# into its ggml when CMake configures (cmake/Patches.cmake).
+
+[submodule "thirdparty/stable-diffusion.cpp"]
+	path = thirdparty/stable-diffusion.cpp
+	url = https://github.com/leejet/stable-diffusion.cpp.git

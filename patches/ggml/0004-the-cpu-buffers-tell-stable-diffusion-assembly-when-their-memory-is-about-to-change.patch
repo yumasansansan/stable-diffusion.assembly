@@ -1,0 +1,96 @@
+SPDX-FileCopyrightText: 2023-2026 The ggml authors
+SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+SPDX-License-Identifier: MIT AND GPL-3.0-or-later
+
+The CPU buffers tell stable-diffusion.assembly when their memory is about to change
+
+stable-diffusion.assembly keeps the weights its kernels have packed from one graph to the next (sources/store.h), for as long as the memory they were packed from stays as it was. ggml calls sdasm_forget() with the memory about to change, so that it forgets what it packed from there: before a CPU buffer sets, clears or copies into the data of a tensor, before it clears the whole buffer, before any host buffer is freed, and before a context is freed, whose memory may have held the data of its tensors. ggml-backend.cpp defines sdasm_forget() weakly, as doing nothing, so that ggml links without the project; stable-diffusion.assembly's definition takes its place.
+
+This is stable-diffusion.assembly's own patch, applied to the submodule by cmake/Patches.cmake when CMake configures, after patch 0003; it is not for upstream. ggml's part is under the MIT License, and the patch's under the GNU General Public License, version 3 or any later version.
+
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+index 8c34873..cfe053f 100644
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -113,11 +113,25 @@ const char * ggml_backend_buffer_name(ggml_backend_buffer_t buffer) {
+     return ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer));
+ }
+ 
++// stable-diffusion.assembly keeps packed forms of weights between graphs
++// (sources/store.h of that project), and is told here whenever memory of a
++// host buffer is about to change, so that it forgets what was packed from it.
++// Without that project, the default here does nothing.
++extern "C" __attribute__((weak)) void sdasm_forget(const void * begin, size_t size);
++extern "C" __attribute__((weak)) void sdasm_forget(const void * begin, size_t size) {
++    GGML_UNUSED(begin);
++    GGML_UNUSED(size);
++}
++
+ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
+     if (buffer == NULL) {
+         return;
+     }
+ 
++    if (buffer->size > 0 && buffer->buft != NULL && ggml_backend_buft_is_host(buffer->buft)) {
++        sdasm_forget(ggml_backend_buffer_get_base(buffer), buffer->size);
++    }
++
+     if (buffer->iface.free_buffer != NULL) {
+         buffer->iface.free_buffer(buffer);
+     }
+@@ -2373,6 +2387,7 @@ static void ggml_backend_cpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+ 
+ static void ggml_backend_cpu_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+     GGML_ASSERT(tensor);
++    sdasm_forget((char *)tensor->data + offset, size);
+     memset((char *)tensor->data + offset, value, size);
+ 
+     GGML_UNUSED(buffer);
+@@ -2380,6 +2395,7 @@ static void ggml_backend_cpu_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+ 
+ static void ggml_backend_cpu_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     GGML_ASSERT(tensor);
++    sdasm_forget((char *)tensor->data + offset, size);
+     memcpy((char *)tensor->data + offset, data, size);
+ 
+     GGML_UNUSED(buffer);
+@@ -2395,6 +2411,7 @@ static void ggml_backend_cpu_buffer_get_tensor(ggml_backend_buffer_t buffer, con
+ static bool ggml_backend_cpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src, struct ggml_tensor * dst) {
+     GGML_ASSERT(src);
+     if (ggml_backend_buffer_is_host(src->buffer)) {
++        sdasm_forget(dst->data, ggml_nbytes(src));
+         memcpy(dst->data, src->data, ggml_nbytes(src));
+         return true;
+     }
+@@ -2405,6 +2422,7 @@ static bool ggml_backend_cpu_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
+ 
+ static void ggml_backend_cpu_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+     GGML_ASSERT(buffer);
++    sdasm_forget(buffer->context, buffer->size);
+     memset(buffer->context, value, buffer->size);
+ }
+ 
+diff --git a/src/ggml.c b/src/ggml.c
+index 562b6eb..fcdac23 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1684,11 +1684,19 @@ void ggml_reset(struct ggml_context * ctx) {
+     ctx->objects_end   = NULL;
+ }
+ 
++// stable-diffusion.assembly forgets what it packed from the memory of a
++// context whose tensors are about to go (ggml-backend.cpp says more).
++void sdasm_forget(const void * begin, size_t size);
++
+ void ggml_free(struct ggml_context * ctx) {
+     if (ctx == NULL) {
+         return;
+     }
+ 
++    if (ctx->mem_buffer != NULL && ctx->mem_size > 0) {
++        sdasm_forget(ctx->mem_buffer, ctx->mem_size);
++    }
++
+     if (ctx->mem_buffer_owned) {
+         ggml_aligned_free(ctx->mem_buffer, ctx->mem_size);
+     }

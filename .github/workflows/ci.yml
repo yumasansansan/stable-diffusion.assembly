@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This file is part of stable-diffusion.assembly. The SPDX lines name its
+# copyright holder and its license, in the machine-readable form of the REUSE
+# specification: the GNU General Public License, version 3 or any later version
+# (LICENSES/GPL-3.0-or-later.txt).
+#
+# Builds and tests stable-diffusion.assembly with Clang and LLD on Ubuntu, in
+# Debug and Release, for AVX2 (x86-64-v3), the least this project builds for.
+# The checkout is plain git, and ci/setup.sh installs a pinned toolchain. The
+# tests compute every operation the kernels take, in every form of them,
+# against the same in double precision (ci/test.sh).
+#
+# The sanitize jobs build with the address and undefined sanitizers, and with
+# the thread sanitizer in place of the address one, which it cannot be built
+# together with: the kernels share the work of an operation out among the
+# threads of ggml's pool, and a race between them is found by nothing else. They
+# are built for the processor of the runner, native, since they are made, tested
+# and thrown away in one job.
+#
+# The reuse job checks with reuse lint, from Ubuntu's reuse package, that every
+# file names its copyright holders and license (see REUSE.toml and LICENSES/).
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.preset }} (${{ matrix.os }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04]
+        arch: [avx2]
+        preset: [debug, release]
+
+    steps:
+      - name: Check out
+        run: |
+          # The commit with its whole history, the submodules at depth 1, those of
+          # stable-diffusion.cpp that it builds with included: ggml, libwebp and
+          # libwebm, not the frontend of its server, which this project does not
+          # build.
+          git config --global core.autocrlf false
+          git -c init.defaultBranch=main init --quiet
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --quiet origin "$GITHUB_SHA"
+          git checkout --quiet --detach "$GITHUB_SHA"
+          git submodule update --init --depth 1 --jobs 4
+          git -C thirdparty/stable-diffusion.cpp submodule update --init --depth 1 --jobs 4 \
+            ggml thirdparty/libwebp thirdparty/libwebm
+          git log -1 --format='%H %s'
+
+      - name: Set up the toolchain
+        run: bash ci/setup.sh
+
+      - name: Build
+        run: bash ci/build.sh "${{ matrix.preset }}" "${{ matrix.arch }}"
+
+      - name: Test
+        run: bash ci/test.sh "${{ matrix.preset }}"
+
+  sanitize:
+    name: ${{ matrix.preset }} (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [sanitize, tsan]
+
+    steps:
+      - name: Check out
+        run: |
+          git config --global core.autocrlf false
+          git -c init.defaultBranch=main init --quiet
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --quiet origin "$GITHUB_SHA"
+          git checkout --quiet --detach "$GITHUB_SHA"
+          git submodule update --init --depth 1 --jobs 4
+          git -C thirdparty/stable-diffusion.cpp submodule update --init --depth 1 --jobs 4 \
+            ggml thirdparty/libwebp thirdparty/libwebm
+          git log -1 --format='%H %s'
+
+      - name: Set up the toolchain
+        run: bash ci/setup.sh
+
+      - name: Build
+        run: bash ci/build.sh "${{ matrix.preset }}" native
+
+      - name: Test
+        run: bash ci/test.sh "${{ matrix.preset }}"
+
+  reuse:
+    name: REUSE compliance
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out
+        run: |
+          # The commit alone: reuse lint leaves the submodules out, as they carry
+          # the licensing of their own projects.
+          git config --global core.autocrlf false
+          git -c init.defaultBranch=main init --quiet
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --quiet --depth 1 origin "$GITHUB_SHA"
+          git checkout --quiet --detach "$GITHUB_SHA"
+          git log -1 --format='%H %s'
+
+      - name: Install reuse
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends reuse
+          reuse --version
+
+      - name: Check the licensing of every file
+        run: reuse lint

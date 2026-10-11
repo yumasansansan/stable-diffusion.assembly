@@ -1,0 +1,27 @@
+SPDX-FileCopyrightText: 2023-2026 leejet and the stable-diffusion.cpp contributors
+SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+SPDX-License-Identifier: MIT AND GPL-3.0-or-later
+
+A convolution of FP16 or FP32 weights is the direct one
+
+With SD_USE_SDASM defined, as stable-diffusion.assembly defines it for the library, ggml_ext_conv_2d() builds the direct convolution, GGML_OP_CONV_2D, for weights of FP16 and of FP32, whatever the model asked for: stable-diffusion.assembly computes it from the image in single precision, without writing out the columns of im2col, which ggml_conv_2d() would have written whole and rounded to FP16 before the matrix product. Weights of other types keep the convolution the model asked for, which the direct one of the CPU backend does not take.
+
+This is stable-diffusion.assembly's own patch, applied to the submodule by cmake/Patches.cmake when CMake configures; it is not for upstream. stable-diffusion.cpp's part is under the MIT License, and the patch's under the GNU General Public License, version 3 or any later version.
+
+diff --git a/src/core/ggml_extend.cpp b/src/core/ggml_extend.cpp
+index d16b92a..417d61d 100644
+--- a/src/core/ggml_extend.cpp
++++ b/src/core/ggml_extend.cpp
+@@ -440,6 +440,12 @@ ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
+         p1 = 0;
+     }
+ 
++#ifdef SD_USE_SDASM
++    // stable-diffusion.assembly computes the direct convolution of FP16 and FP32
++    // weights from the image in single precision, without the columns of
++    // im2col, which ggml_conv_2d writes out whole and rounds to FP16.
++    direct = direct || w->type == GGML_TYPE_F16 || w->type == GGML_TYPE_F32;
++#endif
+     if (direct) {
+         x = ggml_conv_2d_direct(ctx, w, x, s0, s1, p0, p1, d0, d1);
+     } else {
