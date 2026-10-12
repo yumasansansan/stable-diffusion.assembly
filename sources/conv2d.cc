@@ -43,6 +43,7 @@
 #include "kernels.h"
 #include "ops.h"
 #include "phases.h"
+#include "quant.h"
 #include "store.h"
 
 #include "ggml-cpu-impl.h"
@@ -293,8 +294,150 @@ std::size_t amx_work_size(const Conv & c, int n_threads);
 
 }  // namespace
 
+namespace {
+
+// ---------------------------------------------------------------- quantized
+
+// The products in integers (quant.h, Tuning::bits): the weights, signed, each
+// output channel's in groups of K, quantized once and kept by the store; the
+// columns of a block of positions packed in single precision as above, a
+// stretch of K at a time, and quantized, unsigned with a zero point, each
+// position's in groups of the stretch. The blocks are those of the weights
+// shared, whatever the size of the images.
+struct Qplan {
+    Quant q;
+    std::int64_t kc;  // a multiple of the group
+    std::int64_t mc, nc, mblocks, nblocks;
+    std::int64_t a_panel, b_panel;
+    std::size_t weights_bytes, columns_bytes, quantized_bytes, thread_bytes;
+};
+
+Qplan qplan(const Conv & c, int n_threads) {
+    const Tuning & t = tuning();
+    Qplan pl{};
+    pl.q = quant();
+    const std::int64_t group = 4 * pl.q.quads;
+    pl.kc = std::max(group, std::min<std::int64_t>(round_up(c.k, group), t.conv_kc) / group * group);
+    pl.mblocks = ceil_div(c.oc, t.conv_mc);
+    pl.mc = round_up(ceil_div(c.oc, pl.mblocks), kMr);
+    pl.nc = round_up(t.conv_nc, kNr);
+    pl.nblocks = ceil_div(c.p, pl.nc);
+    const std::int64_t wanted = 4 * static_cast<std::int64_t>(n_threads);
+    while (c.n * pl.mblocks * pl.nblocks < wanted && pl.nc > 32) {
+        pl.nc /= 2;
+        pl.nblocks = ceil_div(c.p, pl.nc);
+    }
+    for (std::int64_t split = pl.mblocks + 1; c.n * pl.mblocks * pl.nblocks < wanted && pl.mc > 8 * kMr; ++split) {
+        pl.mc = std::min(pl.mc, round_up(ceil_div(c.oc, split), kMr));
+        pl.mblocks = ceil_div(c.oc, pl.mc);
+    }
+    pl.a_panel = qpanel_bytes(c.k, kMr, pl.q);
+    pl.b_panel = qpanel_bytes(pl.kc, kNr, pl.q);
+    pl.weights_bytes = align_up(static_cast<std::size_t>(ceil_div(c.oc, kMr) * pl.a_panel));
+    pl.columns_bytes = align_up(static_cast<std::size_t>(round_up(pl.nc, kNr) * pl.kc) * sizeof(float));
+    pl.quantized_bytes = align_up(static_cast<std::size_t>(ceil_div(pl.nc, kNr) * pl.b_panel));
+    pl.thread_bytes = pl.columns_bytes + pl.quantized_bytes;
+    return pl;
+}
+
+std::uint64_t qvariant(const Quant & q) {
+    return static_cast<std::uint64_t>(q.quads) | static_cast<std::uint64_t>(q.weight_max) << 16 |
+           static_cast<std::uint64_t>(q.weight_groups ? 1 : 0) << 32;
+}
+
+void compute_quantized(const ggml_compute_params * params, const Conv & c, const Qplan & pl, const Epilogue & chain) {
+    const Quant & q = pl.q;
+    const std::int64_t group = 4 * q.quads;
+    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
+    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::quantized_conv, pl.weights_bytes, qvariant(q));
+    auto * weights = reinterpret_cast<std::uint8_t *>(kept != nullptr ? reinterpret_cast<char *>(kept->data) : base);
+    const bool fill = kept == nullptr || !kept->ready();
+    char * mine = base + pl.weights_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
+    auto * columns = reinterpret_cast<float *>(mine);
+    auto * qcolumns = reinterpret_cast<std::uint8_t *>(mine + pl.columns_bytes);
+    const Qkernel kernel = qkernel_b_unsigned();
+    const Qkernel_wide wide = qkernel_wide_b_unsigned();
+    const std::int64_t step = wide != nullptr ? 2 * kNr : kNr;
+    const std::int64_t a_group = qgroup_bytes(q.quads, kMr);
+
+    Work_queue queue(params);
+    // The weights, a panel of kMr output channels to an item.
+    const std::int64_t pack_items = fill ? ceil_div(c.oc, kMr) : 0;
+    int item = queue.next();
+    if (fill) {
+        for (; item < pack_items; item = queue.next()) {
+            const Phase_scope scope(Phase::pack_weights);
+            const std::int64_t r0 = item * kMr;
+            const std::int64_t rows = std::min<std::int64_t>(kMr, c.oc - r0);
+            if (c.wtype == GGML_TYPE_F16) {
+                quantize_weights_f16(weights + item * pl.a_panel, reinterpret_cast<const std::uint16_t *>(c.w + r0 * c.wnb3),
+                                     c.wnb3, rows, c.k, kMr, q);
+            }
+            else {
+                quantize_weights_f32(weights + item * pl.a_panel, reinterpret_cast<const float *>(c.w + r0 * c.wnb3), c.wnb3,
+                                     rows, c.k, kMr, q);
+            }
+        }
+        queue.barrier();
+        if (kept != nullptr && params->ith == 0) {
+            publish(kept);
+        }
+    }
+
+    const std::vector<Block> blocks = guided_blocks(c.n, c.p, kNr, pl.nc, params->nth);
+    const auto units = static_cast<std::int64_t>(blocks.size()) * pl.mblocks;
+    for (; item < pack_items + units; item = queue.next()) {
+        const std::int64_t u = item - pack_items;
+        const std::int64_t ib = u % pl.mblocks;
+        const Block & block = blocks[static_cast<std::size_t>(u / pl.mblocks)];
+        const std::int64_t n = block.segment;
+        const std::int64_t i0 = ib * pl.mc;
+        const std::int64_t i1 = std::min(c.oc, i0 + pl.mc);
+        const std::int64_t j0 = block.start;
+        const std::int64_t j1 = j0 + block.size;
+        const std::int64_t panels = ceil_div(j1 - j0, kNr);
+        char * image = c.y + n * c.ynb3;
+        for (std::int64_t k0 = 0; k0 < c.k; k0 += pl.kc) {
+            const std::int64_t kc = std::min(pl.kc, c.k - k0);
+            {
+                const Phase_scope scope(Phase::pack_inputs);
+                pack_columns(columns, c, n, j0, j1, k0, k0 + kc);
+                for (std::int64_t p = 0; p < panels; ++p) {
+                    quantize_panel_inputs(qcolumns + p * pl.b_panel, columns + p * kc * kNr, kc, kNr, q);
+                }
+            }
+            const bool last = k0 + kc == c.k;
+            const std::int64_t groups = ceil_div(kc, group);
+            const Phase_scope scope(Phase::product);
+            for (std::int64_t jj = j0; jj < j1; jj += step) {
+                const std::uint8_t * b = qcolumns + ((jj - j0) / kNr) * pl.b_panel;
+                const std::int64_t cols = std::min(step, j1 - jj);
+                for (std::int64_t ii = i0; ii < i1; ii += kMr) {
+                    const std::uint8_t * a = weights + (ii / kMr) * pl.a_panel + k0 / group * a_group;
+                    float * out = reinterpret_cast<float *>(image + ii * c.ynb2) + jj;
+                    const std::int64_t rows = std::min<std::int64_t>(kMr, i1 - ii);
+                    qtiles(kernel, wide, groups, q.quads, a, b, pl.b_panel, out, c.ynb2, k0 > 0 || chain.from_redirect, rows,
+                           cols);
+                    if (last && !chain.empty()) {
+                        for (std::int64_t r = 0; r < rows; ++r) {
+                            chain.apply_positions(reinterpret_cast<float *>(reinterpret_cast<char *>(out) + r * c.ynb2), cols,
+                                                  jj, ii + r, n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+}  // namespace
+
 std::size_t conv2d_work_size(const ggml_tensor * node, int n_threads) {
     const Conv c = geometry(node);
+    if (quantized(Quantized_op::convolution)) {
+        const Qplan pl = qplan(c, n_threads);
+        return kAlign + pl.weights_bytes + pl.thread_bytes * static_cast<std::size_t>(n_threads);
+    }
     if (on_amx(c)) {
         return amx_work_size(c, n_threads);
     }
@@ -655,6 +798,10 @@ void conv2d_compute(const ggml_compute_params * params, ggml_tensor * node, cons
     if (chain.redirect != nullptr) {
         // The residual connection's tensor, of the same layout (fusion.h).
         c.y = static_cast<char *>(chain.redirect->data);
+    }
+    if (quantized(Quantized_op::convolution)) {
+        compute_quantized(params, c, qplan(c, params->nth), chain);
+        return;
     }
     if (on_amx(c)) {
         compute_amx(params, c, chain);

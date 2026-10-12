@@ -26,6 +26,7 @@
 #include "kernels.h"
 #include "ops.h"
 #include "phases.h"
+#include "quant.h"
 #include "store.h"
 
 #include "ggml-cpu-impl.h"
@@ -66,6 +67,17 @@ Mul_mat geometry(const ggml_tensor * node) {
     g.ne1 = node->ne[1];
     g.ne2 = node->ne[2];
     return g;
+}
+
+// Whether a product is quantized (quant.h): of 256 rows or more. The products
+// of fewer -- the text encoder's, of the prompt's 77 tokens, the projections
+// of the prompt to cross-attention's keys and values, the time embedding's --
+// are a few hundredths of the work, and steer the whole picture: they stay in
+// single precision, as cross-attention does.
+constexpr std::int64_t kQuantizedRows = 256;
+
+bool quantized_product(const Mul_mat & g) {
+    return quantized(Quantized_op::linear) && g.m >= kQuantizedRows;
 }
 
 struct Plan {
@@ -144,11 +156,15 @@ namespace {
 
 bool amx_product(const Mul_mat & g);
 std::size_t amx_work_size(const Mul_mat & g, int n_threads);
+std::size_t quantized_work_size(const Mul_mat & g, int n_threads);
 
 }  // namespace
 
 std::size_t mul_mat_work_size(const ggml_tensor * node, int n_threads) {
     const Mul_mat g = geometry(node);
+    if (quantized_product(g)) {
+        return quantized_work_size(g, n_threads);
+    }
     const Plan pl = plan(g, n_threads);
     // Enough for the gated GELU after it too (fusion.h), which needs more of
     // each thread; and for the products on AMX's tiles, when they go there.
@@ -323,6 +339,202 @@ void compute_shared_weights(const ggml_compute_params * params, const Mul_mat & 
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------- quantized
+
+// The products of numbers quantized to integers (quant.h): A is src1, its rows
+// quantized by all threads together, a panel of kMr rows over the whole of K
+// to an item; B the weights, quantized likewise a panel of kNr columns to an
+// item, or kept by the store. Every tile is then a call of the micro-kernel
+// over the whole of K: the panels are a quarter of the bytes of those of
+// single precision, and a panel of B, over K = 1280 in groups of 32, takes
+// 25 kilobytes of the first level of the cache, where it stays while the
+// panels of A of the block go by.
+std::uint64_t quantized_variant(const Quant & q) {
+    return static_cast<std::uint64_t>(q.quads) | static_cast<std::uint64_t>(q.weight_max) << 16 |
+           static_cast<std::uint64_t>(q.weight_groups ? 1 : 0) << 32;
+}
+
+std::size_t quantized_rows_bytes(const Mul_mat & g, const Quant & q) {
+    return align_up(static_cast<std::size_t>(ceil_div(g.m, kMr) * qpanel_bytes(g.k, kMr, q)));
+}
+
+std::size_t quantized_weights_bytes(const Mul_mat & g, const Quant & q) {
+    return align_up(static_cast<std::size_t>(ceil_div(g.n, kNr) * qpanel_bytes(g.k, kNr, q)));
+}
+
+// A thread's tiles of a block of rows by a chunk of the columns of both halves,
+// for the gated GELU after the product.
+std::size_t quantized_gated_bytes(const Mul_mat & g);
+
+std::size_t quantized_work_size(const Mul_mat & g, int n_threads) {
+    const Quant q = quant();
+    return kAlign + quantized_rows_bytes(g, q) + quantized_weights_bytes(g, q) +
+           quantized_gated_bytes(g) * static_cast<std::size_t>(n_threads);
+}
+
+// The quantized rows of src1 and the weights, packed by the queue's first
+// items, from `item`, a panel of kMr rows or of kNr columns to an item, and
+// the threads met after them: the panels, and the number of those items.
+struct Quantized_operands {
+    std::uint8_t * rows;
+    std::uint8_t * weights;
+    std::int64_t items;
+};
+
+Quantized_operands quantize_operands(const ggml_compute_params * params, const Mul_mat & g, const Quant & q, char * base,
+                                     Work_queue & queue, int & item) {
+    const std::int64_t a_panel = qpanel_bytes(g.k, kMr, q);
+    const std::int64_t b_panel = qpanel_bytes(g.k, kNr, q);
+    auto * rows = reinterpret_cast<std::uint8_t *>(base);
+    const std::shared_ptr<Packed> kept = packed(g.weight, Layout::quantized_linear, quantized_weights_bytes(g, q),
+                                                quantized_variant(q));
+    auto * weights = reinterpret_cast<std::uint8_t *>(kept != nullptr ? reinterpret_cast<char *>(kept->data)
+                                                                      : base + quantized_rows_bytes(g, q));
+    const bool fill = kept == nullptr || !kept->ready();
+    const std::int64_t row_items = ceil_div(g.m, kMr);
+    const std::int64_t pack_items = row_items + (fill ? ceil_div(g.n, kNr) : 0);
+    for (; item < pack_items; item = queue.next()) {
+        if (item < row_items) {
+            const Phase_scope scope(Phase::pack_inputs);
+            const std::int64_t r0 = item * kMr;
+            quantize_inputs(rows + item * a_panel, reinterpret_cast<const float *>(g.x + r0 * g.xnb1), g.xnb1,
+                            std::min<std::int64_t>(kMr, g.m - r0), g.k, kMr, q);
+            continue;
+        }
+        const Phase_scope scope(Phase::pack_weights);
+        const std::int64_t panel = item - row_items;
+        const std::int64_t c0 = panel * kNr;
+        if (g.wtype == GGML_TYPE_F16) {
+            quantize_weights_f16(weights + panel * b_panel, reinterpret_cast<const std::uint16_t *>(g.w + c0 * g.wnb1), g.wnb1,
+                                 std::min<std::int64_t>(kNr, g.n - c0), g.k, kNr, q);
+        }
+        else {
+            quantize_weights_f32(weights + panel * b_panel, reinterpret_cast<const float *>(g.w + c0 * g.wnb1), g.wnb1,
+                                 std::min<std::int64_t>(kNr, g.n - c0), g.k, kNr, q);
+        }
+    }
+    queue.barrier();
+    if (fill && kept != nullptr && params->ith == 0) {
+        publish(kept);
+    }
+    return {rows, weights, pack_items};
+}
+
+void compute_quantized(const ggml_compute_params * params, const Mul_mat & g, const Epilogue & chain) {
+    const Quant q = quant();
+    const std::int64_t groups = qgroups(g.k, q);
+    const std::int64_t a_panel = qpanel_bytes(g.k, kMr, q);
+    const std::int64_t b_panel = qpanel_bytes(g.k, kNr, q);
+    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
+    const Qkernel kernel = qkernel_a_unsigned();
+    const Qkernel_wide wide = qkernel_wide_a_unsigned();
+    const std::int64_t step = wide != nullptr ? 2 * kNr : kNr;
+
+    Work_queue queue(params);
+    int item = queue.next();
+    const Quantized_operands operands = quantize_operands(params, g, q, base, queue, item);
+    const std::uint8_t * rows = operands.rows;
+    const std::uint8_t * weights = operands.weights;
+    const std::int64_t pack_items = operands.items;
+
+    // Blocks of rows by blocks of columns, enough of them for every thread to
+    // take several.
+    const std::int64_t mc = std::min<std::int64_t>(round_up(g.m, kMr), round_up(tuning().mul_mat_mc, kMr));
+    const std::int64_t mblocks = ceil_div(g.m, mc);
+    std::int64_t nc = round_up(g.n, kNr);
+    const std::int64_t wanted = 4 * static_cast<std::int64_t>(params->nth);
+    for (std::int64_t split = 2; mblocks * ceil_div(g.n, nc) < wanted && nc > 4 * kNr; ++split) {
+        nc = std::min(nc, round_up(ceil_div(g.n, split), kNr));
+    }
+    const std::int64_t nblocks = ceil_div(g.n, nc);
+    const std::vector<Block> blocks = guided_blocks(1, g.m, kMr, mc, params->nth);
+    const auto units = static_cast<std::int64_t>(blocks.size()) * nblocks;
+    for (; item < pack_items + units; item = queue.next()) {
+        const std::int64_t u = item - pack_items;
+        const Block & block = blocks[static_cast<std::size_t>(u / nblocks)];
+        const std::int64_t i0 = block.start;
+        const std::int64_t i1 = i0 + block.size;
+        const std::int64_t j0 = (u % nblocks) * nc;
+        const std::int64_t j1 = std::min(g.n, j0 + nc);
+        const Phase_scope scope(Phase::product);
+        for (std::int64_t jj = j0; jj < j1; jj += step) {
+            const std::uint8_t * b = weights + (jj / kNr) * b_panel;
+            const std::int64_t cols = std::min(step, j1 - jj);
+            for (std::int64_t ii = i0; ii < i1; ii += kMr) {
+                float * out = reinterpret_cast<float *>(g.y + ii * g.ynb1) + jj;
+                const std::int64_t count = std::min<std::int64_t>(kMr, i1 - ii);
+                qtiles(kernel, wide, groups, q.quads, rows + (ii / kMr) * a_panel, b, b_panel, out, g.ynb1, chain.from_redirect,
+                       count, cols);
+                if (!chain.empty()) {
+                    apply_chain(chain, g, out, ii, count, jj, cols);
+                }
+            }
+        }
+    }
+}
+
+constexpr std::int64_t kQuantizedGatedColumns = 64;
+
+std::size_t quantized_gated_bytes(const Mul_mat & g) {
+    const std::int64_t mc = std::min<std::int64_t>(round_up(g.m, kMr), round_up(tuning().mul_mat_mc, kMr));
+    return align_up(static_cast<std::size_t>(mc * 2 * kQuantizedGatedColumns) * sizeof(float));
+}
+
+void gated_epilogue(const Mul_mat & g, const Epilogue & chain, const ggml_tensor * out, float * buffer, std::int64_t i0,
+                    std::int64_t i1, std::int64_t c0, std::int64_t width);
+
+// The product before the gated GELU, quantized: as compute_quantized(), a
+// block of rows by a chunk of 64 columns of each half at a time, into the
+// thread's tiles, which gated_epilogue() takes as compute_gated()'s.
+void compute_quantized_gated(const ggml_compute_params * params, const Mul_mat & g, const Epilogue & chain,
+                             const ggml_tensor * out) {
+    const Quant q = quant();
+    const std::int64_t groups = qgroups(g.k, q);
+    const std::int64_t a_panel = qpanel_bytes(g.k, kMr, q);
+    const std::int64_t b_panel = qpanel_bytes(g.k, kNr, q);
+    const std::int64_t half = g.n / 2;
+    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
+    auto * buffer = reinterpret_cast<float *>(base + quantized_rows_bytes(g, q) + quantized_weights_bytes(g, q) +
+                                              quantized_gated_bytes(g) * static_cast<std::size_t>(params->ith));
+    const Qkernel kernel = qkernel_a_unsigned();
+    const Qkernel_wide wide = qkernel_wide_a_unsigned();
+    const std::int64_t step = wide != nullptr ? 2 * kNr : kNr;
+    const std::int64_t ldb = 2 * kQuantizedGatedColumns * static_cast<std::int64_t>(sizeof(float));
+
+    Work_queue queue(params);
+    int item = queue.next();
+    const Quantized_operands operands = quantize_operands(params, g, q, base, queue, item);
+    const std::int64_t pack_items = operands.items;
+
+    const std::int64_t mc = std::min<std::int64_t>(round_up(g.m, kMr), round_up(tuning().mul_mat_mc, kMr));
+    const std::int64_t chunks = ceil_div(half, kQuantizedGatedColumns);
+    const std::vector<Block> blocks = guided_blocks(1, g.m, kMr, mc, params->nth);
+    const auto units = static_cast<std::int64_t>(blocks.size()) * chunks;
+    for (; item < pack_items + units; item = queue.next()) {
+        const std::int64_t u = item - pack_items;
+        const Block & block = blocks[static_cast<std::size_t>(u / chunks)];
+        const std::int64_t i0 = block.start;
+        const std::int64_t i1 = i0 + block.size;
+        const std::int64_t c0 = (u % chunks) * kQuantizedGatedColumns;
+        const std::int64_t width = std::min(kQuantizedGatedColumns, half - c0);
+        {
+            const Phase_scope scope(Phase::product);
+            for (int side = 0; side < 2; ++side) {
+                for (std::int64_t jj = 0; jj < width; jj += step) {
+                    const std::uint8_t * b = operands.weights + ((side * half + c0 + jj) / kNr) * b_panel;
+                    for (std::int64_t ii = i0; ii < i1; ii += kMr) {
+                        float * c = buffer + (ii - i0) * 2 * kQuantizedGatedColumns + side * kQuantizedGatedColumns + jj;
+                        qtiles(kernel, wide, groups, q.quads, operands.rows + (ii / kMr) * a_panel, b, b_panel, c, ldb, false,
+                               std::min<std::int64_t>(kMr, i1 - ii), std::min(step, width - jj));
+                    }
+                }
+            }
+        }
+        const Phase_scope scope(Phase::transform_out);
+        gated_epilogue(g, chain, out, buffer, i0, i1, c0, width);
     }
 }
 
@@ -552,6 +764,7 @@ std::size_t gated_thread_bytes(const Mul_mat & g, const Plan & pl) {
 
 void gated_epilogue(const Mul_mat & g, const Epilogue & chain, const ggml_tensor * out, float * buffer, std::int64_t i0,
                     std::int64_t i1, std::int64_t c0, std::int64_t width) {
+    static_assert(kGatedColumns == kQuantizedGatedColumns, "the tiles of both halves lie alike");
     const std::int64_t half = g.n / 2;
     const auto onb1 = static_cast<std::int64_t>(out->nb[1]);
     for (std::int64_t m = i0; m < i1; ++m) {
@@ -786,6 +999,10 @@ void compute_gated_amx(const ggml_compute_params * params, const Mul_mat & g, co
 }  // namespace
 
 bool mul_mat_gated_supported(const ggml_tensor * node, const Epilogue & chain, const ggml_tensor * out) {
+    // Quantized, each half's columns begin a panel.
+    if (quantized_product(geometry(node)) && node->ne[0] / 2 % kNr != 0) {
+        return false;
+    }
     // What the result is written to is not what the product reads: the
     // allocator may have given it the memory of the layer's input, which is
     // free once the layer has read it, as it would be without the fusion.
@@ -812,6 +1029,10 @@ bool mul_mat_gated_supported(const ggml_tensor * node, const Epilogue & chain, c
 void mul_mat_compute_gated(const ggml_compute_params * params, ggml_tensor * node, const Epilogue & chain,
                            const ggml_tensor * out) {
     const Mul_mat g = geometry(node);
+    if (quantized_product(g)) {
+        compute_quantized_gated(params, g, chain, out);
+        return;
+    }
     if (gated_on_amx(g)) {
         compute_gated_amx(params, g, chain, out);
         return;
@@ -824,6 +1045,10 @@ void mul_mat_compute(const ggml_compute_params * params, ggml_tensor * node, con
     if (chain.redirect != nullptr) {
         // The residual connection's tensor, of the same layout (fusion.h).
         g.y = static_cast<char *>(chain.redirect->data);
+    }
+    if (quantized_product(g)) {
+        compute_quantized(params, g, chain);
+        return;
     }
     if (amx_product(g)) {
         compute_amx(params, g, chain);

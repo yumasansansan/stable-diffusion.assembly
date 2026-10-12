@@ -41,6 +41,7 @@ struct Cpu {
     bool avx512_bf16 = false;
     bool avx512_fp16 = false;
     bool avx_vnni = false;
+    bool avx512_vnni = false;
     bool amx_bf16 = false;     // AMX-TILE and AMX-BF16, with AVX512-BF16 and the system's leave to use the tiles
     bool amx_fp16 = false;
 };
@@ -121,6 +122,11 @@ struct Tuning {
     int fuse_residual = 1;         // and the residual connections that end them: 1, apart: 0
     int guided = 1;                // blocks shrinking toward the end of an operation: 1, all alike: 0
     int store_forget = 1;          // the store forgets what changes: 1; 0 only for its canary test
+    int bits = 0;                  // the products': 0 single precision; 2 to 8 integers, the weights of that many bits (quant.h)
+    int input_bits = 8;            // and the inputs', 2 to 8, unsigned with a zero point
+    int group = 64;                // the numbers of k sharing a scale, a multiple of 4
+    int weight_group = 1;          // the weights' scale for each group: 1; for a whole row of k: 0
+    int quantize = 7;              // with bits, the operations quantized: 1 the linear layers, 2 the convolutions, 4 attention
 };
 
 const Tuning & tuning();
@@ -193,6 +199,25 @@ void sdasm_winograd4_inputs_avx2(const sdasm::Winograd4_inputs * job);
 void sdasm_winograd4_weights_avx2(float * dst, std::int64_t stride, const float * g, std::int64_t channels);
 void sdasm_winograd4_outputs_avx2(const float * m, std::int64_t stride, float * row, std::int64_t ldc, std::int64_t groups,
                                   std::int64_t add);
+
+// The micro-kernels of the quantized products for AVX-VNNI (x86_64/quant_avx2.S).
+void sdasm_qgemm_6x16_au_avxvnni(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
+                                 float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_qgemm_6x16_bu_avxvnni(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
+                                 float * c, std::int64_t ldc, std::int64_t accumulate);
+
+// The quantization of a panel of sixteen columns (x86_64/quantize_avx2.S).
+void sdasm_quantize16_avx2(std::uint8_t * dst, const float * src, std::int64_t groups, std::int64_t quads, float levels);
+
+// And for AVX512-VNNI (x86_64/quant_avx512.S).
+void sdasm_qgemm_6x16_au_avx512(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
+                                float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_qgemm_6x16_bu_avx512(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
+                                float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_qgemm_6x32_au_avx512(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
+                                std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_qgemm_6x32_bu_avx512(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
+                                std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
 
 // The kernels written by hand for AVX-512 F, VL, BW and DQ (x86_64/*_avx512.S).
 void sdasm_gemm_6x16_avx512(std::int64_t kc, const float * a, const float * b, float * c, std::int64_t ldc,

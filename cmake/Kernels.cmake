@@ -32,6 +32,7 @@ add_library(sdasm STATIC
   "${PROJECT_SOURCE_DIR}/sources/mul_mat.cc"
   "${PROJECT_SOURCE_DIR}/sources/norm.cc"
   "${PROJECT_SOURCE_DIR}/sources/profile.cc"
+  "${PROJECT_SOURCE_DIR}/sources/quant.cc"
   "${PROJECT_SOURCE_DIR}/sources/store.cc"
   "${PROJECT_SOURCE_DIR}/sources/winograd.cc")
 if(SDASM_X86_64)
@@ -46,6 +47,9 @@ if(SDASM_X86_64)
     "${PROJECT_SOURCE_DIR}/sources/x86_64/gemm_avx2.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/gemm_avx512.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/pack_avx2.S"
+    "${PROJECT_SOURCE_DIR}/sources/x86_64/quant_avx2.S"
+    "${PROJECT_SOURCE_DIR}/sources/x86_64/quant_avx512.S"
+    "${PROJECT_SOURCE_DIR}/sources/x86_64/quantize_avx2.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/softmax_avx2.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/softmax_avx512.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/winograd_avx2.S"

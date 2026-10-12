@@ -37,11 +37,12 @@ struct Key {
     std::int64_t ne[4];
     std::size_t nb[4];
     Layout layout;
+    std::uint64_t variant;
 
     bool operator<(const Key & other) const {
-        return std::tie(begin, name, type, ne[0], ne[1], ne[2], ne[3], nb[0], nb[1], nb[2], nb[3], layout) <
+        return std::tie(begin, name, type, ne[0], ne[1], ne[2], ne[3], nb[0], nb[1], nb[2], nb[3], layout, variant) <
                std::tie(other.begin, other.name, other.type, other.ne[0], other.ne[1], other.ne[2], other.ne[3], other.nb[0],
-                        other.nb[1], other.nb[2], other.nb[3], other.layout);
+                        other.nb[1], other.nb[2], other.nb[3], other.layout, other.variant);
     }
 };
 
@@ -50,11 +51,18 @@ struct Entry {
     std::size_t size;                // the bytes it was packed from
 };
 
-std::size_t budget_from_environment() {
+// The budget of the quantized layouts when the environment gives none.
+constexpr std::size_t kQuantizedBudget = std::size_t{8} << 30;
+
+std::size_t budget_from_environment(bool quantized) {
     if (const char * value = std::getenv("SDASM_STORE_MB")) {
         return static_cast<std::size_t>(std::strtoull(value, nullptr, 10)) << 20;
     }
-    return 0;
+    return quantized ? kQuantizedBudget : 0;
+}
+
+bool quantized_layout(Layout layout) {
+    return layout == Layout::quantized_linear || layout == Layout::quantized_winograd || layout == Layout::quantized_conv;
 }
 
 struct State {
@@ -63,7 +71,10 @@ struct State {
     std::atomic<std::size_t> count{0};
     std::size_t used = 0;
     std::size_t largest = 0;  // the most bytes any entry was packed from
-    std::size_t budget = budget_from_environment();
+    std::size_t budget = budget_from_environment(false);
+    // The quantized layouts', apart.
+    std::size_t quantized_used = 0;
+    std::size_t quantized_budget = budget_from_environment(true);
 };
 
 State & state() {
@@ -77,8 +88,8 @@ bool Packed::ready() const {
     return state.load(std::memory_order_acquire) == kReady;
 }
 
-std::shared_ptr<Packed> packed(const ggml_tensor * tensor, Layout layout, std::size_t bytes) {
-    Key key{static_cast<const char *>(tensor->data), tensor->name, tensor->type, {}, {}, layout};
+std::shared_ptr<Packed> packed(const ggml_tensor * tensor, Layout layout, std::size_t bytes, std::uint64_t variant) {
+    Key key{static_cast<const char *>(tensor->data), tensor->name, tensor->type, {}, {}, layout, variant};
     for (int k = 0; k < 4; ++k) {
         key.ne[k] = tensor->ne[k];
         key.nb[k] = tensor->nb[k];
@@ -90,10 +101,12 @@ std::shared_ptr<Packed> packed(const ggml_tensor * tensor, Layout layout, std::s
         return it->second.packed;
     }
     std::shared_ptr<Packed> p;
-    if (s.used + bytes <= s.budget) {
+    std::size_t & used = quantized_layout(layout) ? s.quantized_used : s.used;
+    const std::size_t budget = quantized_layout(layout) ? s.quantized_budget : s.budget;
+    if (used + bytes <= budget) {
         void * memory = std::aligned_alloc(64, (bytes + 63) / 64 * 64);
         if (memory != nullptr) {
-            s.used += bytes;
+            used += bytes;
             p = std::shared_ptr<Packed>(new Packed, [](Packed * q) {
                 std::free(q->data);
                 delete q;
@@ -131,7 +144,7 @@ void forget(const void * begin, std::size_t size) {
         const char * eb = it->first.begin;
         if (b < eb + it->second.size) {
             if (it->second.packed != nullptr) {
-                s.used -= it->second.packed->bytes;
+                (quantized_layout(it->first.layout) ? s.quantized_used : s.used) -= it->second.packed->bytes;
             }
             it = s.entries.erase(it);
             s.count.fetch_sub(1, std::memory_order_relaxed);

@@ -22,7 +22,7 @@ target_include_directories(sdasm_ops_test SYSTEM PRIVATE
   "${SDASM_GGML_DIR}/include")
 target_compile_definitions(sdasm_ops_test PRIVATE ${SDASM_SD_DEFINITIONS})
 
-foreach(SDASM_TEST_OP IN ITEMS conv2d mul_mat attention gated fusion store)
+foreach(SDASM_TEST_OP IN ITEMS conv2d mul_mat attention gated fusion store quantized)
   add_test(NAME ops.${SDASM_TEST_OP} COMMAND sdasm_ops_test ${SDASM_TEST_OP})
   # The operations with the weights kept between graphs as well (store.h): the
   # first computation of each fills the store, and those after read from it.

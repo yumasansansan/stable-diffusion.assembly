@@ -69,6 +69,7 @@
 
 #include "gemm.h"
 #include "kernels.h"
+#include "quant.h"
 #include "ops.h"
 #include "phases.h"
 
@@ -477,6 +478,258 @@ void compute_amx(const ggml_compute_params * params, const Attention & a) {
 
 }  // namespace
 
+namespace {
+
+// ---------------------------------------------------------------- quantized
+
+// Self-attention's products in integers (quant.h, Tuning::bits): the keys,
+// signed, each over the whole of the head's dimensions, and the queries,
+// unsigned with a zero point, likewise -- their product, a score, is then
+// one group, scaled once, the scale of the softmax folded into the queries'
+// scales; the values, signed, each dimension's in groups of keys
+// (Tuning::group), and the exponentials, unsigned, each query's in groups of
+// keys too: an exponential of 8 bits of one scale for all the keys rounds the
+// small ones away, 10% and more of the output lost where they are many, and
+// the group's own scale keeps them. Measured on SD 1.5, the outputs of its
+// self-attention are then within 1 to 4 times 10^-3 of the exact ones, in the
+// L2 norm. Its cross-attention, over 77 tokens of the prompt, a fiftieth of
+// the work, stays in single precision: over so few keys, a few large weights
+// and many small ones, it is ten times further.
+constexpr std::int64_t kQuantizedKeys = 256;  // the fewest keys quantized
+
+bool quantized_attention(const Attention & a) {
+    return quantized(Quantized_op::attention) && a.lk >= kQuantizedKeys;
+}
+
+// The quantization of the keys and queries, one group over the dimensions,
+// and of the values and exponentials, groups of keys.
+Quant over_dims(const Attention & a) {
+    Quant q = quant();
+    q.quads = ceil_div(a.d, 4);
+    q.weight_groups = true;
+    return q;
+}
+
+Quant over_keys() {
+    Quant q = quant();
+    q.weight_groups = true;
+    return q;
+}
+
+struct Quantized_layout {
+    std::int64_t key_block;     // the keys of a stretch, a multiple of 32
+    std::int64_t lk_groups;     // lk rounded up to 32
+    std::size_t keys_bytes;     // a head's quantized keys: panels of kMr keys
+    std::size_t values_bytes;   // and values: panels of kMr dimensions over every key
+    std::size_t head_bytes, shared_bytes;
+    std::size_t floats_bytes;   // a thread's panel of single precision, for the packing
+    std::size_t queries_bytes;  // its queries, in single precision and quantized
+    std::size_t qqueries_bytes;
+    std::size_t scores_bytes, weights_bytes, output_bytes, maxima_bytes, sums_bytes;
+    std::size_t thread_bytes;
+};
+
+Quantized_layout quantized_layout(const Attention & a) {
+    Quantized_layout l{};
+    const Quant qd = over_dims(a);
+    const Quant qk = over_keys();
+    const std::int64_t group = 4 * qk.quads;
+    l.key_block = std::max<std::int64_t>(group, a.key_block / group * group);
+    l.lk_groups = round_up(a.lk, group);
+    l.keys_bytes = align_up(static_cast<std::size_t>(ceil_div(a.lk, kMr) * qpanel_bytes(a.d, kMr, qd)));
+    l.values_bytes = align_up(static_cast<std::size_t>(ceil_div(a.dv, kMr) * qpanel_bytes(l.lk_groups, kMr, qk)));
+    l.head_bytes = l.keys_bytes + l.values_bytes;
+    l.shared_bytes = l.head_bytes * static_cast<std::size_t>(a.hk * a.b);
+    l.floats_bytes = align_up(static_cast<std::size_t>(std::max(a.d, l.lk_groups) * kMr) * sizeof(float));
+    l.queries_bytes = align_up(static_cast<std::size_t>(a.queries * a.d) * sizeof(float));
+    l.qqueries_bytes = align_up(static_cast<std::size_t>(a.queries / kNr * qpanel_bytes(a.d, kNr, qd)));
+    l.scores_bytes = align_up(static_cast<std::size_t>(a.queries * round_up(a.lk, kMr)) * sizeof(float));
+    l.weights_bytes = align_up(static_cast<std::size_t>(a.queries / kNr * qpanel_bytes(l.key_block, kNr, qk)));
+    l.output_bytes = align_up(static_cast<std::size_t>(round_up(a.dv, kMr) * a.queries) * sizeof(float));
+    l.maxima_bytes = align_up(static_cast<std::size_t>(a.queries) * sizeof(float));
+    l.sums_bytes = align_up(static_cast<std::size_t>(a.queries) * sizeof(double));
+    l.thread_bytes = l.floats_bytes + l.queries_bytes + l.qqueries_bytes + l.scores_bytes + l.weights_bytes +
+                     l.output_bytes + l.maxima_bytes + l.sums_bytes;
+    return l;
+}
+
+void compute_quantized(const ggml_compute_params * params, const Attention & a) {
+    const Quantized_layout l = quantized_layout(a);
+    const Quant qd = over_dims(a);
+    const Quant qk = over_keys();
+    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
+    char * mine = base + l.shared_bytes + l.thread_bytes * static_cast<std::size_t>(params->ith);
+    auto * floats = reinterpret_cast<float *>(mine);
+    mine += l.floats_bytes;
+    auto * queries = reinterpret_cast<float *>(mine);
+    mine += l.queries_bytes;
+    auto * qqueries = reinterpret_cast<std::uint8_t *>(mine);
+    mine += l.qqueries_bytes;
+    auto * scores = reinterpret_cast<float *>(mine);
+    mine += l.scores_bytes;
+    auto * weights = reinterpret_cast<std::uint8_t *>(mine);
+    mine += l.weights_bytes;
+    auto * output = reinterpret_cast<float *>(mine);
+    mine += l.output_bytes;
+    auto * maxima = reinterpret_cast<float *>(mine);
+    mine += l.maxima_bytes;
+    auto * sums = reinterpret_cast<double *>(mine);
+    const Qkernel kernel = qkernel_b_unsigned();
+    const std::int64_t key_panel = qpanel_bytes(a.d, kMr, qd);
+    const std::int64_t value_panel = qpanel_bytes(l.lk_groups, kMr, qk);
+    const std::int64_t query_panel = qpanel_bytes(a.d, kNr, qd);
+    const std::int64_t weight_panel = qpanel_bytes(l.key_block, kNr, qk);
+    const auto head_of = [&](std::int64_t b, std::int64_t hk) {
+        return reinterpret_cast<std::uint8_t *>(base) + static_cast<std::size_t>(b * a.hk + hk) * l.head_bytes;
+    };
+
+    Work_queue queue(params);
+    // The keys and the values of every head: a panel of kMr keys, or of kMr
+    // dimensions, to an item, packed in single precision and quantized.
+    const std::int64_t key_panels = ceil_div(a.lk, kMr);
+    const std::int64_t value_panels = ceil_div(a.dv, kMr);
+    const std::int64_t per_head = key_panels + value_panels;
+    const std::int64_t pack_items = a.b * a.hk * per_head;
+    int item = queue.next();
+    for (; item < pack_items; item = queue.next()) {
+        const std::int64_t head = item / per_head;
+        const std::int64_t panel = item % per_head;
+        const std::int64_t b = head / a.hk;
+        const std::int64_t hk = head % a.hk;
+        std::uint8_t * keys = head_of(b, hk);
+        const Phase_scope scope(Phase::pack_weights);
+        if (panel < key_panels) {
+            const std::int64_t r0 = panel * kMr;
+            const char * src = a.k + b * a.knb3 + hk * a.knb2 + r0 * a.knb1;
+            const std::int64_t rows = std::min<std::int64_t>(kMr, a.lk - r0);
+            if (a.ktype == GGML_TYPE_F16) {
+                pack_rows_f16(floats, reinterpret_cast<const std::uint16_t *>(src), a.knb1, rows, 0, a.d, kMr);
+            }
+            else {
+                pack_rows_f32(floats, reinterpret_cast<const float *>(src), a.knb1, rows, 0, a.d, kMr);
+            }
+            quantize_panel_weights(keys + panel * key_panel, floats, a.d, kMr, qd);
+        }
+        else {
+            const std::int64_t d0 = (panel - key_panels) * kMr;
+            const char * src = a.v + b * a.vnb3 + hk * a.vnb2;
+            const std::int64_t width = std::min<std::int64_t>(kMr, a.dv - d0);
+            // The panel of kMr dimensions over the keys, [lk][kMr], zeros past
+            // the last dimension and the last key.
+            for (std::int64_t j = 0; j < l.lk_groups; ++j) {
+                float * out = floats + j * kMr;
+                for (std::int64_t i = 0; i < kMr; ++i) {
+                    float x = 0.0f;
+                    if (j < a.lk && i < width) {
+                        const char * p = src + j * a.vnb1;
+                        x = a.vtype == GGML_TYPE_F16 ? _cvtsh_ss(reinterpret_cast<const std::uint16_t *>(p)[d0 + i])
+                                                     : reinterpret_cast<const float *>(p)[d0 + i];
+                    }
+                    out[i] = x;
+                }
+            }
+            quantize_panel_weights(keys + l.keys_bytes + (panel - key_panels) * value_panel, floats, l.lk_groups, kMr, qk);
+        }
+    }
+    queue.barrier();
+
+    const std::int64_t blocks = ceil_div(a.lq, a.queries);
+    const std::int64_t units = a.b * a.h * blocks;
+    const std::int64_t lk_padded = key_panels * kMr;
+    for (; item < pack_items + units; item = queue.next()) {
+        std::int64_t u = item - pack_items;
+        const std::int64_t block = u % blocks;
+        u /= blocks;
+        const std::int64_t h = u % a.h;
+        const std::int64_t b = u / a.h;
+        const std::int64_t hk = h / (a.h / a.hk);
+        const std::int64_t q0 = block * a.queries;
+        const std::int64_t nq = std::min(a.queries, a.lq - q0);
+        const std::int64_t qpanels = ceil_div(nq, kNr);
+        const std::uint8_t * keys = head_of(b, hk);
+        const std::uint8_t * values = keys + l.keys_bytes;
+
+        {
+            // The queries, a panel of kNr, the scale of the softmax folded into
+            // their scales and offsets.
+            const Phase_scope scope(Phase::pack_inputs);
+            pack_rows_f32(queries, reinterpret_cast<const float *>(a.q + b * a.qnb3 + h * a.qnb2 + q0 * a.qnb1), a.qnb1,
+                          nq, 0, a.d, kNr);
+            for (std::int64_t qp = 0; qp < qpanels; ++qp) {
+                std::uint8_t * panel = qqueries + qp * query_panel;
+                quantize_panel_inputs(panel, queries + qp * a.d * kNr, a.d, kNr, qd);
+                float meta[2 * kNr];
+                std::memcpy(meta, panel + qd.quads * kNr * 4, sizeof meta);
+                for (float & m : meta) {
+                    m *= a.scale;
+                }
+                std::memcpy(panel + qd.quads * kNr * 4, meta, sizeof meta);
+            }
+        }
+        {
+            // The scores, keys by queries, scaled; and each query's greatest.
+            const Phase_scope scope(Phase::product);
+            for (std::int64_t qp = 0; qp < qpanels; ++qp) {
+                float * panel = scores + qp * lk_padded * kNr;
+                // Each tile's greatest taken while it is in the nearest cache.
+                float top[kNr];
+                for (int lane = 0; lane < kNr; ++lane) {
+                    top[lane] = -INFINITY;
+                }
+                for (std::int64_t kp = 0; kp < key_panels; ++kp) {
+                    const std::int64_t rows = std::min<std::int64_t>(kMr, a.lk - kp * kMr);
+                    float * tile = panel + kp * kMr * kNr;
+                    qtile(kernel, 1, qd.quads, keys + kp * key_panel, qqueries + qp * query_panel, tile,
+                          kNr * static_cast<std::int64_t>(sizeof(float)), false, rows, kNr);
+                    for (std::int64_t j = 0; j < rows; ++j) {
+                        for (int lane = 0; lane < kNr; ++lane) {
+                            top[lane] = std::max(top[lane], tile[j * kNr + lane]);
+                        }
+                    }
+                }
+                for (int lane = 0; lane < kNr; ++lane) {
+                    maxima[qp * kNr + lane] = top[lane];
+                    sums[qp * kNr + lane] = 0;
+                }
+            }
+        }
+        // The exponentials of a stretch of keys, quantized, and the sum of the
+        // values by them.
+        for (std::int64_t j0 = 0; j0 < a.lk; j0 += l.key_block) {
+            const std::int64_t j1 = std::min(a.lk, j0 + l.key_block);
+            {
+                const Phase_scope scope(Phase::softmax);
+                for (std::int64_t qp = 0; qp < qpanels; ++qp) {
+                    float * panel = scores + qp * lk_padded * kNr;
+                    exponentials(panel, j0, j1, maxima + qp * kNr, sums + qp * kNr);
+                    quantize_panel_inputs(weights + qp * weight_panel, panel + j0 * kNr, j1 - j0, kNr, qk);
+                }
+            }
+            const Phase_scope scope(Phase::product);
+            const std::int64_t groups = ceil_div(j1 - j0, 4 * qk.quads);
+            const std::int64_t ldc = a.queries * static_cast<std::int64_t>(sizeof(float));
+            for (std::int64_t dp = 0; dp < value_panels; ++dp) {
+                const std::uint8_t * v = values + dp * value_panel + (j0 / (4 * qk.quads)) * qgroup_bytes(qk.quads, kMr);
+                for (std::int64_t qp = 0; qp < qpanels; ++qp) {
+                    qtile(kernel, groups, qk.quads, v, weights + qp * weight_panel, output + dp * kMr * a.queries + qp * kNr, ldc,
+                          j0 > 0, kMr, kNr);
+                }
+            }
+        }
+        const Phase_scope scope(Phase::transform_out);
+        char * dst = a.out + b * a.onb3 + h * a.onb1;
+        for (std::int64_t i = 0; i < nq; ++i) {
+            const auto reciprocal = static_cast<float>(1.0 / sums[i]);
+            float * row = reinterpret_cast<float *>(dst + (q0 + i) * a.onb2);
+            for (std::int64_t c = 0; c < a.dv; ++c) {
+                row[c] = output[c * a.queries + i] * reciprocal;
+            }
+        }
+    }
+}
+
+}  // namespace
+
 bool attention_supported(const ggml_tensor * node) {
     if (node->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
@@ -499,6 +752,10 @@ bool attention_supported(const ggml_tensor * node) {
 
 std::size_t attention_work_size(const ggml_tensor * node, int n_threads) {
     const Attention a = geometry(node);
+    if (quantized_attention(a)) {
+        const Quantized_layout l = quantized_layout(a);
+        return kAlign + l.shared_bytes + l.thread_bytes * static_cast<std::size_t>(n_threads);
+    }
     if (on_amx(a)) {
         const Amx_layout l = amx_layout(a);
         return kAlign + l.shared_bytes + l.thread_bytes * static_cast<std::size_t>(n_threads);
@@ -509,6 +766,10 @@ std::size_t attention_work_size(const ggml_tensor * node, int n_threads) {
 
 void attention_compute(const ggml_compute_params * params, ggml_tensor * node) {
     const Attention a = geometry(node);
+    if (quantized_attention(a)) {
+        compute_quantized(params, a);
+        return;
+    }
     if (on_amx(a)) {
         compute_amx(params, a);
         return;

@@ -182,12 +182,79 @@ bool run(const char * name, ggml_context * ctx, ggml_tensor * out, int threads, 
     return ok;
 }
 
+// The quantized forms (quant.h, Tuning::bits): each within kQuantized of the
+// exact result, of the magnitudes summed, and the kernels written by hand
+// within kSingle of the C++ ones, which sum the same integers. Inputs of 8
+// bits in [-1, 1] are within 1/255 of themselves, weights of 8 bits in
+// [-0.25, 0.25] within 1/1016: a product within about 1% of the magnitudes in
+// the worst case, the sum of a few hundred of them, with errors of either
+// sign, nearer 0.1%.
+constexpr double kQuantized = 1e-2;
+
+// Attention's forms differ in the last bits of their exponentials, as in single
+// precision, and an exponential that lands next to the boundary between two
+// steps of 8 bits rounds to one in one form and to the other in another: a
+// step of a group of 32 keys, of the sum of thousands.
+constexpr double kQuantizedApart = 1e-3;
+
+template <class Exact>
+bool run_quantized(const char * name, ggml_context * ctx, ggml_tensor * out, int threads, Exact exact,
+                   double apart_bound = kSingle) {
+    const sdasm::Tuning saved = sdasm::tuning();
+    sdasm::Tuning t = saved;
+    t.bits = 8;
+    sdasm::set_tuning(t);
+    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    const std::int64_t n = ggml_nelements(out);
+    const std::vector<Form> all = forms(false);
+    std::vector<Result> results(all.size());
+    bool computed = true;
+    for (std::size_t f = 0; f < all.size() && computed; ++f) {
+        use(all[f]);
+        std::memset(out->data, 0xff, ggml_nbytes(out));
+        computed = ggml_graph_compute_with_ctx(ctx, graph, threads) == GGML_STATUS_SUCCESS;
+        results[f].values.assign(static_cast<const float *>(out->data), static_cast<const float *>(out->data) + n);
+    }
+    use_default();
+    sdasm::set_tuning(saved);
+    if (!computed) {
+        std::printf("FAIL %s: the graph was not computed\n", name);
+        return false;
+    }
+    const Result & cxx = results.back();
+    std::vector<double> apart(all.size(), 0.0);
+    for (std::int64_t i = 0; i < n; ++i) {
+        double magnitude = 0;
+        const double value = exact(i, magnitude);
+        const double scale = magnitude > 0 ? magnitude : 1;
+        const auto at_i = static_cast<std::size_t>(i);
+        for (std::size_t f = 0; f < all.size(); ++f) {
+            const double v = static_cast<double>(results[f].values[at_i]);
+            const double e = std::fabs(v - value) / scale;
+            const double d = std::fabs(v - static_cast<double>(cxx.values[at_i])) / scale;
+            results[f].worst = std::isfinite(e) ? std::fmax(results[f].worst, e) : HUGE_VAL;
+            apart[f] = std::isfinite(d) ? std::fmax(apart[f], d) : HUGE_VAL;
+        }
+    }
+    bool ok = true;
+    std::string errors;
+    for (std::size_t f = 0; f < all.size(); ++f) {
+        ok = ok && results[f].worst <= kQuantized && apart[f] <= apart_bound;
+        char text[96];
+        std::snprintf(text, sizeof text, "%s%s %.3g (%.2g from cxx)", f == 0 ? "" : ", ", all[f].name, results[f].worst, apart[f]);
+        errors += text;
+    }
+    std::printf("%s %s, quantized: error relative to the magnitudes: %s\n", ok ? "ok  " : "FAIL", name, errors.c_str());
+    return ok;
+}
+
 struct Conv_case {
     int w, h, ic, oc, kw, kh, s0, s1, p0, p1, d0, d1, n;
     ggml_type type;
 };
 
-bool conv2d(const Conv_case & c, int threads) {
+bool conv2d(const Conv_case & c, int threads, bool quantized = false) {
     const std::size_t bytes = std::size_t{512} << 20;
     ggml_init_params params{bytes, nullptr, false};
     ggml_context * ctx = ggml_init(params);
@@ -201,7 +268,7 @@ bool conv2d(const Conv_case & c, int threads) {
                   ggml_type_name(c.type), c.w, c.h, c.ic, c.oc, c.kw, c.kh, c.s0, c.s1, c.p0, c.p1, c.d0, c.d1, c.n);
     const std::int64_t ow = y->ne[0];
     const std::int64_t oh = y->ne[1];
-    const bool ok = run(name, ctx, y, threads, [&](std::int64_t i, double & magnitude) {
+    const auto exact = [&](std::int64_t i, double & magnitude) {
         const std::int64_t ox = i % ow;
         const std::int64_t oy = (i / ow) % oh;
         const std::int64_t oc = (i / (ow * oh)) % c.oc;
@@ -223,7 +290,8 @@ bool conv2d(const Conv_case & c, int threads) {
             }
         }
         return sum;
-    }, kAmxProducts);
+    };
+    const bool ok = quantized ? run_quantized(name, ctx, y, threads, exact) : run(name, ctx, y, threads, exact, kAmxProducts);
     ggml_free(ctx);
     return ok;
 }
@@ -233,7 +301,7 @@ struct Mul_mat_case {
     ggml_type type;
 };
 
-bool mul_mat(const Mul_mat_case & c, int threads) {
+bool mul_mat(const Mul_mat_case & c, int threads, bool quantized = false) {
     const std::size_t bytes = std::size_t{512} << 20;
     ggml_init_params params{bytes, nullptr, false};
     ggml_context * ctx = ggml_init(params);
@@ -244,7 +312,7 @@ bool mul_mat(const Mul_mat_case & c, int threads) {
     ggml_tensor * y = ggml_mul_mat(ctx, w, x);
     char name[128];
     std::snprintf(name, sizeof name, "mul_mat %s %d -> %d, %d rows x %d", ggml_type_name(c.type), c.k, c.n, c.m, c.batch);
-    const bool ok = run(name, ctx, y, threads, [&](std::int64_t i, double & magnitude) {
+    const auto exact = [&](std::int64_t i, double & magnitude) {
         const std::int64_t j = i % c.n;
         const std::int64_t r = (i / c.n) % c.m;
         const std::int64_t b = i / (std::int64_t{c.n} * c.m);
@@ -256,7 +324,8 @@ bool mul_mat(const Mul_mat_case & c, int threads) {
             magnitude += std::fabs(p);
         }
         return sum;
-    }, kAmxProducts);
+    };
+    const bool ok = quantized ? run_quantized(name, ctx, y, threads, exact) : run(name, ctx, y, threads, exact, kAmxProducts);
     ggml_free(ctx);
     return ok;
 }
@@ -286,7 +355,7 @@ ggml_tensor * attention_graph(ggml_context * ctx, ggml_tensor * q, ggml_tensor *
     return ggml_reshape_3d(ctx, kqv, c.d * c.h, c.lq, c.b);
 }
 
-bool attention(const Attention_case & c, int threads) {
+bool attention(const Attention_case & c, int threads, bool quantized = false) {
     const std::size_t bytes = std::size_t{1} << 30;
     ggml_init_params params{bytes, nullptr, false};
     ggml_context * ctx = ggml_init(params);
@@ -345,10 +414,16 @@ bool attention(const Attention_case & c, int threads) {
     char name[160];
     std::snprintf(name, sizeof name, "attention q %s, k and v %s: %d dimensions, %d queries, %d keys, %d heads (%d of keys), %d batches",
                   ggml_type_name(GGML_TYPE_F32), ggml_type_name(c.kv_type), c.d, c.lq, c.lk, c.h, c.hk, c.b);
-    bool ok = run(name, ctx, out, threads, [&](std::int64_t i, double & magnitude) {
+    const auto exact_at = [&](std::int64_t i, double & magnitude) {
         magnitude = magnitudes[static_cast<std::size_t>(i)];
         return exact[static_cast<std::size_t>(i)];
-    });
+    };
+    if (quantized) {
+        const bool ok = run_quantized(name, ctx, out, threads, exact_at, kQuantizedApart);
+        ggml_free(ctx);
+        return ok;
+    }
+    bool ok = run(name, ctx, out, threads, exact_at);
 
     // The graph stable-diffusion.cpp builds without flash attention, in ggml's
     // own kernels, which is what the operation stands in for.
@@ -510,7 +585,7 @@ bool store(const char * name, int threads,
 // table of FP16; the error of each form is measured against the exact
 // x GELU(gate), relative to the magnitudes it is computed from: those of the
 // products summed into x and the gate, by how much the result moves with each.
-bool gated_gelu(int k, int half, int m, int batch, int threads) {
+bool gated_gelu(int k, int half, int m, int batch, int threads, bool quantized = false) {
     const std::size_t bytes = std::size_t{512} << 20;
     ggml_init_params params{bytes, nullptr, false};
     ggml_context * ctx = ggml_init(params);
@@ -548,10 +623,11 @@ bool gated_gelu(int k, int half, int m, int batch, int threads) {
     }
     char name[128];
     std::snprintf(name, sizeof name, "gated GELU after linear %d -> 2 x %d, %d rows x %d", k, half, m, batch);
-    const bool ok = run(name, ctx, out, threads, [&](std::int64_t i, double & magnitude) {
+    const auto exact_at = [&](std::int64_t i, double & magnitude) {
         magnitude = magnitudes[static_cast<std::size_t>(i)];
         return exact[static_cast<std::size_t>(i)];
-    }, kAmxProducts);
+    };
+    const bool ok = quantized ? run_quantized(name, ctx, out, threads, exact_at) : run(name, ctx, out, threads, exact_at, kAmxProducts);
     ggml_free(ctx);
     return ok;
 }
@@ -560,7 +636,7 @@ bool gated_gelu(int k, int half, int m, int batch, int threads) {
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: %s conv2d|mul_mat|attention|gated|fusion|store [threads]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s conv2d|mul_mat|attention|gated|fusion|store|quantized [threads]\n", argv[0]);
         return 2;
     }
     const std::string what = argv[1];
@@ -602,6 +678,56 @@ int main(int argc, char ** argv) {
         };
         for (const auto & c : cases) {
             ok = mul_mat(c, threads) && ok;
+        }
+    }
+    else if (what == "quantized") {
+        // Winograd's convolutions of small and large images, and the direct
+        // ones, of the cases above.
+        const Conv_case conv_cases[] = {
+            {64, 64, 64, 48, 3, 3, 1, 1, 1, 1, 1, 1, 2, GGML_TYPE_F16},
+            {16, 16, 96, 64, 3, 3, 1, 1, 1, 1, 1, 1, 2, GGML_TYPE_F16},
+            {8, 8, 96, 64, 3, 3, 1, 1, 1, 1, 1, 1, 2, GGML_TYPE_F16},
+            {32, 32, 64, 40, 1, 1, 1, 1, 0, 0, 1, 1, 2, GGML_TYPE_F16},
+            {33, 33, 24, 30, 3, 3, 2, 2, 1, 1, 1, 1, 1, GGML_TYPE_F16},
+            {17, 13, 5, 7, 3, 3, 1, 1, 1, 1, 1, 1, 3, GGML_TYPE_F32},
+            {65, 33, 24, 20, 3, 3, 1, 1, 1, 1, 1, 1, 2, GGML_TYPE_F16},
+            {64, 20, 13, 11, 3, 3, 1, 1, 0, 0, 1, 1, 1, GGML_TYPE_F16},
+            {96, 16, 32, 17, 3, 3, 1, 1, 1, 1, 1, 1, 1, GGML_TYPE_F32},
+        };
+        for (const auto & c : conv_cases) {
+            ok = conv2d(c, threads, true) && ok;
+        }
+        // The linear layers of 256 rows and more, which are quantized, sizes of
+        // no multiple of a panel or a group among them; and of fewer, which
+        // are not.
+        const Mul_mat_case cases[] = {
+            {320, 320, 512, 2, GGML_TYPE_F16},
+            {768, 1280, 300, 1, GGML_TYPE_F16},
+            {1280, 320, 256, 1, GGML_TYPE_F16},
+            {77, 100, 300, 1, GGML_TYPE_F32},
+            {300, 17, 131, 3, GGML_TYPE_F16},
+            {40, 2560, 296, 1, GGML_TYPE_F32},
+            {768, 320, 77, 2, GGML_TYPE_F16},
+        };
+        for (const auto & c : cases) {
+            ok = mul_mat(c, threads, true) && ok;
+        }
+        // The gated GELU after the product, fused; and of halves of no multiple
+        // of a panel, apart.
+        ok = gated_gelu(320, 1280, 200, 2, threads, true) && ok;
+        ok = gated_gelu(96, 2000, 300, 1, threads, true) && ok;
+        ok = gated_gelu(40, 100, 300, 1, threads, true) && ok;
+        // Self-attention, over enough keys to be quantized, and cross-attention,
+        // over too few, in single precision.
+        const Attention_case attention_cases[] = {
+            {40, 300, 4096, 2, 2, 2, GGML_TYPE_F32},
+            {80, 100, 1024, 2, 2, 1, GGML_TYPE_F16},
+            {160, 64, 256, 2, 2, 2, GGML_TYPE_F32},
+            {40, 200, 77, 2, 2, 2, GGML_TYPE_F32},
+            {13, 37, 290, 4, 2, 3, GGML_TYPE_F32},
+        };
+        for (const auto & c : attention_cases) {
+            ok = attention(c, threads, true) && ok;
         }
     }
     else if (what == "attention") {

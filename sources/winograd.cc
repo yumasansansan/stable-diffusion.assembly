@@ -82,6 +82,7 @@
 #include "kernels.h"
 #include "ops.h"
 #include "phases.h"
+#include "quant.h"
 #include "store.h"
 
 #include "ggml-cpu-impl.h"
@@ -1715,6 +1716,273 @@ void compute_small4(const ggml_compute_params * params, const Conv & c, const Pl
 
 }  // namespace
 
+namespace {
+
+// ---------------------------------------------------------------- quantized
+
+// F(2x2, 3x3) with its products in integers (quant.h, Tuning::bits): the
+// transforms as above, in single precision, and each xi's product of the
+// transformed weights and inputs on the quantized micro-kernel -- the weights
+// signed, each output channel's in groups of the input channels, the inputs
+// unsigned with a zero point, each tile's likewise, a scale for each xi of
+// each: the sixteen elements of a transformed tile are of ranges that one
+// scale would waste the bits of, as Andri et al. (2022) found of the taps of
+// F(4x4, 3x3). Measured on SD 1.5, its outputs are within 7 times 10^-3 of
+// the exact ones in the L2 norm, F(4x4, 3x3)'s in integers 1.7 times 10^-2,
+// whose transforms make more of the rounding of the products.
+struct Qplan {
+    Quant q;
+    std::int64_t kc;          // a stretch of the input channels, a multiple of the group
+    std::int64_t opanels;     // panels of kMr output channels
+    std::int64_t u_panel;     // a quantized panel of transformed weights over every input channel
+    std::int64_t v_panel;     // a quantized panel of kNr tiles' transformed inputs over a stretch (large)
+                              // or over every input channel (small)
+    std::size_t weights_bytes, shared_bytes;
+    std::size_t widened_bytes, scratch_bytes, floats_bytes, quantized_bytes, product_bytes;
+    std::size_t thread_bytes;
+    Plan base;                // the blocks of the products, as in single precision
+};
+
+std::uint64_t qvariant(const Quant & q) {
+    return static_cast<std::uint64_t>(q.quads) | static_cast<std::uint64_t>(q.weight_max) << 16 |
+           static_cast<std::uint64_t>(q.weight_groups ? 1 : 0) << 32;
+}
+
+// The quantized transformed weights, the store's or the work buffer's at
+// `base`, packed by the queue's first items, from `item`, when they are not
+// ready -- a panel of kMr output channels to an item -- and the threads met
+// after them: the weights, and the number of those items, which the items
+// after count from.
+struct Quantized_weights {
+    std::uint8_t * data;
+    std::int64_t items;
+};
+
+Quantized_weights quantized_weights(const ggml_compute_params * params, const Conv & c, const Qplan & pl, char * base,
+                                    float * floats, float * widened, Work_queue & queue, int & item) {
+    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::quantized_winograd, pl.weights_bytes, qvariant(pl.q));
+    auto * weights = reinterpret_cast<std::uint8_t *>(kept != nullptr ? reinterpret_cast<char *>(kept->data) : base);
+    if (kept != nullptr && kept->ready()) {
+        return {weights, 0};
+    }
+    const std::int64_t group = 4 * pl.q.quads;
+    const std::int64_t a_group = qgroup_bytes(pl.q.quads, kMr);
+    const std::int64_t stride = xi_stride(kMr, pl.kc);
+    for (; item < pl.opanels; item = queue.next()) {
+        const Phase_scope scope(Phase::pack_weights);
+        for (std::int64_t k0 = 0; k0 < c.ic; k0 += pl.kc) {
+            const std::int64_t kc = std::min(pl.kc, c.ic - k0);
+            transform_weights(floats, stride, c, item * kMr, std::min<std::int64_t>(kMr, c.oc - item * kMr), k0, k0 + kc,
+                              widened);
+            for (int xi = 0; xi < kXi; ++xi) {
+                quantize_panel_weights(weights + (xi * pl.opanels + item) * pl.u_panel + k0 / group * a_group,
+                                       floats + xi * stride, kc, kMr, pl.q);
+            }
+        }
+    }
+    queue.barrier();
+    if (kept != nullptr && params->ith == 0) {
+        publish(kept);
+    }
+    return {weights, pl.opanels};
+}
+
+Qplan qplan(const Conv & c, int n_threads) {
+    Qplan pl{};
+    pl.q = quant();
+    pl.base = plan(c, n_threads);
+    const std::int64_t group = 4 * pl.q.quads;
+    pl.kc = std::max(group, pl.base.kc / group * group);
+    pl.opanels = ceil_div(c.oc, kMr);
+    pl.u_panel = qpanel_bytes(c.ic, kMr, pl.q);
+    pl.widened_bytes = align_up(static_cast<std::size_t>(kWidened * 9 * kMr + 8) * sizeof(float));
+    // The quantized weights of every xi and output channel, by all threads
+    // together, or the store's; each thread transforms a panel of them a
+    // stretch of input channels at a time.
+    pl.weights_bytes = align_up(static_cast<std::size_t>(kXi * pl.opanels * pl.u_panel));
+    const std::size_t transformed = align_up(static_cast<std::size_t>(kXi * xi_stride(kMr, pl.kc)) * sizeof(float));
+    if (pl.base.small) {
+        // The inputs of every tile, in single precision and quantized, by all
+        // threads.
+        pl.v_panel = qpanel_bytes(c.ic, kNr, pl.q);
+        pl.shared_bytes = pl.weights_bytes + pl.base.shared_bytes +
+                          align_up(static_cast<std::size_t>(kXi * pl.base.panels * pl.v_panel));
+        pl.floats_bytes = transformed;
+        pl.quantized_bytes = 0;
+        pl.scratch_bytes = pl.base.scratch_bytes;
+        pl.product_bytes = pl.base.product_bytes;
+    }
+    else {
+        // Each thread's inputs of a block of tiles, in single precision and
+        // quantized.
+        pl.v_panel = qpanel_bytes(pl.kc, kNr, pl.q);
+        pl.shared_bytes = pl.weights_bytes;
+        pl.floats_bytes = std::max(pl.base.panel_bytes, transformed);
+        pl.quantized_bytes = align_up(static_cast<std::size_t>(4 * (pl.base.tiles / kNr) * pl.v_panel));
+        pl.scratch_bytes = 0;
+        pl.product_bytes = pl.base.product_bytes;
+    }
+    pl.thread_bytes = pl.widened_bytes + pl.floats_bytes + pl.quantized_bytes + pl.scratch_bytes + pl.product_bytes;
+    return pl;
+}
+
+void compute_large_quantized(const ggml_compute_params * params, const Conv & c, const Qplan & pl, const Epilogue & chain) {
+    const Quant & q = pl.q;
+    const std::int64_t group = 4 * q.quads;
+    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
+    auto * weights = reinterpret_cast<std::uint8_t *>(base);
+    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
+    auto * widened = reinterpret_cast<float *>(mine);
+    auto * floats = reinterpret_cast<float *>(mine + pl.widened_bytes);
+    auto * inputs = reinterpret_cast<std::uint8_t *>(mine + pl.widened_bytes + pl.floats_bytes);
+    auto * products = reinterpret_cast<float *>(mine + pl.widened_bytes + pl.floats_bytes + pl.quantized_bytes);
+    const Qkernel kernel = qkernel_b_unsigned();
+    const Qkernel_wide wide = qkernel_wide_b_unsigned();
+    const std::int64_t step = wide != nullptr ? 2 * kNr : kNr;
+    const bool shuffle = avx2_kernels() && !avx512_kernels();
+    const std::int64_t a_group = qgroup_bytes(q.quads, kMr);
+
+    Work_queue queue(params);
+    int item = queue.next();
+    const Quantized_weights packed_weights = quantized_weights(params, c, pl, base, floats, widened, queue, item);
+    weights = packed_weights.data;
+    const std::int64_t pack_items = packed_weights.items;
+
+    const Plan & bp = pl.base;
+    const std::int64_t tiles = c.tw * c.th;
+    const std::vector<Block> blocks = guided_blocks(c.n, tiles, kNr, bp.tiles, params->nth);
+    const auto units = static_cast<std::int64_t>(blocks.size()) * bp.mblocks;
+    const std::int64_t fstride = static_cast<std::int64_t>(pl.floats_bytes / 4 / sizeof(float)) / kSkew * kSkew;
+    for (; item < pack_items + units; item = queue.next()) {
+        const std::int64_t u = item - pack_items;
+        const std::int64_t ib = u % bp.mblocks;
+        const Block & block = blocks[static_cast<std::size_t>(u / bp.mblocks)];
+        const std::int64_t n = block.segment;
+        const std::int64_t i0 = ib * bp.mc;
+        const std::int64_t i1 = std::min(c.oc, i0 + bp.mc);
+        const std::int64_t t0 = block.start;
+        const std::int64_t t1 = t0 + block.size;
+        const std::int64_t nt = round_up(t1 - t0, kNr);
+        const std::int64_t ntp = nt / kNr;
+        const std::int64_t ldc = nt * static_cast<std::int64_t>(sizeof(float));
+        const auto pstride = static_cast<std::size_t>(products_stride(bp.mc, nt));
+        for (int r = 0; r < 4; ++r) {
+            for (std::int64_t k0 = 0; k0 < c.ic; k0 += pl.kc) {
+                const std::int64_t kc = std::min(pl.kc, c.ic - k0);
+                {
+                    const Phase_scope scope(Phase::pack_inputs);
+                    pack_inputs(floats, fstride, c, n, t0, t1, k0, k0 + kc, r, shuffle);
+                    for (int s = 0; s < 4; ++s) {
+                        for (std::int64_t p = 0; p < ntp; ++p) {
+                            quantize_panel_inputs(inputs + (s * ntp + p) * pl.v_panel, floats + s * fstride + p * kc * kNr, kc, kNr,
+                                                  q);
+                        }
+                    }
+                }
+                const Phase_scope scope(Phase::product);
+                const std::int64_t groups = ceil_div(kc, group);
+                for (int s = 0; s < 4; ++s) {
+                    const int xi = 4 * r + s;
+                    float * product = products + static_cast<std::size_t>(xi) * pstride;
+                    for (std::int64_t jj = 0; jj < nt; jj += step) {
+                        const std::uint8_t * b = inputs + (s * ntp + jj / kNr) * pl.v_panel;
+                        for (std::int64_t ii = i0; ii < i1; ii += kMr) {
+                            const std::uint8_t * a = weights + (xi * pl.opanels + ii / kMr) * pl.u_panel + k0 / group * a_group;
+                            qtiles(kernel, wide, groups, q.quads, a, b, pl.v_panel, product + (ii - i0) * nt + jj, ldc, k0 > 0,
+                                   std::min<std::int64_t>(kMr, i1 - ii), std::min(step, nt - jj));
+                        }
+                    }
+                }
+            }
+        }
+        transform_outputs(c, products, pstride, nt, n, t0, t1, i0, i1, chain, shuffle);
+    }
+}
+
+void compute_small_quantized(const ggml_compute_params * params, const Conv & c, const Qplan & pl, const Epilogue & chain) {
+    const Quant & q = pl.q;
+    const Plan & bp = pl.base;
+    const std::int64_t group = 4 * q.quads;
+    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
+    auto * inputs = reinterpret_cast<float *>(base + pl.weights_bytes);
+    auto * qinputs = reinterpret_cast<std::uint8_t *>(base + pl.weights_bytes + bp.shared_bytes);
+    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
+    auto * widened = reinterpret_cast<float *>(mine);
+    auto * floats = reinterpret_cast<float *>(mine + pl.widened_bytes);
+    auto * scratch = reinterpret_cast<float *>(mine + pl.widened_bytes + pl.floats_bytes + pl.quantized_bytes);
+    auto * products =
+        reinterpret_cast<float *>(mine + pl.widened_bytes + pl.floats_bytes + pl.quantized_bytes + pl.scratch_bytes);
+    const Qkernel kernel = qkernel_b_unsigned();
+    const Qkernel_wide wide = qkernel_wide_b_unsigned();
+    const std::int64_t step = wide != nullptr ? 2 * kNr : kNr;
+    const std::int64_t tiles = c.tw * c.th;
+    const std::int64_t nt = bp.panels * kNr;
+    const std::int64_t b_group = qgroup_bytes(q.quads, kNr);
+
+    // The weights, when they are not ready; the inputs, by all threads
+    // together, sixteen channels of an image to an item; then quantized, a
+    // panel of an xi to an item.
+    constexpr std::int64_t kInputChannels = 16;
+    Work_queue queue(params);
+    int item = queue.next();
+    const Quantized_weights packed_weights = quantized_weights(params, c, pl, base, floats, widened, queue, item);
+    const std::uint8_t * weights = packed_weights.data;
+    const std::int64_t channel_groups = ceil_div(c.ic, kInputChannels);
+    const std::int64_t input_items = packed_weights.items + c.n * channel_groups;
+    for (; item < input_items; item = queue.next()) {
+        const std::int64_t i = item - packed_weights.items;
+        const std::int64_t n = i / channel_groups;
+        const std::int64_t k0 = (i % channel_groups) * kInputChannels;
+        const Phase_scope scope(Phase::pack_inputs);
+        transform_inputs_small(inputs, c, bp.panels, n, k0, std::min(c.ic, k0 + kInputChannels), scratch);
+    }
+    queue.barrier();
+    const std::int64_t quantize_items = input_items + kXi * bp.panels;
+    for (; item < quantize_items; item = queue.next()) {
+        const std::int64_t i = item - input_items;
+        const std::int64_t xi = i / bp.panels;
+        const std::int64_t p = i % bp.panels;
+        const Phase_scope scope(Phase::pack_inputs);
+        quantize_panel_inputs(qinputs + i * pl.v_panel, inputs + xi * inputs_stride(bp.panels, c.ic) + p * c.ic * kNr, c.ic,
+                              kNr, q);
+    }
+    queue.barrier();
+
+    const std::vector<Block> blocks = guided_blocks(1, c.oc, kMr, bp.mc, params->nth);
+    const auto units = static_cast<std::int64_t>(blocks.size());
+    const std::int64_t a_group = qgroup_bytes(q.quads, kMr);
+    for (; item < quantize_items + units; item = queue.next()) {
+        const Block & block = blocks[static_cast<std::size_t>(item - quantize_items)];
+        const std::int64_t i0 = block.start;
+        const std::int64_t i1 = i0 + block.size;
+        const std::int64_t panels = ceil_div(i1 - i0, kMr);
+        for (std::int64_t k0 = 0; k0 < c.ic; k0 += pl.kc) {
+            const std::int64_t kc = std::min(pl.kc, c.ic - k0);
+            const Phase_scope scope(Phase::product);
+            const std::int64_t groups = ceil_div(kc, group);
+            for (int xi = 0; xi < kXi; ++xi) {
+                float * product = products + static_cast<std::size_t>(xi) * static_cast<std::size_t>(products_stride(bp.mc, nt));
+                for (std::int64_t ip = 0; ip < panels; ++ip) {
+                    const std::uint8_t * a =
+                        weights + (xi * pl.opanels + i0 / kMr + ip) * pl.u_panel + k0 / group * a_group;
+                    for (std::int64_t jj = 0; jj < nt; jj += step) {
+                        const std::uint8_t * b = qinputs + (xi * bp.panels + jj / kNr) * pl.v_panel + k0 / group * b_group;
+                        qtiles(kernel, wide, groups, q.quads, a, b, pl.v_panel, product + ip * kMr * nt + jj,
+                               nt * static_cast<std::int64_t>(sizeof(float)), k0 > 0, std::min<std::int64_t>(kMr, i1 - i0 - ip * kMr),
+                               std::min(step, nt - jj));
+                    }
+                }
+            }
+        }
+        for (std::int64_t n = 0; n < c.n; ++n) {
+            transform_outputs(c, products + n * tiles, static_cast<std::size_t>(products_stride(bp.mc, nt)), nt, n, 0, tiles,
+                              i0, i1, chain, false);
+        }
+    }
+}
+
+}  // namespace
+
 bool winograd_supported(const ggml_tensor * node) {
     if (node->op != GGML_OP_CONV_2D || tuning().winograd == 0) {
         return false;
@@ -1732,6 +2000,10 @@ bool winograd_supported(const ggml_tensor * node) {
 
 std::size_t winograd_work_size(const ggml_tensor * node, int n_threads) {
     const Conv c = geometry(node);
+    if (quantized(Quantized_op::convolution)) {
+        const Qplan pl = qplan(c, n_threads);
+        return kAlign + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(n_threads);
+    }
     if (four(c)) {
         if (small4(c)) {
             const Plan4_small pl = plan4_small(c);
@@ -1753,6 +2025,16 @@ void winograd_compute(const ggml_compute_params * params, ggml_tensor * node, co
     if (chain.redirect != nullptr) {
         // The residual connection's tensor, of the same layout (fusion.h).
         c.y = static_cast<char *>(chain.redirect->data);
+    }
+    if (quantized(Quantized_op::convolution)) {
+        const Qplan pl = qplan(c, params->nth);
+        if (pl.base.small) {
+            compute_small_quantized(params, c, pl, chain);
+        }
+        else {
+            compute_large_quantized(params, c, pl, chain);
+        }
+        return;
     }
     if (four(c)) {
         if (small4(c)) {

@@ -11,9 +11,9 @@
 # Sets up a GitHub Actions runner of Ubuntu to build and test
 # stable-diffusion.assembly: Clang, LLD and the LLVM tools of one major version,
 # from apt.llvm.org, whose signing key is checked by its fingerprint, with the
-# OpenMP runtime that ggml's threads run on, clang-tidy of the same version, and
-# the C++ library's headers of the GCC its runtime comes from. The tools go first
-# on PATH for the later steps.
+# OpenMP runtime that ggml's threads run on, the sanitizers' runtimes, clang-tidy
+# of the same version, and the C++ library's headers of the GCC its runtime
+# comes from. The tools go first on PATH for the later steps.
 #
 # To move to another version of LLVM, change llvm_major below; the
 # configuration of every build checks that its toolchain is of that version
@@ -59,11 +59,12 @@ esac
 
 sudo apt-get update -qq
 # libomp is the OpenMP runtime of this LLVM, which ggml's thread pool runs on;
-# clang-tidy is of the same version as the compiler, so that it parses what the
-# compiler compiles.
+# libclang-rt holds the runtimes of its sanitizers, which the sanitize jobs link,
+# and which clang does not depend on; clang-tidy is of the same version as the
+# compiler, so that it parses what the compiler compiles.
 sudo apt-get install -y -qq --no-install-recommends \
   "clang-$llvm_major" "lld-$llvm_major" "llvm-$llvm_major" "libomp-$llvm_major-dev" \
-  "clang-tidy-$llvm_major" "clang-tools-$llvm_major" \
+  "libclang-rt-$llvm_major-dev" "clang-tidy-$llvm_major" "clang-tools-$llvm_major" \
   "libstdc++-${runtime#gcc-}-dev"
 llvm_bin=/usr/lib/llvm-$llvm_major/bin
 

@@ -25,7 +25,8 @@
 # (AVX10.1, AMX-FP16). Each operation is tested at every level of the kernels
 # the model has (tests/ops_test.cc), and the convolutions of three by three
 # by F(2x2, 3x3) alone as well (f2x2), and directly, without Winograd's
-# transform (direct).
+# transform (direct); and the products quantized to integers (quantized),
+# AVX512-VNNI's and AVX-VNNI's kernels against the C++ ones.
 set -euo pipefail
 
 sde=$1
@@ -37,7 +38,7 @@ fi
 test=build/emulated/tests/sdasm_ops_test
 status=0
 for model in "${models[@]}"; do
-  for op in conv2d f2x2 direct mul_mat attention gated fusion store; do
+  for op in conv2d f2x2 direct mul_mat attention gated fusion store quantized; do
     if [[ $op == direct ]]; then
       log=$(SDASM_TUNE=winograd=0 "$sde" "-$model" -- "$test" conv2d 4 2>&1) || status=1
     elif [[ $op == f2x2 ]]; then

@@ -39,6 +39,7 @@ Cpu detect() {
     c.avx512_bf16 = c.avx512 && __builtin_cpu_supports("avx512bf16");
     c.avx512_fp16 = c.avx512 && __builtin_cpu_supports("avx512fp16");
     c.avx_vnni = c.avx2 && __builtin_cpu_supports("avxvnni");
+    c.avx512_vnni = c.avx512 && __builtin_cpu_supports("avx512vnni");
     // AMX's tiles are a state of the processor that Linux gives a process only
     // when it asks (sdasm_amx_request(), x86_64/amx.S), and that a system which
     // does not know them never gives: what cpuid says is not enough.
@@ -148,6 +149,11 @@ constexpr Tuning_field kTuningFields[] = {
     {"fuse_residual", &Tuning::fuse_residual},
     {"guided", &Tuning::guided},
     {"store_forget", &Tuning::store_forget},
+    {"bits", &Tuning::bits},
+    {"input_bits", &Tuning::input_bits},
+    {"group", &Tuning::group},
+    {"weight_group", &Tuning::weight_group},
+    {"quantize", &Tuning::quantize},
 };
 
 Tuning tuning_from_environment() {

@@ -27,7 +27,11 @@
 // with SD 1.5, the kept weights, in single precision, are twice the bytes of the
 // FP16 weights they come from, more than any cache holds, and reading them from
 // memory every step costs what packing the FP16 ones did, with four gigabytes
-// more of memory taken. An operation's own packing reads FP16 and keeps its
+// more of memory taken. The quantized weights (quant.h) are kept unless the
+// environment says otherwise, up to kQuantizedBudget: they are fewer bytes than
+// the FP16 ones, and quantizing them again for each computation costs a
+// quarter and more of the time of the products of the layers of few rows.
+// An operation's own packing reads FP16 and keeps its
 // panels in the cache while its threads use them.
 
 #ifndef SDASM_STORE_H
@@ -43,11 +47,25 @@ struct ggml_tensor;
 namespace sdasm {
 
 // The layouts of the kernels: the panels of the micro-kernel for convolutions,
-// Winograd's transformed weights, the panels of the linear layers; and on AMX
+// Winograd's transformed weights, the panels of the linear layers; on AMX
 // (x86_64/amx.S), the tiles of B of the linear layers and the tiles of A of
 // Winograd's transformed weights and of the convolutions', of AMX-BF16's form,
-// and those of the linear layers and of the convolutions of AMX-FP16's.
-enum class Layout { conv_rows, winograd, linear_columns, amx_linear, amx_winograd, amx_conv, amx_linear_fp16, amx_conv_fp16 };
+// and those of the linear layers and of the convolutions of AMX-FP16's; and
+// the quantized panels of the linear layers, of Winograd's transformed weights
+// and of the direct convolutions (quant.h).
+enum class Layout {
+    conv_rows,
+    winograd,
+    linear_columns,
+    amx_linear,
+    amx_winograd,
+    amx_conv,
+    amx_linear_fp16,
+    amx_conv_fp16,
+    quantized_linear,
+    quantized_winograd,
+    quantized_conv,
+};
 
 struct Packed {
     float * data = nullptr;
@@ -62,8 +80,10 @@ struct Packed {
 // operation alike: one that is ready to read, one to fill, or none, when the
 // budget has no room for it. The first thread to ask for one that is not kept
 // makes it, and the others get the same; the operation marks it ready with
-// publish() once all its threads have filled it.
-std::shared_ptr<Packed> packed(const ggml_tensor * tensor, Layout layout, std::size_t bytes);
+// publish() once all its threads have filled it. `variant` tells apart the
+// forms of a layout that the tuning chooses among, the bits and the groups of
+// the quantized ones.
+std::shared_ptr<Packed> packed(const ggml_tensor * tensor, Layout layout, std::size_t bytes, std::uint64_t variant = 0);
 void publish(const std::shared_ptr<Packed> & p);
 
 // Forgets what was packed from memory in [begin, begin + size).

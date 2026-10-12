@@ -60,6 +60,7 @@ on:
           amx-kc512:isa=amx,amx_kc=512 amx-mc64:isa=amx,amx_mc=64
           amx-small-direct:isa=amx,winograd_small_tiles=0 amx-direct:isa=amx,winograd=0
           amx-bf16-form:isa=amx,amx_fp16=0
+          int8:bits=8 int8-g32:bits=8,group=32 int8-g128:bits=8,group=128 int8-avx2:isa=avx2,bits=8
 
 permissions:
   contents: read
