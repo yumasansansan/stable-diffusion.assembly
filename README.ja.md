@@ -71,7 +71,7 @@ SDXL の UNet の時間は，26×38 の格子で 10 段重なる transformer の
 
 マイクロカーネルは，単精度のものを整数にしたものです．AVX-VNNI 用の 6×16（`x86_64/quant_avx2.S`．Alder Lake 以降のコアが持つ VEX 版 `vpdpbusd`），AVX512-VNNI 用の 6×16 と 6×32（`quant_avx512.S`），そして整数演算をコンパイラがベクトル化する C++ 版です．16 列のパネルの量子化は AVX2 で行います（`quantize_avx2.S`）．AMX-INT8 のタイル（Sapphire Rapids 以降）では，線形層の積を 32×32 のブロックで計算します（`amx_int8.S`）．グループの積は `tdpbusd`（1 命令で 16 行 × 16 列 × K 64 個）で足し，タイルが次のグループの積を足している間に AVX-512 でスケールを掛けます．グループが K 64 個の倍数のときに使います．スケールを掛ける時間は，グループ 64 個では積の約 2 倍，128 個では同じくらいです．そのためタイル上の整数の積は，グループ 64 個では `bits=16` の bfloat16 の積と同じくらい，128 個以上ではその 2 倍ほど速くなる見込みです．実際の速さはワークフロー `Measure` で確かめます（変種 `int8`・`int8-g128`・`int8-g256`・`int8-avx512`）．どれも同じ整数を計算するので，attention の指数を除いて出力はビット単位で一致します（`tests/ops_test.cc quantized`）．
 
-VNNI のない AVX2（Haswell〜Coffee Lake，Zen〜Zen 3）では，6×16 のカーネルを `vpmaddubsw` で計算します（`quant_maddubs.S`）．符号なしバイトと符号付きバイトの積 32 個を 2 つずつ 16 ビットに足し，それを 1 を掛ける `vpmaddwd` で 2 つずつ 32 ビットのレーン（`vpdpbusd` が積 4 つを足すレーン）に足して，`vpaddd` で和に加えます．2 つの積の和が 16 ビットの 32767 を超えない限り整数は同じで，重みが 7 ビットで入力が 8 ビット（`bits=7`），または重みが 8 ビットで入力が 7 ビット（`input_bits=7`）のときに使います．両方 8 ビットのとき，これらのプロセッサは単精度のままです．VNNI の 1 命令に対して乗算が 2 命令なので，ベクトル整数の乗算器が 2 本あるプロセッサ（Skylake 以降のコア，Zen 3）では FMA の 2 倍の積を計算でき，1 本のもの（Haswell，Broadwell，Zen 2）では同じで，速くなりません．i7-1360P で AVX-VNNI を無いものとして測ると，カーネルの積の速さは P コアで FMA の 1.55 倍（AVX-VNNI は 3.0 倍），E コアで同じ（同 1.8 倍）でした．P コア 1 つでは，線形層が単精度の 1.45〜1.7 倍，self-attention が 1.3 倍速くなる一方，3×3 の畳み込みは 1.0〜1.25 倍，VAE の大きなものは 0.9 倍にとどまります．整数の F(2x2, 3x3) は単精度の F(4x4, 3x3) の 1.8 倍の積を要するためです．SD 1.5 のサンプリングは `bits=7` で 1.18 倍速くなり，畳み込みを単精度のままにする `quantize=5` でも同じ速さで，VAE は速さが変わらず，画像も正確なものに近くなります：上の 8 つのプロンプトで，正確な画像との PSNR は中央値 26.0 dB（17.7〜35.9），SSIM は 0.90 で，`bits=7` だけでは 23.2 dB と 0.84，`input_bits=7` では 23.2 dB と 0.83，`bits=8` は 25.4 dB と 0.89 です．Zen 3 での速さはワークフロー `Measure` で確かめます（変種 `int7-avx2`・`int8a7-avx2`）．
+VNNI のない AVX2（Haswell〜Coffee Lake，Zen〜Zen 3）では，6×16 のカーネルを `vpmaddubsw` で計算します（`quant_maddubs.S`）．符号なしバイトと符号付きバイトの積 32 個を 2 つずつ 16 ビットに足し，それを 1 を掛ける `vpmaddwd` で 2 つずつ 32 ビットのレーン（`vpdpbusd` が積 4 つを足すレーン）に足して，`vpaddd` で和に加えます．2 つの積の和が 16 ビットの 32767 を超えない限り整数は同じで，重みが 7 ビットで入力が 8 ビット（`bits=7`），または重みが 8 ビットで入力が 7 ビット（`input_bits=7`）のときに使います．両方 8 ビットのとき，これらのプロセッサは単精度のままです．VNNI の 1 命令に対して乗算が 2 命令なので，ベクトル整数の乗算器が 2 本あるプロセッサ（Skylake 以降のコア，Zen 3）では FMA の 2 倍の積を計算でき，1 本のもの（Haswell，Broadwell，Zen 2）では同じで，速くなりません．i7-1360P で AVX-VNNI を無いものとして測ると，カーネルの積の速さは P コアで FMA の 1.55 倍（AVX-VNNI は 3.0 倍），E コアで同じ（同 1.8 倍）でした．P コア 1 つでは，線形層が単精度の 1.45〜1.7 倍，self-attention が 1.3 倍速くなる一方，3×3 の畳み込みは 1.0〜1.25 倍，VAE の大きなものは 0.9 倍にとどまります．整数の F(2x2, 3x3) は単精度の F(4x4, 3x3) の 1.8 倍の積を要するためです．SD 1.5 のサンプリングは `bits=7` で 1.18 倍速くなり，畳み込みを単精度のままにする `quantize=5` でも同じ速さで，VAE は速さが変わらず，画像も正確なものに近くなります：上の 8 つのプロンプトで，正確な画像との PSNR は中央値 26.0 dB（17.7〜35.9），SSIM は 0.90 で，`bits=7` だけでは 23.2 dB と 0.84，`input_bits=7` では 23.2 dB と 0.83，`bits=8` は 25.4 dB と 0.89 です．GitHub の Zen 3（EPYC 7763．ワークフロー `Measure` の 36 台，変種 `int7-avx2`・`int8a7-avx2`）でも同じで，単精度に比べて線形層が 1.55〜1.74 倍，self-attention が 1.33〜1.39 倍（VAE のものは 1.75 倍），3×3 の畳み込みが UNet の 16×16 以上の格子で 0.92〜1.17 倍，VAE のもので 0.87〜1.02 倍でした．
 
 i7-1360P では，`vpdpbusd` により P コアは FMA の 4 倍，E コアは 2 倍の積を計算します．SD 1.5，512×512，20 ステップ：
 
@@ -100,7 +100,7 @@ SD 1.5 自身の活性で測ると，各演算の出力と正確な値との差�
 - AMX がなく AVX-512 を持つプロセッサではベクトルユニットで計算します．AVX10.2 があれば `vdpphps`（FP16 のペアを単精度で足す．AMX-FP16 と同じ積）を使います．AVX10.2 がなければ AVX512-BF16 の `vdpbf16ps`（Zen 4・5）を使い，AVX512-FP16 はあって AVX512-BF16 がないプロセッサでは AVX512-FP16 の `vfmadd231ph` を使います．`vfmadd231ph` は FP16 で足すので，積 32 個ごとに和を単精度へ移します．`half_format=1` は bfloat16，`half_format=2` は AVX512-FP16 を，持っていれば必ず使います．
 - 単精度どうしの積である Winograd の積は，タイルでは bfloat16 で，ベクトルユニットでは単精度のままです．attention は AVX512-BF16 でも bfloat16 です．
 
-それ以外（i7-1360P のように AVX2 だけの場合）では，積は単精度のままです．`tests/ops_test.cc half` は各形態を足し合わせた積の絶対値の和の 8 × 10⁻³ 以内に保つことを確かめ，SDE 上で Cooper Lake・Sapphire Rapids・Granite Rapids・Nova Lake（AVX10.2）・Diamond Rapids として実行しています．速さは，ワークフロー `Measure` が GitHub のランナーで計時します（変種 `half`・`half-avx512`・`half-bf16`・`half-fp16`）．
+それ以外（i7-1360P のように AVX2 だけの場合）では，積は単精度のままです．`tests/ops_test.cc half` は各形態を足し合わせた積の絶対値の和の 8 × 10⁻³ 以内に保つことを確かめ，SDE 上で Cooper Lake・Sapphire Rapids・Granite Rapids・Nova Lake（AVX10.2）・Diamond Rapids として実行しています．速さは，ワークフロー `Measure` が GitHub のランナーで計時します（変種 `half`・`half-avx512`・`half-bf16`・`half-fp16`）．AVX512-BF16 のベクトルユニットでの線形層は，単精度に比べて Zen 4 で 1.5〜1.9 倍，Zen 5 で 1.0〜1.6 倍速い一方，Emerald Rapids と Granite Rapids では 0.55〜0.65 倍に遅くなります．これらの既定はタイルで，その上では厳密な経路のそれぞれ 1.3〜1.8 倍，1.1〜1.3 倍速くなります．
 
 ### attention のキーと値を粗い格子から取る
 
@@ -151,7 +151,7 @@ cmake --preset release
 cmake --build --preset release
 ```
 
-プリセット（`cmake --list-presets`）は，`release`（-O3，ThinLTO，既定は x86-64-v3 向け），`debug`，`relwithdebinfo`，`sanitize` と `tsan`（address と undefined，thread と undefined），そして Intel SDE 用に x86-64-v3 でテストを作る `emulated` です．`-DSDASM_ARCH=native` は，C++ をビルドしたマシン向けにコンパイルします．
+プリセット（`cmake --list-presets`）は，`release`（-O3，ThinLTO，既定は x86-64-v3 向け），`debug`，`relwithdebinfo`，`sanitize` と `tsan`（address と undefined，thread と undefined），そして Intel SDE 用に x86-64-v3 でテストを作る `emulated` です．`emulated` は `debug` やサニタイザのプリセットと同じく，すべての添字を検査します（`SDASM_CHECKS`）．`-DSDASM_ARCH=native` は，C++ をビルドしたマシン向けにコンパイルします．
 
 プログラムは stable-diffusion.cpp の `build/release/bin/sd-cli` で，オプションはすべてそのまま使えます．
 
@@ -185,7 +185,7 @@ cmake --build --preset release
 ctest --preset release
 ```
 
-`sdasm_ops_test <演算> [スレッド数]` は，各演算をすべての形態・レベルで倍精度と比べ，それぞれの誤差を表示します．`ci/test.sh` はそれを全演算について実行します．`ci/emulated.sh <sde64>` は，`emulated` プリセットのテストを [Intel SDE](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html) 上で，Haswell・Skylake-SP・Cooper Lake・Ice Lake-SP・Sapphire Rapids・Arrow Lake・Granite Rapids・Nova Lake・Diamond Rapids として（AMX のタイルと AVX10.2 も含めて）実行します．
+`sdasm_ops_test <演算> [スレッド数]` は，各演算をすべての形態・レベルで倍精度と比べ，それぞれの誤差を表示します．`ci/test.sh` はそれを全演算について実行します．`ci/emulated.sh <sde64>` は，`emulated` プリセットのテストを [Intel SDE](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html) 上で，Haswell・Skylake-SP・Cooper Lake・Ice Lake-SP・Sapphire Rapids・Arrow Lake・Granite Rapids・Nova Lake・Diamond Rapids として（AMX のタイルと AVX10.2 も含めて）実行し，既定でない設定も，そのカーネルを使うモデルで実行します．GitHub のランナーにはないかもしれない命令のカーネルも，渡された範囲の外を読まないことをここで確かめます．
 
 `sdasm_bench` は SD 1.5 の各演算を実際の形状で，各形態（`--forms assembly,avx2,avx512,amx,cxx,upstream`）と変種（`--variant label:isa=avx512,wide=0`）について計時します．`--peak` は，各幅でプロセッサが出せる FMA の最大を計ります．
 

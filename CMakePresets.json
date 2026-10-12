@@ -55,12 +55,13 @@
     },
     {
       "name": "emulated",
-      "displayName": "Release for x86-64-v3 with the tests, for Intel SDE's emulated processors (ci/emulated.sh)",
+      "displayName": "Release for x86-64-v3 with the tests, every index checked, for Intel SDE's emulated processors (ci/emulated.sh)",
       "inherits": ["base"],
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "SDASM_ARCH": "avx2",
-        "SDASM_BUILD_TESTS": "ON"
+        "SDASM_BUILD_TESTS": "ON",
+        "SDASM_CHECKS": "ON"
       }
     },
     {

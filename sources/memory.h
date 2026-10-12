@@ -28,12 +28,12 @@
 //  - The store's buffers (store.h) are allocated as the type their layout
 //    holds.
 //
-// Where elements are reached through a span, every index is checked against
-// its bounds in a build with checks (SDASM_CHECKS: Debug, and the sanitizers'
-// builds, which define _GLIBCXX_ASSERTIONS); a Release build checks what it
-// is handed once, where it takes it -- a tensor's type, alignment and strides,
-// the size of the work buffer -- and leaves the indices unchecked, as the
-// C++ library leaves those of its spans.
+// Where elements are reached through a span, every index is checked against its
+// bounds in a build with checks (SDASM_CHECKS: Debug, and the sanitizers' and
+// the emulated preset's builds, which define _GLIBCXX_ASSERTIONS); a Release
+// build checks what it is handed once, where it takes it -- a tensor's type,
+// alignment and strides, the size of the work buffer -- and leaves the indices
+// unchecked, as the C++ library leaves those of its spans.
 //
 // The kernels written by hand take pointers, as the System V calling
 // convention passes them: data() of a span, the bounds of which their callers

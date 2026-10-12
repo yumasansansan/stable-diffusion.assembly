@@ -666,14 +666,23 @@ bool amx_product(const Mul_mat & g) {
 }
 
 // The elements of a panel of sixteen columns of B over the whole of K, and of
-// all of B: the panels of the columns rounded up to 32. A block of k of a tile
-// of A or B is a_bytes or b_bytes, of elements of two bytes.
+// all of B: the panels of the columns rounded up to 32, and a pair of panels of
+// zeros after them. A block of 32 columns takes two panels; the gated GELU's
+// gate begins at the panel its half begins at, and when the half is an odd
+// number of panels, the gate's blocks are a panel off the pairs, and its last
+// takes the panel after the last column. A block of k of a tile of A or B is
+// a_bytes or b_bytes, of elements of two bytes.
 std::int64_t amx_panel(const Mul_mat & g, const Split_form & f) {
     return round_up(g.k, kAmxBlock) / kAmxBlock * (f.b_bytes / 2);
 }
 
+// The pairs of panels of B, the last of zeros.
+std::int64_t amx_weight_pairs(const Mul_mat & g) {
+    return round_up(g.n, kAmxBlock) / kAmxBlock + 1;
+}
+
 std::int64_t amx_weights_count(const Mul_mat & g, const Split_form & f) {
-    return round_up(g.n, kAmxBlock) / kAmxTile * amx_panel(g, f);
+    return amx_weight_pairs(g) * 2 * amx_panel(g, f);
 }
 
 struct Amx_plan {
@@ -736,7 +745,7 @@ std::size_t amx_work_size(const Mul_mat & g, int n_threads) {
 
 // The tiles of B: the store's, or the work buffer's, packed by all threads
 // together, two panels of sixteen columns to an item of the work queue, when
-// they are not ready; a panel past the last column is zeros.
+// they are not ready; the panels past the last column are zeros.
 struct Amx_weights {
     std::shared_ptr<Packed> kept;
     Elements<std::uint16_t> tiles;
@@ -747,7 +756,7 @@ Amx_weights amx_weights(const Mul_mat & g, const std::shared_ptr<Packed> & kept,
     Amx_weights w;
     w.kept = kept;
     w.tiles = kept != nullptr ? kept->halves() : work;
-    w.items = kept == nullptr || !kept->ready() ? round_up(g.n, kAmxBlock) / kAmxBlock : 0;
+    w.items = kept == nullptr || !kept->ready() ? amx_weight_pairs(g) : 0;
     return w;
 }
 

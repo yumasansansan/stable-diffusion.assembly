@@ -81,6 +81,7 @@ include(LLVMToolchain)
 option(SDASM_WERROR "Treat warnings in stable-diffusion.assembly's own sources as errors" OFF)
 option(SDASM_BUILD_TESTS "Build the tests and register them with CTest" OFF)
 option(SDASM_BUILD_TOOLS "Build the developer tools (tools/: the benchmark of the kernels)" OFF)
+option(SDASM_CHECKS "Check every index, as the Debug build and the sanitizers' do (_GLIBCXX_ASSERTIONS)" OFF)
 if(SDASM_X86_64)
   set(SDASM_ARCH_DEFAULT avx2)
 else()
@@ -259,6 +260,14 @@ if(SDASM_SANITIZERS)
   if("thread" IN_LIST SDASM_SANITIZER_LIST)
     list(APPEND SDASM_SANITIZER_TEST_ENVIRONMENT "TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1")
   endif()
+endif()
+
+# SDASM_CHECKS checks every index of a build that would not otherwise, as the
+# Debug build and the sanitizers' do: the emulated preset's, whose kernels for
+# AVX-512 and AMX only Intel SDE runs on a machine without them, and whose
+# reads past what they are given would go unseen there (ci/emulated.sh).
+if(SDASM_CHECKS)
+  add_compile_definitions("$<$<COMPILE_LANGUAGE:CXX>:_GLIBCXX_ASSERTIONS>")
 endif()
 
 # --------------------------------------------------------------------------
