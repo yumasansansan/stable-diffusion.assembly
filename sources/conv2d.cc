@@ -35,12 +35,13 @@
 // are those of the weights shared, for every image.
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
-#include <cstring>
 
 #include "fusion.h"
 #include "gemm.h"
 #include "kernels.h"
+#include "memory.h"
 #include "ops.h"
 #include "phases.h"
 #include "quant.h"
@@ -53,16 +54,18 @@ namespace sdasm {
 
 namespace {
 
+// The strides are in elements.
 struct Conv {
     const ggml_tensor * kernel;
-    const char * x;  // [IW, IH, IC, N]
+    Elements<const float> x;  // [IW, IH, IC, N]
     std::int64_t iw, ih, ic, n;
     std::int64_t xnb1, xnb2, xnb3;
-    const char * w;  // [KW, KH, IC, OC]
     ggml_type wtype;
+    Elements<const float> w32;          // [KW, KH, IC, OC], of single precision
+    Elements<const std::uint16_t> w16;  // or FP16
     std::int64_t kw, kh, oc;
     std::int64_t wnb3;
-    char * y;  // [OW, OH, OC, N]
+    Elements<float> y;  // [OW, OH, OC, N]
     std::int64_t ow, oh;
     std::int64_t ynb2, ynb3;
     int s0, s1, p0, p1, d0, d1;
@@ -70,30 +73,37 @@ struct Conv {
     std::int64_t p;  // ow * oh
 };
 
-Conv geometry(const ggml_tensor * node) {
-    const ggml_tensor * kernel = node->src[0];
-    const ggml_tensor * input = node->src[1];
+// Of a node that conv2d_supported() takes.
+Conv geometry(const ggml_tensor * const node) {
+    const ggml_tensor * const kernel = node->src[0];
+    const ggml_tensor * const input = node->src[1];
     Conv c{};
     c.kernel = kernel;
-    c.x = static_cast<const char *>(input->data);
+    c.x = elements_of<const float>(input);
     c.iw = input->ne[0];
     c.ih = input->ne[1];
     c.ic = input->ne[2];
     c.n = input->ne[3];
-    c.xnb1 = static_cast<std::int64_t>(input->nb[1]);
-    c.xnb2 = static_cast<std::int64_t>(input->nb[2]);
-    c.xnb3 = static_cast<std::int64_t>(input->nb[3]);
-    c.w = static_cast<const char *>(kernel->data);
+    c.xnb1 = stride_of<float>(input, 1);
+    c.xnb2 = stride_of<float>(input, 2);
+    c.xnb3 = stride_of<float>(input, 3);
     c.wtype = kernel->type;
+    if (kernel->type == GGML_TYPE_F16) {
+        c.w16 = elements_of<const std::uint16_t>(kernel);
+        c.wnb3 = stride_of<std::uint16_t>(kernel, 3);
+    }
+    else {
+        c.w32 = elements_of<const float>(kernel);
+        c.wnb3 = stride_of<float>(kernel, 3);
+    }
     c.kw = kernel->ne[0];
     c.kh = kernel->ne[1];
     c.oc = kernel->ne[3];
-    c.wnb3 = static_cast<std::int64_t>(kernel->nb[3]);
-    c.y = static_cast<char *>(node->data);
+    c.y = elements_of<float>(node);
     c.ow = node->ne[0];
     c.oh = node->ne[1];
-    c.ynb2 = static_cast<std::int64_t>(node->nb[2]);
-    c.ynb3 = static_cast<std::int64_t>(node->nb[3]);
+    c.ynb2 = stride_of<float>(node, 2);
+    c.ynb3 = stride_of<float>(node, 3);
     c.s0 = node->op_params[0];
     c.s1 = node->op_params[1];
     c.p0 = node->op_params[2];
@@ -103,6 +113,28 @@ Conv geometry(const ggml_tensor * node) {
     c.k = c.ic * c.kh * c.kw;
     c.p = c.ow * c.oh;
     return c;
+}
+
+// The weights of output channels [r0, r0 + rows) over [k0, k1) of K into
+// panels of p (gemm.h).
+void pack_weight_rows(Elements<float> dst, const Conv & c, std::int64_t r0, std::int64_t rows, std::int64_t k0,
+                      std::int64_t k1, int p) {
+    if (c.wtype == GGML_TYPE_F16) {
+        pack_rows_f16(dst, c.w16.from(r0 * c.wnb3), c.wnb3, rows, k0, k1, p);
+    }
+    else {
+        pack_rows_f32(dst, c.w32.from(r0 * c.wnb3), c.wnb3, rows, k0, k1, p);
+    }
+}
+
+// The output of channel `channel` of image n from position `position` on, and
+// the chain after the convolution over `rows` channels from there, `cols`
+// positions of each.
+void apply_chain_positions(const Epilogue & chain, const Conv & c, std::int64_t n, std::int64_t channel, std::int64_t rows,
+                           std::int64_t position, std::int64_t cols) {
+    for (std::int64_t r = 0; r < rows; ++r) {
+        chain.apply_positions(c.y.part(n * c.ynb3 + (channel + r) * c.ynb2 + position, cols), position, channel + r, n);
+    }
 }
 
 struct Plan {
@@ -115,7 +147,6 @@ struct Plan {
     std::int64_t chunk;  // with shared columns: the stretch of K packed at a time
     std::int64_t mc, nc, kc;
     std::int64_t mblocks, nblocks;
-    std::size_t shared_bytes, thread_bytes;
 };
 
 std::int64_t ceil_div(std::int64_t a, std::int64_t b) {
@@ -144,8 +175,6 @@ Plan plan(const Conv & c, int n_threads) {
         // reads them all.
         const std::int64_t fit = static_cast<std::int64_t>(t.conv_columns_bytes) / (c.n * c.p * 4);
         pl.chunk = std::clamp<std::int64_t>(fit / pl.kc * pl.kc, pl.kc, round_up(c.k, pl.kc));
-        pl.shared_bytes = align_up(static_cast<std::size_t>(c.n * c.p * pl.chunk) * sizeof(float));
-        pl.thread_bytes = align_up(static_cast<std::size_t>(pl.mc * pl.kc) * sizeof(float));
         return pl;
     }
     // As many output channels in a block as fit the cache beside the columns,
@@ -165,38 +194,58 @@ Plan plan(const Conv & c, int n_threads) {
         pl.mc = std::min(pl.mc, round_up(ceil_div(c.oc, split), kMr));
         pl.mblocks = ceil_div(c.oc, pl.mc);
     }
-    pl.shared_bytes = align_up(static_cast<std::size_t>(round_up(c.oc, kMr) * c.k) * sizeof(float));
-    pl.thread_bytes = align_up(static_cast<std::size_t>(pl.nc * pl.kc) * sizeof(float));
     return pl;
+}
+
+// The weights in panels of kMr output channels over the whole of K,
+// [panel][k][kMr]: the panels of A, which the store keeps (store.h).
+std::int64_t weights_count(const Conv & c) {
+    return round_up(c.oc, kMr) * c.k;
+}
+
+// The work buffer of the products of single precision: with shared columns,
+// the columns of a chunk of K, and each thread's panels of weights; otherwise
+// the panels of the weights, and each thread's columns.
+struct Single_layout {
+    Work_layout layout;
+    Shared<float> shared;
+    Own<float> mine;
+};
+
+Single_layout single_layout(const Conv & c, const Plan & pl) {
+    Single_layout l;
+    if (pl.shared_columns) {
+        l.shared = l.layout.shared<float>(c.n * c.p * pl.chunk);
+        l.mine = l.layout.own<float>(pl.mc * pl.kc);
+    }
+    else {
+        l.shared = l.layout.shared<float>(weights_count(c));
+        l.mine = l.layout.own<float>(pl.nc * pl.kc);
+    }
+    return l;
 }
 
 // Packs the columns of the image for positions [j0, j1) of image n and the
 // stretch [k0, k1) of K, in panels of kNr positions: [panel][k1 - k0][kNr]. The
 // positions past j1 are zeros.
-void pack_columns(float * dst, const Conv & c, std::int64_t n, std::int64_t j0, std::int64_t j1, std::int64_t k0,
+void pack_columns(Elements<float> dst, const Conv & c, std::int64_t n, std::int64_t j0, std::int64_t j1, std::int64_t k0,
                   std::int64_t k1) {
     const std::int64_t kc = k1 - k0;
-    const char * image = c.x + n * c.xnb3;
+    const Elements<const float> image = c.x.from(n * c.xnb3);
     const std::int64_t taps = c.kh * c.kw;
     const bool pointwise = c.kh == 1 && c.kw == 1 && c.s0 == 1 && c.s1 == 1 && c.p0 == 0 && c.p1 == 0 &&
-                           c.xnb1 == c.iw * static_cast<std::int64_t>(sizeof(float)) && c.ow == c.iw;
-    for (std::int64_t jj = j0; jj < j1; jj += kNr, dst += kc * kNr) {
+                           c.xnb1 == c.iw && c.ow == c.iw;
+    for (std::int64_t jj = j0; jj < j1; jj += kNr) {
+        const Elements<float> panel = dst.part((jj - j0) / kNr * kc * kNr, kc * kNr);
         const std::int64_t valid = std::min<std::int64_t>(kNr, j1 - jj);
         if (pointwise) {
             // A kernel of one by one: the columns are the image itself, its
             // positions one after another across the rows.
             for (std::int64_t k = k0; k < k1; ++k) {
-                const float * src = reinterpret_cast<const float *>(image + k * c.xnb2) + jj;
-                float * d = dst + (k - k0) * kNr;
-                if (valid == kNr) {
-                    for (int l = 0; l < kNr; ++l) {
-                        d[l] = src[l];
-                    }
-                }
-                else {
-                    for (std::int64_t l = 0; l < kNr; ++l) {
-                        d[l] = l < valid ? src[l] : 0.0f;
-                    }
+                const Elements<const float> src = image.part(k * c.xnb2 + jj, valid);
+                const Elements<float> d = panel.part((k - k0) * kNr, kNr);
+                for (std::int64_t l = 0; l < kNr; ++l) {
+                    d[l] = l < valid ? src[l] : 0.0f;
                 }
             }
             continue;
@@ -212,25 +261,20 @@ void pack_columns(float * dst, const Conv & c, std::int64_t n, std::int64_t j0, 
             // each row of the columns is sixteen numbers in a row of the image,
             // or fewer and zeros at its edges.
             for (std::int64_t k = k0; k < k1; ++k) {
-                float * d = dst + (k - k0) * kNr;
+                const Elements<float> d = panel.part((k - k0) * kNr, kNr);
                 const std::int64_t y = oh * c.s1 + kh * c.d1 - c.p1;
                 const std::int64_t xs = ow0 + kw * c.d0 - c.p0;
                 if (y < 0 || y >= c.ih) {
-                    for (int l = 0; l < kNr; ++l) {
-                        d[l] = 0.0f;
-                    }
+                    fill_with(d, 0.0f);
                 }
                 else if (xs >= 0 && xs + kNr <= c.iw) {
-                    const float * src = reinterpret_cast<const float *>(image + ic * c.xnb2 + y * c.xnb1) + xs;
-                    for (int l = 0; l < kNr; ++l) {
-                        d[l] = src[l];
-                    }
+                    copy(d, image.part(ic * c.xnb2 + y * c.xnb1 + xs, kNr));
                 }
                 else {
-                    const float * src = reinterpret_cast<const float *>(image + ic * c.xnb2 + y * c.xnb1);
+                    const Elements<const float> row = image.part(ic * c.xnb2 + y * c.xnb1, c.iw);
                     for (std::int64_t l = 0; l < kNr; ++l) {
                         const std::int64_t x = xs + l;
-                        d[l] = x >= 0 && x < c.iw ? src[x] : 0.0f;
+                        d[l] = x >= 0 && x < c.iw ? row[x] : 0.0f;
                     }
                 }
                 if (++kw == c.kw) {
@@ -245,22 +289,20 @@ void pack_columns(float * dst, const Conv & c, std::int64_t n, std::int64_t j0, 
         }
         // Any other stride, or positions that run over the end of a row of the
         // output: one position at a time.
-        std::int64_t pos_y[kNr];
-        std::int64_t pos_x[kNr];
-        for (std::int64_t l = 0; l < kNr; ++l) {
-            const std::int64_t j = jj + l;
+        std::array<std::int64_t, kNr> pos_y{};
+        std::array<std::int64_t, kNr> pos_x{};
+        for (std::size_t l = 0; l < kNr; ++l) {
+            const std::int64_t j = jj + static_cast<std::int64_t>(l);
             pos_y[l] = j < j1 ? (j / c.ow) * c.s1 - c.p1 : -(INT64_C(1) << 40);
             pos_x[l] = j < j1 ? (j % c.ow) * c.s0 - c.p0 : -(INT64_C(1) << 40);
         }
         for (std::int64_t k = k0; k < k1; ++k) {
-            float * d = dst + (k - k0) * kNr;
-            const char * plane = image + ic * c.xnb2;
-            for (std::int64_t l = 0; l < kNr; ++l) {
+            const Elements<float> d = panel.part((k - k0) * kNr, kNr);
+            const Elements<const float> plane = image.from(ic * c.xnb2);
+            for (std::size_t l = 0; l < kNr; ++l) {
                 const std::int64_t y = pos_y[l] + kh * c.d1;
                 const std::int64_t x = pos_x[l] + kw * c.d0;
-                d[l] = (y >= 0 && y < c.ih && x >= 0 && x < c.iw)
-                           ? reinterpret_cast<const float *>(plane + y * c.xnb1)[x]
-                           : 0.0f;
+                d[static_cast<std::int64_t>(l)] = (y >= 0 && y < c.ih && x >= 0 && x < c.iw) ? plane[y * c.xnb1 + x] : 0.0f;
             }
             if (++kw == c.kw) {
                 kw = 0;
@@ -275,15 +317,16 @@ void pack_columns(float * dst, const Conv & c, std::int64_t n, std::int64_t j0, 
 
 }  // namespace
 
-bool conv2d_supported(const ggml_tensor * node) {
+bool conv2d_supported(const ggml_tensor * const node) {
     if (node->op != GGML_OP_CONV_2D) {
         return false;
     }
-    const ggml_tensor * kernel = node->src[0];
-    const ggml_tensor * input = node->src[1];
-    return (kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32) && ggml_is_contiguous(kernel) &&
-           input->type == GGML_TYPE_F32 && input->nb[0] == sizeof(float) && node->type == GGML_TYPE_F32 &&
-           ggml_is_contiguous(node) && kernel->ne[2] == input->ne[2] && node->op_params[0] > 0 &&
+    const ggml_tensor * const kernel = node->src[0];
+    const ggml_tensor * const input = node->src[1];
+    const bool weights = (kernel->type == GGML_TYPE_F16 && holds<std::uint16_t>(kernel)) ||
+                         (kernel->type == GGML_TYPE_F32 && holds<float>(kernel));
+    return weights && ggml_is_contiguous(kernel) && holds<float>(input) && input->nb[0] == sizeof(float) &&
+           holds<float>(node) && ggml_is_contiguous(node) && kernel->ne[2] == input->ne[2] && node->op_params[0] > 0 &&
            node->op_params[1] > 0 && node->op_params[4] > 0 && node->op_params[5] > 0;
 }
 
@@ -291,10 +334,6 @@ namespace {
 
 bool on_amx(const Conv & c);
 std::size_t amx_work_size(const Conv & c, int n_threads);
-
-}  // namespace
-
-namespace {
 
 // ---------------------------------------------------------------- quantized
 
@@ -309,7 +348,6 @@ struct Qplan {
     std::int64_t kc;  // a multiple of the group
     std::int64_t mc, nc, mblocks, nblocks;
     std::int64_t a_panel, b_panel;
-    std::size_t weights_bytes, columns_bytes, quantized_bytes, thread_bytes;
 };
 
 Qplan qplan(const Conv & c, int n_threads) {
@@ -333,11 +371,28 @@ Qplan qplan(const Conv & c, int n_threads) {
     }
     pl.a_panel = qpanel_bytes(c.k, kMr, pl.q);
     pl.b_panel = qpanel_bytes(pl.kc, kNr, pl.q);
-    pl.weights_bytes = align_up(static_cast<std::size_t>(ceil_div(c.oc, kMr) * pl.a_panel));
-    pl.columns_bytes = align_up(static_cast<std::size_t>(round_up(pl.nc, kNr) * pl.kc) * sizeof(float));
-    pl.quantized_bytes = align_up(static_cast<std::size_t>(ceil_div(pl.nc, kNr) * pl.b_panel));
-    pl.thread_bytes = pl.columns_bytes + pl.quantized_bytes;
     return pl;
+}
+
+std::int64_t quantized_weights_count(const Conv & c, const Qplan & pl) {
+    return ceil_div(c.oc, kMr) * pl.a_panel;
+}
+
+// The quantized weights, shared; each thread's columns of a block, in single
+// precision and quantized.
+struct Quantized_layout {
+    Work_layout layout;
+    Shared<std::uint8_t> weights;
+    Own<float> columns;
+    Own<std::uint8_t> quantized;
+};
+
+Quantized_layout quantized_layout(const Conv & c, const Qplan & pl) {
+    Quantized_layout l;
+    l.weights = l.layout.shared<std::uint8_t>(quantized_weights_count(c, pl));
+    l.columns = l.layout.own<float>(round_up(pl.nc, kNr) * pl.kc);
+    l.quantized = l.layout.own<std::uint8_t>(ceil_div(pl.nc, kNr) * pl.b_panel);
+    return l;
 }
 
 std::uint64_t qvariant(const Quant & q) {
@@ -345,22 +400,24 @@ std::uint64_t qvariant(const Quant & q) {
            static_cast<std::uint64_t>(q.weight_groups ? 1 : 0) << 32;
 }
 
-void compute_quantized(const ggml_compute_params * params, const Conv & c, const Qplan & pl, const Epilogue & chain) {
+void compute_quantized(const ggml_compute_params * const params, const Conv & c, const Qplan & pl,
+                       const Epilogue & chain) {
     const Quant & q = pl.q;
     const std::int64_t group = 4 * q.quads;
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::quantized_conv, pl.weights_bytes, qvariant(q));
-    auto * weights = reinterpret_cast<std::uint8_t *>(kept != nullptr ? reinterpret_cast<char *>(kept->data) : base);
+    const Quantized_layout l = quantized_layout(c, pl);
+    Work_buffer buffer(params, l.layout);
+    const std::shared_ptr<Packed> kept =
+        packed(c.kernel, Layout::quantized_conv, quantized_weights_count(c, pl), qvariant(q));
     const bool fill = kept == nullptr || !kept->ready();
-    char * mine = base + pl.weights_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    auto * columns = reinterpret_cast<float *>(mine);
-    auto * qcolumns = reinterpret_cast<std::uint8_t *>(mine + pl.columns_bytes);
     const Qkernel kernel = qkernel_b_unsigned();
     const Qkernel_wide wide = qkernel_wide_b_unsigned();
     const std::int64_t step = wide != nullptr ? 2 * kNr : kNr;
     const std::int64_t a_group = qgroup_bytes(q.quads, kMr);
 
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<std::uint8_t> weights = kept != nullptr ? kept->octets() : buffer[l.weights];
+    const Elements<float> columns = buffer[l.columns];
+    const Elements<std::uint8_t> qcolumns = buffer[l.quantized];
     // The weights, a panel of kMr output channels to an item.
     const std::int64_t pack_items = fill ? ceil_div(c.oc, kMr) : 0;
     int item = queue.next();
@@ -369,13 +426,12 @@ void compute_quantized(const ggml_compute_params * params, const Conv & c, const
             const Phase_scope scope(Phase::pack_weights);
             const std::int64_t r0 = item * kMr;
             const std::int64_t rows = std::min<std::int64_t>(kMr, c.oc - r0);
+            const Elements<std::uint8_t> dst = weights.part(item * pl.a_panel, pl.a_panel);
             if (c.wtype == GGML_TYPE_F16) {
-                quantize_weights_f16(weights + item * pl.a_panel, reinterpret_cast<const std::uint16_t *>(c.w + r0 * c.wnb3),
-                                     c.wnb3, rows, c.k, kMr, q);
+                quantize_weights_f16(dst, c.w16.from(r0 * c.wnb3), c.wnb3, rows, c.k, kMr, Qlayout::rows, q);
             }
             else {
-                quantize_weights_f32(weights + item * pl.a_panel, reinterpret_cast<const float *>(c.w + r0 * c.wnb3), c.wnb3,
-                                     rows, c.k, kMr, q);
+                quantize_weights_f32(dst, c.w32.from(r0 * c.wnb3), c.wnb3, rows, c.k, kMr, Qlayout::rows, q);
             }
         }
         queue.barrier();
@@ -396,33 +452,29 @@ void compute_quantized(const ggml_compute_params * params, const Conv & c, const
         const std::int64_t j0 = block.start;
         const std::int64_t j1 = j0 + block.size;
         const std::int64_t panels = ceil_div(j1 - j0, kNr);
-        char * image = c.y + n * c.ynb3;
         for (std::int64_t k0 = 0; k0 < c.k; k0 += pl.kc) {
             const std::int64_t kc = std::min(pl.kc, c.k - k0);
             {
                 const Phase_scope scope(Phase::pack_inputs);
                 pack_columns(columns, c, n, j0, j1, k0, k0 + kc);
                 for (std::int64_t p = 0; p < panels; ++p) {
-                    quantize_panel_inputs(qcolumns + p * pl.b_panel, columns + p * kc * kNr, kc, kNr, q);
+                    quantize_panel_inputs(qcolumns.part(p * pl.b_panel, pl.b_panel), columns.part(p * kc * kNr, kc * kNr),
+                                          kc, kNr, Qlayout::columns, q);
                 }
             }
             const bool last = k0 + kc == c.k;
             const std::int64_t groups = ceil_div(kc, group);
             const Phase_scope scope(Phase::product);
             for (std::int64_t jj = j0; jj < j1; jj += step) {
-                const std::uint8_t * b = qcolumns + ((jj - j0) / kNr) * pl.b_panel;
+                const Elements<const std::uint8_t> b = qcolumns.from(((jj - j0) / kNr) * pl.b_panel);
                 const std::int64_t cols = std::min(step, j1 - jj);
                 for (std::int64_t ii = i0; ii < i1; ii += kMr) {
-                    const std::uint8_t * a = weights + (ii / kMr) * pl.a_panel + k0 / group * a_group;
-                    float * out = reinterpret_cast<float *>(image + ii * c.ynb2) + jj;
+                    const Elements<const std::uint8_t> a = weights.from((ii / kMr) * pl.a_panel + k0 / group * a_group);
                     const std::int64_t rows = std::min<std::int64_t>(kMr, i1 - ii);
-                    qtiles(kernel, wide, groups, q.quads, a, b, pl.b_panel, out, c.ynb2, k0 > 0 || chain.from_redirect, rows,
-                           cols);
+                    qtiles(kernel, wide, groups, q.quads, a, b, pl.b_panel, c.y.from(n * c.ynb3 + ii * c.ynb2 + jj), c.ynb2,
+                           k0 > 0 || chain.from_redirect, rows, cols);
                     if (last && !chain.empty()) {
-                        for (std::int64_t r = 0; r < rows; ++r) {
-                            chain.apply_positions(reinterpret_cast<float *>(reinterpret_cast<char *>(out) + r * c.ynb2), cols,
-                                                  jj, ii + r, n);
-                        }
+                        apply_chain_positions(chain, c, n, ii, rows, jj, cols);
                     }
                 }
             }
@@ -432,26 +484,18 @@ void compute_quantized(const ggml_compute_params * params, const Conv & c, const
 
 }  // namespace
 
-std::size_t conv2d_work_size(const ggml_tensor * node, int n_threads) {
+std::size_t conv2d_work_size(const ggml_tensor * const node, int n_threads) {
     const Conv c = geometry(node);
     if (quantized(Quantized_op::convolution)) {
-        const Qplan pl = qplan(c, n_threads);
-        return kAlign + pl.weights_bytes + pl.thread_bytes * static_cast<std::size_t>(n_threads);
+        return quantized_layout(c, qplan(c, n_threads)).layout.bytes(n_threads);
     }
     if (on_amx(c)) {
         return amx_work_size(c, n_threads);
     }
-    const Plan pl = plan(c, n_threads);
-    return kAlign + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(n_threads);
+    return single_layout(c, plan(c, n_threads)).layout.bytes(n_threads);
 }
 
 namespace {
-
-// The weights in panels of kMr output channels over the whole of K,
-// [panel][k][kMr]: the panels of A, which the store keeps (store.h).
-std::size_t weights_bytes(const Conv & c) {
-    return static_cast<std::size_t>(round_up(c.oc, kMr) * c.k) * sizeof(float);
-}
 
 constexpr std::int64_t kPanelsPerItem = 4;
 
@@ -459,22 +503,16 @@ std::int64_t weight_items(const Conv & c) {
     return ceil_div(ceil_div(c.oc, kMr), kPanelsPerItem);
 }
 
-void pack_weights(float * weights, const Conv & c, std::int64_t item) {
+void pack_weights(Elements<float> weights, const Conv & c, std::int64_t item) {
     const std::int64_t r0 = item * kPanelsPerItem * kMr;
     const std::int64_t rows = std::min<std::int64_t>(kPanelsPerItem * kMr, c.oc - r0);
-    float * dst = weights + r0 * c.k;
-    if (c.wtype == GGML_TYPE_F16) {
-        pack_rows_f16(dst, reinterpret_cast<const std::uint16_t *>(c.w + r0 * c.wnb3), c.wnb3, rows, 0, c.k, kMr);
-    }
-    else {
-        pack_rows_f32(dst, reinterpret_cast<const float *>(c.w + r0 * c.wnb3), c.wnb3, rows, 0, c.k, kMr);
-    }
+    pack_weight_rows(weights.from(r0 * c.k), c, r0, rows, 0, c.k, kMr);
 }
 
-void compute_shared_columns(const ggml_compute_params * params, const Conv & c, const Plan & pl, const Epilogue & chain) {
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    float * columns = reinterpret_cast<float *>(base);
-    float * weights = reinterpret_cast<float *>(base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith));
+void compute_shared_columns(const ggml_compute_params * const params, const Conv & c, const Plan & pl,
+                            const Epilogue & chain) {
+    const Single_layout l = single_layout(c, pl);
+    Work_buffer buffer(params, l.layout);
     const Microkernel uk = microkernel();
     const Microkernel_wide wide = microkernel_wide();
     const std::int64_t panels = c.n * c.p / kNr;
@@ -482,7 +520,7 @@ void compute_shared_columns(const ggml_compute_params * params, const Conv & c, 
     const auto units = static_cast<std::int64_t>(blocks.size());
     // The panels of the weights the store keeps, packed first when they are not
     // yet; without them, each block packs its own as it goes.
-    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::conv_rows, weights_bytes(c));
+    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::conv_rows, weights_count(c));
     const bool fill = kept != nullptr && !kept->ready();
 
     // A stretch of K at a time: its columns, packed by all threads together,
@@ -490,14 +528,16 @@ void compute_shared_columns(const ggml_compute_params * params, const Conv & c, 
     // to an item; then the blocks of channels, each adding the product of its
     // weights and those columns to its outputs. The threads meet after each.
     constexpr std::int64_t kStretch = 512;
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<float> columns = buffer[l.shared];
+    const Elements<float> weights = buffer[l.mine];
     int item = queue.next();
     std::int64_t end = 0;
     if (fill) {
         end = weight_items(c);
         for (; item < end; item = queue.next()) {
             const Phase_scope scope(Phase::pack_weights);
-            pack_weights(kept->data, c, item);
+            pack_weights(kept->singles(), c, item);
         }
         queue.barrier();
         if (params->ith == 0) {
@@ -516,7 +556,7 @@ void compute_shared_columns(const ggml_compute_params * params, const Conv & c, 
             const std::int64_t k1 = std::min(c1, k0 + kStretch);
             const std::int64_t j = panel * kNr;
             const Phase_scope scope(Phase::pack_inputs);
-            pack_columns(columns + (panel * width + (k0 - c0)) * kNr, c, j / c.p, j % c.p, j % c.p + kNr, k0, k1);
+            pack_columns(columns.from((panel * width + (k0 - c0)) * kNr), c, j / c.p, j % c.p, j % c.p + kNr, k0, k1);
         }
         queue.barrier();
         end += units;
@@ -528,14 +568,7 @@ void compute_shared_columns(const ggml_compute_params * params, const Conv & c, 
                 const std::int64_t kc = std::min(pl.kc, c1 - k0);
                 if (kept == nullptr) {
                     const Phase_scope scope(Phase::pack_weights);
-                    if (c.wtype == GGML_TYPE_F16) {
-                        pack_rows_f16(weights, reinterpret_cast<const std::uint16_t *>(c.w + i0 * c.wnb3), c.wnb3, i1 - i0,
-                                      k0, k0 + kc, kMr);
-                    }
-                    else {
-                        pack_rows_f32(weights, reinterpret_cast<const float *>(c.w + i0 * c.wnb3), c.wnb3, i1 - i0, k0,
-                                      k0 + kc, kMr);
-                    }
+                    pack_weight_rows(weights, c, i0, i1 - i0, k0, k0 + kc, kMr);
                 }
                 const bool last = k0 + kc == c.k;
                 const Phase_scope scope(Phase::product);
@@ -545,19 +578,15 @@ void compute_shared_columns(const ggml_compute_params * params, const Conv & c, 
                     // Two panels at once when the wide micro-kernel takes them,
                     // and both are of this image.
                     const std::int64_t cols = wide != nullptr && panel + 1 < panels && position + 2 * kNr <= c.p ? 2 * kNr : kNr;
-                    const float * b = columns + (panel * width + (k0 - c0)) * kNr;
-                    char * image = c.y + n * c.ynb3;
+                    const Elements<const float> b = columns.from((panel * width + (k0 - c0)) * kNr);
                     for (std::int64_t ii = i0; ii < i1; ii += kMr) {
-                        const float * a = kept != nullptr ? kept->data + ii * c.k + k0 * kMr : weights + (ii - i0) * kc;
-                        float * out = reinterpret_cast<float *>(image + ii * c.ynb2) + position;
+                        const Elements<const float> a =
+                            kept != nullptr ? kept->singles().from(ii * c.k + k0 * kMr) : weights.from((ii - i0) * kc);
                         const std::int64_t rows = std::min<std::int64_t>(kMr, i1 - ii);
-                        tiles(uk, wide, kc, a, b, width * kNr * static_cast<std::int64_t>(sizeof(float)), out, c.ynb2,
+                        tiles(uk, wide, kc, a, b, width * kNr, c.y.from(n * c.ynb3 + ii * c.ynb2 + position), c.ynb2,
                               k0 > 0 || chain.from_redirect, rows, cols);
                         if (last && !chain.empty()) {
-                            for (std::int64_t r = 0; r < rows; ++r) {
-                                chain.apply_positions(reinterpret_cast<float *>(reinterpret_cast<char *>(out) + r * c.ynb2),
-                                                      cols, position, ii + r, n);
-                            }
+                            apply_chain_positions(chain, c, n, ii, rows, position, cols);
                         }
                     }
                     panel += cols / kNr;
@@ -569,20 +598,22 @@ void compute_shared_columns(const ggml_compute_params * params, const Conv & c, 
     }
 }
 
-void compute_shared_weights(const ggml_compute_params * params, const Conv & c, const Plan & pl, const Epilogue & chain) {
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
+void compute_shared_weights(const ggml_compute_params * const params, const Conv & c, const Plan & pl,
+                            const Epilogue & chain) {
+    const Single_layout l = single_layout(c, pl);
+    Work_buffer buffer(params, l.layout);
     // The panels of the weights: the store's, packed here the first time, or
     // the work buffer's, packed here every time.
-    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::conv_rows, weights_bytes(c));
-    float * weights = kept != nullptr ? kept->data : reinterpret_cast<float *>(base);
+    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::conv_rows, weights_count(c));
     const bool fill = kept == nullptr || !kept->ready();
-    float * columns = reinterpret_cast<float *>(base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith));
     const Microkernel uk = microkernel();
     const Microkernel_wide wide = microkernel_wide();
     const std::int64_t step = panel_step(wide);
     const bool rows_outer = tuning().conv_rows_outer != 0;
 
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<float> weights = kept != nullptr ? kept->singles() : buffer[l.shared];
+    const Elements<float> columns = buffer[l.mine];
     const std::int64_t pack_items = fill ? weight_items(c) : 0;
     int item = queue.next();
     if (fill) {
@@ -607,7 +638,6 @@ void compute_shared_weights(const ggml_compute_params * params, const Conv & c, 
         const std::int64_t i1 = std::min(c.oc, i0 + pl.mc);
         const std::int64_t j0 = block.start;
         const std::int64_t j1 = j0 + block.size;
-        char * image = c.y + n * c.ynb3;
         for (std::int64_t k0 = 0; k0 < c.k; k0 += pl.kc) {
             const std::int64_t kc = std::min(pl.kc, c.k - k0);
             {
@@ -617,18 +647,14 @@ void compute_shared_weights(const ggml_compute_params * params, const Conv & c, 
             const bool last = k0 + kc == c.k;
             const Phase_scope scope(Phase::product);
             const auto one = [&](std::int64_t ii, std::int64_t jj) {
-                const float * a = weights + ii * c.k + k0 * kMr;
-                const float * b = columns + ((jj - j0) / kNr) * kc * kNr;
-                float * out = reinterpret_cast<float *>(image + ii * c.ynb2) + jj;
+                const Elements<const float> a = weights.from(ii * c.k + k0 * kMr);
+                const Elements<const float> b = columns.from(((jj - j0) / kNr) * kc * kNr);
                 const std::int64_t rows = std::min<std::int64_t>(kMr, i1 - ii);
                 const std::int64_t cols = std::min(step, j1 - jj);
-                tiles(uk, wide, kc, a, b, kc * kNr * static_cast<std::int64_t>(sizeof(float)), out, c.ynb2,
+                tiles(uk, wide, kc, a, b, kc * kNr, c.y.from(n * c.ynb3 + ii * c.ynb2 + jj), c.ynb2,
                       k0 > 0 || chain.from_redirect, rows, cols);
                 if (last && !chain.empty()) {
-                    for (std::int64_t r = 0; r < rows; ++r) {
-                        chain.apply_positions(reinterpret_cast<float *>(reinterpret_cast<char *>(out) + r * c.ynb2), cols,
-                                              jj, ii + r, n);
-                    }
+                    apply_chain_positions(chain, c, n, ii, rows, jj, cols);
                 }
             };
             if (rows_outer) {
@@ -655,22 +681,22 @@ bool on_amx(const Conv & c) {
     return split_form(Split_use::convolution).kernel != nullptr && c.wtype == GGML_TYPE_F16;
 }
 
-// The bytes of the tiles of A of sixteen output channels over the whole of K,
-// rounded up to 32, and of all of them, the channels rounded up to 32.
-std::int64_t amx_row_bytes(const Conv & c, const Split_form & f) {
-    return round_up(c.k, kAmxBlock) / kAmxBlock * f.a_bytes;
+// The elements of the tiles of A of sixteen output channels over the whole of
+// K, rounded up to 32, and of all of them, the channels rounded up to 32. A
+// block of k of a tile is a_bytes, of elements of two bytes.
+std::int64_t amx_row(const Conv & c, const Split_form & f) {
+    return round_up(c.k, kAmxBlock) / kAmxBlock * (f.a_bytes / 2);
 }
 
-std::size_t amx_weights_bytes(const Conv & c, const Split_form & f) {
-    return static_cast<std::size_t>(round_up(c.oc, kAmxBlock) / kAmxTile * amx_row_bytes(c, f));
+std::int64_t amx_weights_count(const Conv & c, const Split_form & f) {
+    return round_up(c.oc, kAmxBlock) / kAmxTile * amx_row(c, f);
 }
 
 struct Amx_plan {
     std::int64_t mc, nc, kc, mblocks;
-    std::size_t columns_bytes, tiles_bytes, thread_bytes;
 };
 
-Amx_plan amx_plan(const Conv & c, const Split_form & f, int n_threads) {
+Amx_plan amx_plan(const Conv & c, int n_threads) {
     const Tuning & t = tuning();
     Amx_plan pl{};
     pl.kc = std::min(round_up(c.k, kAmxBlock), round_up(std::max(t.amx_kc, 1), kAmxBlock));
@@ -683,32 +709,48 @@ Amx_plan amx_plan(const Conv & c, const Split_form & f, int n_threads) {
     while (c.n * pl.mblocks * ceil_div(c.p, pl.nc) < wanted && pl.nc > kAmxBlock) {
         pl.nc = round_up(pl.nc / 2, kAmxBlock);
     }
-    pl.columns_bytes = align_up(static_cast<std::size_t>(pl.nc * pl.kc) * sizeof(float));
-    pl.tiles_bytes = align_up(static_cast<std::size_t>(pl.nc / kAmxTile * (pl.kc / kAmxBlock) * f.b_bytes));
-    pl.thread_bytes = pl.columns_bytes + pl.tiles_bytes + align_up(kAmxBlock * kAmxBlock * sizeof(float));
     return pl;
+}
+
+// The tiles of A, shared; each thread's columns of a block in single
+// precision, their tiles of B, and the block it copies a part of.
+struct Amx_layout {
+    Work_layout layout;
+    Shared<std::uint16_t> weights;
+    Own<float> columns;
+    Own<std::uint16_t> tiles;
+    Own<float> spare;
+};
+
+Amx_layout amx_layout(const Conv & c, const Split_form & f, const Amx_plan & pl) {
+    Amx_layout l;
+    l.weights = l.layout.shared<std::uint16_t>(amx_weights_count(c, f));
+    l.columns = l.layout.own<float>(pl.nc * pl.kc);
+    l.tiles = l.layout.own<std::uint16_t>(pl.nc / kAmxTile * (pl.kc / kAmxBlock) * (f.b_bytes / 2));
+    l.spare = l.layout.own<float>(kAmxBlock * kAmxBlock);
+    return l;
 }
 
 std::size_t amx_work_size(const Conv & c, int n_threads) {
     const Split_form f = split_form(Split_use::convolution);
-    return kAlign + align_up(amx_weights_bytes(c, f)) +
-           amx_plan(c, f, n_threads).thread_bytes * static_cast<std::size_t>(n_threads);
+    return amx_layout(c, f, amx_plan(c, n_threads)).layout.bytes(n_threads);
 }
 
-void compute_amx(const ggml_compute_params * params, const Conv & c, const Epilogue & chain) {
+void compute_amx(const ggml_compute_params * const params, const Conv & c, const Epilogue & chain) {
     const Split_form f = split_form(Split_use::convolution);
-    const Amx_plan pl = amx_plan(c, f, params->nth);
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    const std::shared_ptr<Packed> kept = packed(c.kernel, f.fp16 ? Layout::amx_conv_fp16 : Layout::amx_conv, amx_weights_bytes(c, f));
-    auto * weights = reinterpret_cast<std::uint16_t *>(kept != nullptr ? reinterpret_cast<char *>(kept->data) : base);
+    const Amx_plan pl = amx_plan(c, params->nth);
+    const Amx_layout l = amx_layout(c, f, pl);
+    Work_buffer buffer(params, l.layout);
+    const std::shared_ptr<Packed> kept =
+        packed(c.kernel, f.fp16 ? Layout::amx_conv_fp16 : Layout::amx_conv, amx_weights_count(c, f));
     const bool fill = kept == nullptr || !kept->ready();
-    char * mine = base + align_up(amx_weights_bytes(c, f)) + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    auto * columns = reinterpret_cast<float *>(mine);
-    auto * tiles = reinterpret_cast<std::uint16_t *>(mine + pl.columns_bytes);
-    auto * spare = reinterpret_cast<float *>(mine + pl.columns_bytes + pl.tiles_bytes);
-    const std::int64_t row_bytes = amx_row_bytes(c, f);
+    const std::int64_t row = amx_row(c, f);
 
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<std::uint16_t> weights = kept != nullptr ? kept->halves() : buffer[l.weights];
+    const Elements<float> columns = buffer[l.columns];
+    const Elements<std::uint16_t> tiles = buffer[l.tiles];
+    const Elements<float> spare = buffer[l.spare];
     // The weights, a tile of sixteen output channels to an item; those past
     // the last are zeros.
     const std::int64_t pack_items = fill ? round_up(c.oc, kAmxBlock) / kAmxTile : 0;
@@ -716,14 +758,16 @@ void compute_amx(const ggml_compute_params * params, const Conv & c, const Epilo
     if (fill) {
         for (; item < pack_items; item = queue.next()) {
             const Phase_scope scope(Phase::pack_weights);
-            std::uint16_t * dst = weights + item * row_bytes / 2;
+            const Elements<std::uint16_t> dst = weights.part(item * row, row);
             const std::int64_t r0 = item * kAmxTile;
             if (r0 >= c.oc) {
-                std::memset(dst, 0, static_cast<std::size_t>(row_bytes));
+                fill_with(dst, std::uint16_t{0});
                 continue;
             }
-            f.pack_weight_rows(dst, reinterpret_cast<const std::uint16_t *>(c.w + r0 * c.wnb3), c.wnb3,
-                               std::min(kAmxTile, c.oc - r0), c.k);
+            const std::int64_t rows = std::min(kAmxTile, c.oc - r0);
+            const Elements<const std::uint16_t> src = c.w16.from(r0 * c.wnb3);
+            SDASM_CHECK(src.size() >= (rows - 1) * c.wnb3 + c.k);
+            f.pack_weight_rows(dst.data(), src.data(), bytes_of<std::uint16_t>(c.wnb3), rows, c.k);
         }
         queue.barrier();
         if (params->ith == 0) {
@@ -748,39 +792,36 @@ void compute_amx(const ggml_compute_params * params, const Conv & c, const Epilo
         const std::int64_t j0 = block.start;
         const std::int64_t j1 = j0 + block.size;
         const std::int64_t panels = ceil_div(j1 - j0, kNr);
-        char * image = c.y + n * c.ynb3;
         for (std::int64_t k0 = 0; k0 < c.k; k0 += pl.kc) {
             const std::int64_t kc = std::min(pl.kc, c.k - k0);
             const std::int64_t kb = ceil_div(kc, kAmxBlock);
-            const std::int64_t panel_bytes = kb * f.b_bytes;
+            const std::int64_t panel = kb * (f.b_bytes / 2);
             {
                 // The columns in single precision, then their tiles of B; one
                 // more of zeros past an odd number of panels, for the last pair.
                 const Phase_scope scope(Phase::pack_inputs);
                 pack_columns(columns, c, n, j0, j1, k0, k0 + kc);
                 for (std::int64_t p = 0; p < panels; ++p) {
-                    f.pack_panel(tiles + p * panel_bytes / 2, columns + p * kc * kNr, kc);
+                    const Elements<std::uint16_t> dst = tiles.part(p * panel, panel);
+                    const Elements<const float> src = columns.part(p * kc * kNr, kc * kNr);
+                    f.pack_panel(dst.data(), src.data(), kc);
                 }
                 if (panels % 2 != 0) {
-                    std::memset(tiles + panels * panel_bytes / 2, 0, static_cast<std::size_t>(panel_bytes));
+                    fill_with(tiles.part(panels * panel, panel), std::uint16_t{0});
                 }
             }
             const bool last = k0 + kc == c.k;
             const Phase_scope scope(Phase::product);
             for (std::int64_t jj = j0; jj < j1; jj += kAmxBlock) {
-                const std::uint16_t * b = tiles + (jj - j0) / kAmxTile * panel_bytes / 2;
+                const Elements<const std::uint16_t> b = tiles.from((jj - j0) / kAmxTile * panel);
                 const std::int64_t cols = std::min(kAmxBlock, j1 - jj);
                 for (std::int64_t ii = i0; ii < i1; ii += kAmxBlock) {
-                    const std::uint16_t * a = weights + (ii / kAmxTile * row_bytes + k0 / kAmxBlock * f.a_bytes) / 2;
+                    const Elements<const std::uint16_t> a = weights.from(ii / kAmxTile * row + k0 / kAmxBlock * (f.a_bytes / 2));
                     const std::int64_t rows = std::min(kAmxBlock, i1 - ii);
-                    float * out = reinterpret_cast<float *>(image + ii * c.ynb2) + jj;
-                    split_block(f, kb, a, row_bytes, b, panel_bytes, out, c.ynb2, k0 > 0 || chain.from_redirect, rows, cols,
-                                spare);
+                    split_block(f, kb, a, row, b, panel, c.y.from(n * c.ynb3 + ii * c.ynb2 + jj), c.ynb2,
+                                k0 > 0 || chain.from_redirect, rows, cols, spare);
                     if (last && !chain.empty()) {
-                        for (std::int64_t r = 0; r < rows; ++r) {
-                            chain.apply_positions(reinterpret_cast<float *>(reinterpret_cast<char *>(out) + r * c.ynb2), cols,
-                                                  jj, ii + r, n);
-                        }
+                        apply_chain_positions(chain, c, n, ii, rows, jj, cols);
                     }
                 }
             }
@@ -793,11 +834,11 @@ void compute_amx(const ggml_compute_params * params, const Conv & c, const Epilo
 
 }  // namespace
 
-void conv2d_compute(const ggml_compute_params * params, ggml_tensor * node, const Epilogue & chain) {
+void conv2d_compute(const ggml_compute_params * const params, const ggml_tensor * const node, const Epilogue & chain) {
     Conv c = geometry(node);
     if (chain.redirect != nullptr) {
         // The residual connection's tensor, of the same layout (fusion.h).
-        c.y = static_cast<char *>(chain.redirect->data);
+        c.y = elements_of<float>(chain.redirect);
     }
     if (quantized(Quantized_op::convolution)) {
         compute_quantized(params, c, qplan(c, params->nth), chain);

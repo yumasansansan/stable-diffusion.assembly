@@ -73,13 +73,14 @@
 // numbers, which the transform of the outputs adds by eights.
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
-#include <cstring>
 
 #include "fusion.h"
 #include "gemm.h"
 #include "kernels.h"
+#include "memory.h"
 #include "ops.h"
 #include "phases.h"
 #include "quant.h"
@@ -94,46 +95,54 @@ namespace {
 
 constexpr int kXi = 16;  // the elements of a tile of four by four
 
+// The strides are in elements.
 struct Conv {
     const ggml_tensor * kernel;
-    const char * x;  // [IW, IH, IC, N]
+    Elements<const float> x;  // [IW, IH, IC, N]
     std::int64_t iw, ih, ic, n;
     std::int64_t xnb1, xnb2, xnb3;
-    const char * w;  // [3, 3, IC, OC]
     ggml_type wtype;
+    Elements<const float> w32;          // [3, 3, IC, OC], of single precision
+    Elements<const std::uint16_t> w16;  // or FP16
     std::int64_t oc;
-    std::int64_t wnb2, wnb3;
-    char * y;  // [OW, OH, OC, N]
+    std::int64_t wnb3;
+    Elements<float> y;  // [OW, OH, OC, N]
     std::int64_t ow, oh;
     std::int64_t ynb1, ynb2, ynb3;
     int p0, p1;
     std::int64_t tw, th;  // tiles across and down
 };
 
-Conv geometry(const ggml_tensor * node) {
-    const ggml_tensor * kernel = node->src[0];
-    const ggml_tensor * input = node->src[1];
+// Of a node that winograd_supported() takes.
+Conv geometry(const ggml_tensor * const node) {
+    const ggml_tensor * const kernel = node->src[0];
+    const ggml_tensor * const input = node->src[1];
     Conv c{};
     c.kernel = kernel;
-    c.x = static_cast<const char *>(input->data);
+    c.x = elements_of<const float>(input);
     c.iw = input->ne[0];
     c.ih = input->ne[1];
     c.ic = input->ne[2];
     c.n = input->ne[3];
-    c.xnb1 = static_cast<std::int64_t>(input->nb[1]);
-    c.xnb2 = static_cast<std::int64_t>(input->nb[2]);
-    c.xnb3 = static_cast<std::int64_t>(input->nb[3]);
-    c.w = static_cast<const char *>(kernel->data);
+    c.xnb1 = stride_of<float>(input, 1);
+    c.xnb2 = stride_of<float>(input, 2);
+    c.xnb3 = stride_of<float>(input, 3);
     c.wtype = kernel->type;
+    if (kernel->type == GGML_TYPE_F16) {
+        c.w16 = elements_of<const std::uint16_t>(kernel);
+        c.wnb3 = stride_of<std::uint16_t>(kernel, 3);
+    }
+    else {
+        c.w32 = elements_of<const float>(kernel);
+        c.wnb3 = stride_of<float>(kernel, 3);
+    }
     c.oc = kernel->ne[3];
-    c.wnb2 = static_cast<std::int64_t>(kernel->nb[2]);
-    c.wnb3 = static_cast<std::int64_t>(kernel->nb[3]);
-    c.y = static_cast<char *>(node->data);
+    c.y = elements_of<float>(node);
     c.ow = node->ne[0];
     c.oh = node->ne[1];
-    c.ynb1 = static_cast<std::int64_t>(node->nb[1]);
-    c.ynb2 = static_cast<std::int64_t>(node->nb[2]);
-    c.ynb3 = static_cast<std::int64_t>(node->nb[3]);
+    c.ynb1 = stride_of<float>(node, 1);
+    c.ynb2 = stride_of<float>(node, 2);
+    c.ynb3 = stride_of<float>(node, 3);
     c.p0 = node->op_params[2];
     c.p1 = node->op_params[3];
     c.tw = (c.ow + 1) / 2;
@@ -149,15 +158,36 @@ std::int64_t round_up(std::int64_t a, std::int64_t b) {
     return ceil_div(a, b) * b;
 }
 
+// The first element of channel ic of image n, of the input, and of channel r
+// of image n, of the output.
+std::int64_t input_plane(const Conv & c, std::int64_t n, std::int64_t ic) {
+    return n * c.xnb3 + ic * c.xnb2;
+}
+std::int64_t output_plane(const Conv & c, std::int64_t n, std::int64_t r) {
+    return n * c.ynb3 + r * c.ynb2;
+}
+
+// The weights of output channels [r0, r0 + rows) over [k0, k1) of the input
+// channels' nine numbers each into panels of p (gemm.h).
+void pack_weight_rows(Elements<float> dst, const Conv & c, std::int64_t r0, std::int64_t rows, std::int64_t k0,
+                      std::int64_t k1, int p) {
+    if (c.wtype == GGML_TYPE_F16) {
+        pack_rows_f16(dst, c.w16.from(r0 * c.wnb3), c.wnb3, rows, k0, k1, p);
+    }
+    else {
+        pack_rows_f32(dst, c.w32.from(r0 * c.wnb3), c.wnb3, rows, k0, k1, p);
+    }
+}
+
 // The large-image path keeps the sixteen tiles of a panel of B in the order
 // its packing finds them in, which is not quite their own: within each eight,
 // tiles 0, 1, 4, 5 and then 2, 3, 6, 7 (pack_inputs()). The lane of tile l of
 // a block, l counted from the block's first, is shuffled(l); the order is its
 // own inverse.
-constexpr std::int64_t kShuffle[8] = {0, 1, 4, 5, 2, 3, 6, 7};
+constexpr std::array<std::int64_t, 8> kShuffle = {0, 1, 4, 5, 2, 3, 6, 7};
 
 std::int64_t shuffled(std::int64_t l) {
-    return (l & ~std::int64_t{7}) | kShuffle[l & 7];
+    return (l & ~std::int64_t{7}) | kShuffle[static_cast<std::size_t>(l & 7)];
 }
 
 // Small images: every tile of every image in one block of output channels.
@@ -171,17 +201,12 @@ struct Plan {
     std::int64_t tiles;  // tiles in a block, a multiple of kNr
     std::int64_t mblocks, tblocks;
     std::int64_t panels;  // small images: the panels of kNr tiles of all images
-    std::size_t shared_bytes;
-    std::size_t panel_bytes;    // a thread's packed inputs; small images: its widened weights
-    std::size_t weight_bytes;   // small images: a thread's transformed weights
-    std::size_t scratch_bytes;  // small images: a thread's channel of an image, padded
-    std::size_t product_bytes;  // a thread's sixteen products
-    std::size_t thread_bytes;
 };
 
 // The widened weights of kWidened input channels of a panel of output
 // channels, [channel][3 * 3][kMr], and the floats a full load past them reads.
 constexpr std::int64_t kWidened = 8;
+constexpr std::int64_t kWidenedFloats = kWidened * 9 * kMr + 8;
 
 // The sixteen xi of a tile go to sixteen blocks of floats, one for each, which
 // the transforms write, or read, all at once; blocks a multiple of 4 KiB apart
@@ -217,12 +242,6 @@ Plan plan_small(const Conv & c) {
     pl.panels = ceil_div(c.n * c.tw * c.th, kNr);
     pl.kc = std::min<std::int64_t>(c.ic, std::max(kWidened, static_cast<std::int64_t>(t.winograd_small_kc)));
     pl.mc = round_up(std::min<std::int64_t>(c.oc, std::max(kMr, t.winograd_small_mc)), kMr);
-    pl.shared_bytes = align_up(static_cast<std::size_t>(kXi * inputs_stride(pl.panels, c.ic)) * sizeof(float));
-    pl.panel_bytes = align_up(static_cast<std::size_t>(kWidened * 9 * kMr + 8) * sizeof(float));
-    pl.weight_bytes = align_up(static_cast<std::size_t>(kXi * xi_stride(pl.mc, pl.kc)) * sizeof(float));
-    pl.scratch_bytes = align_up(static_cast<std::size_t>((2 * c.th + 2) * (2 * c.tw + 2)) * sizeof(float));
-    pl.product_bytes = align_up(static_cast<std::size_t>(kXi * products_stride(pl.mc, pl.panels * kNr)) * sizeof(float));
-    pl.thread_bytes = pl.panel_bytes + pl.weight_bytes + pl.scratch_bytes + pl.product_bytes;
     return pl;
 }
 
@@ -245,18 +264,57 @@ Plan plan(const Conv & c, int n_threads) {
         pl.tiles = round_up(pl.tiles / 2, kNr);
         pl.tblocks = ceil_div(c.tw * c.th, pl.tiles);
     }
-    pl.shared_bytes = align_up(static_cast<std::size_t>(kXi * xi_stride(round_up(c.oc, kMr), c.ic)) * sizeof(float));
-    pl.panel_bytes = std::max(4 * static_cast<std::size_t>(skewed(pl.kc * pl.tiles)) * sizeof(float),
-                              align_up(static_cast<std::size_t>(kWidened * 9 * kMr + 8) * sizeof(float)));
-    pl.product_bytes = align_up(static_cast<std::size_t>(kXi * products_stride(pl.mc, pl.tiles)) * sizeof(float));
-    pl.thread_bytes = pl.panel_bytes + pl.product_bytes;
     return pl;
 }
 
+// The large images' transformed weights of every xi, [xi][panel][ic][kMr].
+std::int64_t weights_count(const Conv & c) {
+    return kXi * xi_stride(round_up(c.oc, kMr), c.ic);
+}
+
+// A thread's panels of the inputs of the four xi of a row of B^T, for a block
+// of kc input channels and `tiles` tiles, each `stride` floats from the last;
+// and the floats of them, which the widened weights fit in too.
+std::int64_t panels_stride(std::int64_t kc, std::int64_t tiles) {
+    return skewed(kc * tiles);
+}
+std::int64_t panels_count(std::int64_t kc, std::int64_t tiles) {
+    return std::max(4 * panels_stride(kc, tiles), round_up(kWidenedFloats, kSkew));
+}
+
+// The work buffer of F(2x2, 3x3) in single precision. Large images: the
+// transformed weights, shared, and each thread's panels and products. Small
+// images: the transformed inputs of every tile, shared, and each thread's
+// widened weights, transformed weights, a channel of an image with its padding
+// and products.
+struct Single_layout {
+    Work_layout layout;
+    Shared<float> shared;
+    Own<float> panels;  // large: the inputs' panels; small: the widened weights
+    Own<float> weights, scratch;  // small images
+    Own<float> products;
+};
+
+Single_layout single_layout(const Conv & c, const Plan & pl) {
+    Single_layout l;
+    if (pl.small) {
+        l.shared = l.layout.shared<float>(kXi * inputs_stride(pl.panels, c.ic));
+        l.panels = l.layout.own<float>(kWidenedFloats);
+        l.weights = l.layout.own<float>(kXi * xi_stride(pl.mc, pl.kc));
+        l.scratch = l.layout.own<float>((2 * c.th + 2) * (2 * c.tw + 2));
+        l.products = l.layout.own<float>(kXi * products_stride(pl.mc, pl.panels * kNr));
+        return l;
+    }
+    l.shared = l.layout.shared<float>(weights_count(c));
+    l.panels = l.layout.own<float>(panels_count(pl.kc, pl.tiles));
+    l.products = l.layout.own<float>(kXi * products_stride(pl.mc, pl.tiles));
+    return l;
+}
+
 // The four by four inputs of tile t of image n, channel ic, rows and columns,
-// zeros outside the image.
-inline float input_at(const Conv & c, const char * plane, std::int64_t y, std::int64_t x) {
-    return (y >= 0 && y < c.ih && x >= 0 && x < c.iw) ? reinterpret_cast<const float *>(plane + y * c.xnb1)[x] : 0.0f;
+// zeros outside the image: of the channel's plane, its first element at plane.
+inline float input_at(const Conv & c, Elements<const float> plane, std::int64_t y, std::int64_t x) {
+    return (y >= 0 && y < c.ih && x >= 0 && x < c.iw) ? plane[y * c.xnb1 + x] : 0.0f;
 }
 
 // Row i of B^T applied to four numbers.
@@ -273,34 +331,59 @@ inline float bt(int i, float d0, float d1, float d2, float d3) {
     }
 }
 
+// A row of zeros, which the kernels written by hand read in place of a row of
+// the image above or below it: as far as they read a row.
+alignas(64) constexpr std::array<float, 2 * kNr + 16> kZeros{};
+
 // Packs the elements xi = (r, s), s = 0..3, of the transformed inputs of tiles
 // [t0, t1) of image n and channels [k0, k1) into panels of kNr tiles,
 // [panel][k1 - k0][kNr], tile l of the block in lane shuffled(l), zeros past
-// t1: those of element (r, s) at dst + s * stride. The four take the same two
-// rows of each tile, which row r of B^T adds or subtracts, and are packed
-// together so that those rows are read and taken apart once for the four.
-void pack_inputs(float * dst, std::int64_t stride, const Conv & c, std::int64_t n, std::int64_t t0, std::int64_t t1,
+// t1: those of element (r, s) `stride` floats after those of (r, s - 1). The
+// four take the same two rows of each tile, which row r of B^T adds or
+// subtracts, and are packed together so that those rows are read and taken
+// apart once for the four.
+void pack_inputs(Elements<float> dst, std::int64_t stride, const Conv & c, std::int64_t n, std::int64_t t0, std::int64_t t1,
                  std::int64_t k0, std::int64_t k1, int r, bool shuffle) {
     const std::int64_t kc = k1 - k0;
-    const char * image = c.x + n * c.xnb3;
     // The rows of the tile that row r of B^T takes, with their signs.
-    constexpr int kRows[4][2] = {{0, 2}, {1, 2}, {1, 2}, {1, 3}};
-    constexpr float kSigns[4][2] = {{1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}, {1.0f, -1.0f}};
-    for (std::int64_t tt = t0; tt < t1; tt += kNr, dst += kc * kNr) {
+    constexpr std::array<std::array<int, 2>, 4> kRows = {{{0, 2}, {1, 2}, {1, 2}, {1, 3}}};
+    constexpr std::array<std::array<float, 2>, 4> kSigns = {{{1.0f, -1.0f}, {1.0f, 1.0f}, {-1.0f, 1.0f}, {1.0f, -1.0f}}};
+    const auto rows_of = [&](std::size_t q) { return kRows[static_cast<std::size_t>(r)][q]; };
+    const std::int64_t span = 3 * stride + ceil_div(t1 - t0, kNr) * kc * kNr;
+    SDASM_REQUIRE(dst.size() >= span);
+    for (std::int64_t tt = t0; tt < t1; tt += kNr) {
+        const Elements<float> out = dst.from((tt - t0) / kNr * kc * kNr);
         const std::int64_t valid = std::min<std::int64_t>(kNr, t1 - tt);
         const std::int64_t ty = tt / c.tw;
         const std::int64_t tx0 = tt % c.tw;
         const std::int64_t y0 = 2 * ty - c.p1;
         const std::int64_t x0 = 2 * tx0 - c.p0;
 #if SDASM_X86_64
+        // Rows A and B of the tile, those of row r of B^T, for the kernels
+        // written by hand: the row's first number, of channel k0, the bytes from
+        // it to the tiles' first input, and the bytes to the next channel's;
+        // a row outside the image, a row of zeros.
+        const auto row = [&](int q, const float *& p, std::int64_t & offset, std::int64_t & step) {
+            const std::int64_t y = y0 + rows_of(static_cast<std::size_t>(q));
+            if (y < 0 || y >= c.ih) {
+                p = kZeros.data();
+                offset = 0;
+                step = 0;
+                return;
+            }
+            const Elements<const float> first = c.x.from(input_plane(c, n, k0) + y * c.xnb1);
+            SDASM_CHECK(first.size() >= (kc - 1) * c.xnb2 + c.iw);
+            p = first.data();
+            offset = bytes_of<float>(x0);
+            step = bytes_of<float>(c.xnb2);
+        };
         if (avx512_kernels() && valid == kNr && tx0 + kNr <= c.tw) {
             // Sixteen tiles of a row by the kernel for AVX-512, in their order:
             // the rows as below, and the lanes of its four loads of sixteen
             // that are inside the image.
-            alignas(64) static constexpr float kZeros[2 * kNr + 16] = {};
-            constexpr int kOffsets[4] = {0, 16, 2, 18};
+            constexpr std::array<int, 4> kOffsets = {0, 16, 2, 18};
             Winograd_inputs job{};
-            for (int m = 0; m < 4; ++m) {
+            for (std::size_t m = 0; m < 4; ++m) {
                 std::uint16_t lanes = 0;
                 for (int lane = 0; lane < 16; ++lane) {
                     const std::int64_t x = x0 + kOffsets[m] + lane;
@@ -309,21 +392,10 @@ void pack_inputs(float * dst, std::int64_t stride, const Conv & c, std::int64_t 
                 job.lanes[m] = lanes;
             }
             const int qa = r == 2 ? 1 : 0;
-            const auto row = [&](int q, const char *& p, std::int64_t & step) {
-                const std::int64_t y = y0 + kRows[r][q];
-                if (y < 0 || y >= c.ih) {
-                    p = reinterpret_cast<const char *>(kZeros);
-                    step = 0;
-                    return;
-                }
-                p = reinterpret_cast<const char *>(reinterpret_cast<std::uintptr_t>(image + k0 * c.xnb2 + y * c.xnb1) +
-                                                   static_cast<std::uintptr_t>(x0 * static_cast<std::int64_t>(sizeof(float))));
-                step = c.xnb2;
-            };
-            job.dst = dst;
-            job.stride = stride * static_cast<std::int64_t>(sizeof(float));
-            row(qa, job.a, job.a_step);
-            row(1 - qa, job.b, job.b_step);
+            job.dst = out.data();
+            job.stride = bytes_of<float>(stride);
+            row(qa, job.a, job.a_offset, job.a_step);
+            row(1 - qa, job.b, job.b_offset, job.b_step);
             job.channels = kc;
             job.subtract = r == 1 ? 0 : 1;
             sdasm_winograd_inputs_avx512(&job);
@@ -336,39 +408,25 @@ void pack_inputs(float * dst, std::int64_t stride, const Conv & c, std::int64_t 
             // minus B with the two exchanged. A row outside the image is a row
             // of zeros, and the inputs past the left and the right edges are
             // masked out of the loads.
-            alignas(32) static constexpr float kZeros[2 * kNr + 8] = {};
-            constexpr int kOffsets[8] = {0, 8, 2, 10, 16, 24, 18, 26};
-            alignas(32) std::int32_t masks[8][8];
+            constexpr std::array<int, 8> kOffsets = {0, 8, 2, 10, 16, 24, 18, 26};
+            alignas(32) std::array<std::int32_t, 8 * 8> masks{};
             const bool inside = x0 >= 0 && x0 + 2 * kNr + 2 <= c.iw;
-            for (int m = 0; m < 8; ++m) {
-                for (int lane = 0; lane < 8; ++lane) {
-                    const std::int64_t x = x0 + kOffsets[m] + lane;
-                    masks[m][lane] = x >= 0 && x < c.iw ? -1 : 0;
+            for (std::size_t m = 0; m < 8; ++m) {
+                for (std::size_t lane = 0; lane < 8; ++lane) {
+                    const std::int64_t x = x0 + kOffsets[m] + static_cast<std::int64_t>(lane);
+                    masks[m * 8 + lane] = x >= 0 && x < c.iw ? -1 : 0;
                 }
             }
             const int qa = r == 2 ? 1 : 0;
-            const auto row = [&](int q, const char *& p, std::int64_t & step) {
-                const std::int64_t y = y0 + kRows[r][q];
-                if (y < 0 || y >= c.ih) {
-                    p = reinterpret_cast<const char *>(kZeros);
-                    step = 0;
-                    return;
-                }
-                // The address of the first input, which may lie before the row:
-                // it is formed but never read.
-                p = reinterpret_cast<const char *>(reinterpret_cast<std::uintptr_t>(image + k0 * c.xnb2 + y * c.xnb1) +
-                                                   static_cast<std::uintptr_t>(x0 * static_cast<std::int64_t>(sizeof(float))));
-                step = c.xnb2;
-            };
             Winograd_inputs job{};
-            job.dst = dst;
-            job.stride = stride * static_cast<std::int64_t>(sizeof(float));
-            row(qa, job.a, job.a_step);
-            row(1 - qa, job.b, job.b_step);
+            job.dst = out.data();
+            job.stride = bytes_of<float>(stride);
+            row(qa, job.a, job.a_offset, job.a_step);
+            row(1 - qa, job.b, job.b_offset, job.b_step);
             job.channels = kc;
             // A row of zeros is read where a row of the image would be, and as
             // far: kZeros is long enough for it, masks or none.
-            job.masks = inside ? nullptr : &masks[0][0];
+            job.masks = inside ? nullptr : masks.data();
             job.subtract = r == 1 ? 0 : 1;
             sdasm_winograd_inputs_avx2(&job);
             continue;
@@ -379,29 +437,31 @@ void pack_inputs(float * dst, std::int64_t stride, const Conv & c, std::int64_t 
             // the input at 2 l + j along the two rows that row r of B^T takes,
             // or zeros for a row outside the image.
             for (std::int64_t k = k0; k < k1; ++k) {
-                const char * plane = image + k * c.xnb2;
-                float sum[4][kNr] = {};
-                for (int q = 0; q < 2; ++q) {
-                    const std::int64_t y = y0 + kRows[r][q];
+                const Elements<const float> plane = c.x.from(input_plane(c, n, k));
+                std::array<std::array<float, kNr>, 4> sum{};
+                for (std::size_t q = 0; q < 2; ++q) {
+                    const std::int64_t y = y0 + rows_of(q);
                     if (y < 0 || y >= c.ih) {
                         continue;
                     }
-                    const float * p = reinterpret_cast<const float *>(plane + y * c.xnb1) + x0;
-                    const float sign = kSigns[r][q];
-                    for (int l = 0; l < kNr; ++l) {
-                        const float d0 = p[2 * l];
-                        const float d1 = p[2 * l + 1];
-                        const float d2 = p[2 * l + 2];
-                        const float d3 = p[2 * l + 3];
+                    const Elements<const float> p = plane.part(y * c.xnb1 + x0, 2 * kNr + 2);
+                    const float sign = kSigns[static_cast<std::size_t>(r)][q];
+                    for (std::size_t l = 0; l < kNr; ++l) {
+                        const auto x = static_cast<std::int64_t>(2 * l);
+                        const float d0 = p[x];
+                        const float d1 = p[x + 1];
+                        const float d2 = p[x + 2];
+                        const float d3 = p[x + 3];
                         sum[0][l] += sign * (d0 - d2);
                         sum[1][l] += sign * (d1 + d2);
                         sum[2][l] += sign * (d2 - d1);
                         sum[3][l] += sign * (d1 - d3);
                     }
                 }
-                for (int s4 = 0; s4 < 4; ++s4) {
-                    for (int l = 0; l < kNr; ++l) {
-                        dst[s4 * stride + (k - k0) * kNr + l] = sum[s4][l];
+                for (std::size_t s4 = 0; s4 < 4; ++s4) {
+                    const Elements<float> d = out.part(static_cast<std::int64_t>(s4) * stride + (k - k0) * kNr, kNr);
+                    for (std::size_t l = 0; l < kNr; ++l) {
+                        d[static_cast<std::int64_t>(l)] = sum[s4][l];
                     }
                 }
             }
@@ -410,30 +470,30 @@ void pack_inputs(float * dst, std::int64_t stride, const Conv & c, std::int64_t 
         // Tiles at the edges of the image, or running over the end of a row of
         // tiles: one at a time.
         for (std::int64_t k = k0; k < k1; ++k) {
-            const char * plane = image + k * c.xnb2;
+            const Elements<const float> plane = c.x.from(input_plane(c, n, k));
             for (std::int64_t l = 0; l < kNr; ++l) {
-                float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                std::array<float, 4> o{};
                 if (l < valid) {
                     const std::int64_t t = tt + l;
                     const std::int64_t yy = 2 * (t / c.tw) - c.p1;
                     const std::int64_t xx = 2 * (t % c.tw) - c.p0;
-                    float d[4][4];
-                    for (int i = 0; i < 4; ++i) {
-                        for (int j = 0; j < 4; ++j) {
-                            d[i][j] = input_at(c, plane, yy + i, xx + j);
+                    std::array<std::array<float, 4>, 4> d{};
+                    for (std::size_t i = 0; i < 4; ++i) {
+                        for (std::size_t j = 0; j < 4; ++j) {
+                            d[i][j] = input_at(c, plane, yy + static_cast<std::int64_t>(i), xx + static_cast<std::int64_t>(j));
                         }
                     }
                     for (int s4 = 0; s4 < 4; ++s4) {
-                        float row[4];
-                        for (int i = 0; i < 4; ++i) {
-                            row[i] = bt(s4, d[i][0], d[i][1], d[i][2], d[i][3]);
+                        std::array<float, 4> rw{};
+                        for (std::size_t i = 0; i < 4; ++i) {
+                            rw[i] = bt(s4, d[i][0], d[i][1], d[i][2], d[i][3]);
                         }
-                        out[s4] = bt(r, row[0], row[1], row[2], row[3]);
+                        o[static_cast<std::size_t>(s4)] = bt(r, rw[0], rw[1], rw[2], rw[3]);
                     }
                 }
                 const std::int64_t lane = shuffle ? shuffled(l) : l;
-                for (int s4 = 0; s4 < 4; ++s4) {
-                    dst[s4 * stride + (k - k0) * kNr + lane] = out[s4];
+                for (std::size_t s4 = 0; s4 < 4; ++s4) {
+                    out[static_cast<std::int64_t>(s4) * stride + (k - k0) * kNr + lane] = o[s4];
                 }
             }
         }
@@ -446,15 +506,16 @@ void pack_inputs(float * dst, std::int64_t stride, const Conv & c, std::int64_t 
 // -- or at shuffled(t - t0), with `shuffle`; added to the outputs there when
 // the chain begins its sum from them (fusion.h). Then the chain after the
 // convolution, over the rows of the outputs written.
-void transform_outputs(const Conv & c, const float * products, std::size_t stride, std::int64_t nt, std::int64_t n,
+void transform_outputs(const Conv & c, Elements<const float> products, std::int64_t stride, std::int64_t nt, std::int64_t n,
                        std::int64_t t0, std::int64_t t1, std::int64_t r0, std::int64_t r1, const Epilogue & chain,
                        bool shuffle) {
     const Phase_scope scope(Phase::transform_out);
     const bool add = chain.from_redirect;
-    char * image = c.y + n * c.ynb3;
     for (std::int64_t r = r0; r < r1; ++r) {
-        const float * m = products + (r - r0) * nt;
-        char * plane = image + r * c.ynb2;
+        const Elements<const float> m = products.from((r - r0) * nt);
+        const std::int64_t plane = output_plane(c, n, r);
+        // The output row y from column x on.
+        const auto output = [&](std::int64_t y, std::int64_t x) { return c.y.from(plane + y * c.ynb1 + x); };
         for (std::int64_t t = t0; t < t1;) {
             const std::int64_t ty = t / c.tw;
             const std::int64_t tx = t % c.tw;
@@ -465,10 +526,10 @@ void transform_outputs(const Conv & c, const float * products, std::size_t strid
                 // Sixteen tiles at a time, in their order, by the kernel for
                 // AVX-512.
                 const std::int64_t groups = whole / 16;
-                sdasm_winograd_outputs_avx512(m + (t - t0), static_cast<std::int64_t>(stride * sizeof(float)),
-                                              reinterpret_cast<float *>(plane + 2 * ty * c.ynb1) + 2 * tx,
-                                              reinterpret_cast<float *>(plane + (2 * ty + 1) * c.ynb1) + 2 * tx, groups,
-                                              add ? 1 : 0);
+                SDASM_CHECK(m.size() >= (kXi - 1) * stride + (t - t0) + 16 * groups);
+                sdasm_winograd_outputs_avx512(m.from(t - t0).data(), bytes_of<float>(stride),
+                                              output(2 * ty, 2 * tx).first(32 * groups).data(),
+                                              output(2 * ty + 1, 2 * tx).first(32 * groups).data(), groups, add ? 1 : 0);
                 t += 16 * groups;
                 continue;
             }
@@ -476,27 +537,28 @@ void transform_outputs(const Conv & c, const float * products, std::size_t strid
                 // Eight tiles at a time, in the shuffled lanes the packing left
                 // them in, by the kernel written by hand.
                 const std::int64_t groups = whole / 8;
-                sdasm_winograd_outputs_avx2(m + (t - t0), static_cast<std::int64_t>(stride * sizeof(float)),
-                                            reinterpret_cast<float *>(plane + 2 * ty * c.ynb1) + 2 * tx,
-                                            reinterpret_cast<float *>(plane + (2 * ty + 1) * c.ynb1) + 2 * tx, groups,
-                                            add ? 1 : 0);
+                SDASM_CHECK(m.size() >= (kXi - 1) * stride + (t - t0) + 8 * groups);
+                sdasm_winograd_outputs_avx2(m.from(t - t0).data(), bytes_of<float>(stride),
+                                            output(2 * ty, 2 * tx).first(16 * groups).data(),
+                                            output(2 * ty + 1, 2 * tx).first(16 * groups).data(), groups, add ? 1 : 0);
                 t += 8 * groups;
                 continue;
             }
 #endif
             if (!shuffle && whole > 0 && 2 * ty + 2 <= c.oh) {
-                float * row0 = reinterpret_cast<float *>(plane + 2 * ty * c.ynb1) + 2 * tx;
-                float * row1 = reinterpret_cast<float *>(plane + (2 * ty + 1) * c.ynb1) + 2 * tx;
-                const float * v = m + (t - t0);
+                const Elements<float> row0 = output(2 * ty, 2 * tx).first(2 * whole);
+                const Elements<float> row1 = output(2 * ty + 1, 2 * tx).first(2 * whole);
+                const Elements<const float> v = m.from(t - t0);
                 for (std::int64_t l = 0; l < whole; ++l) {
                     // A^T M A: rows 0 and 1 of A^T M, then their columns.
-                    float a0[4];
-                    float a1[4];
-                    for (int j = 0; j < 4; ++j) {
-                        const float v0 = v[static_cast<std::size_t>(0 * 4 + j) * stride + static_cast<std::size_t>(l)];
-                        const float v1 = v[static_cast<std::size_t>(1 * 4 + j) * stride + static_cast<std::size_t>(l)];
-                        const float v2 = v[static_cast<std::size_t>(2 * 4 + j) * stride + static_cast<std::size_t>(l)];
-                        const float v3 = v[static_cast<std::size_t>(3 * 4 + j) * stride + static_cast<std::size_t>(l)];
+                    std::array<float, 4> a0{};
+                    std::array<float, 4> a1{};
+                    for (std::size_t j = 0; j < 4; ++j) {
+                        const auto jj = static_cast<std::int64_t>(j);
+                        const float v0 = v[(0 * 4 + jj) * stride + l];
+                        const float v1 = v[(1 * 4 + jj) * stride + l];
+                        const float v2 = v[(2 * 4 + jj) * stride + l];
+                        const float v3 = v[(3 * 4 + jj) * stride + l];
                         a0[j] = v0 + v1 + v2;
                         a1[j] = v1 - v2 - v3;
                     }
@@ -514,30 +576,30 @@ void transform_outputs(const Conv & c, const float * products, std::size_t strid
             }
             // A tile at an edge of the output, or in shuffled lanes: on its own.
             const std::int64_t l = t - t0;
-            const auto lane = static_cast<std::size_t>(shuffle ? shuffled(l) : l);
-            float v[kXi];
-            for (int xi = 0; xi < kXi; ++xi) {
-                v[xi] = m[static_cast<std::size_t>(xi) * stride + lane];
+            const std::int64_t lane = shuffle ? shuffled(l) : l;
+            std::array<float, kXi> v{};
+            for (std::size_t xi = 0; xi < kXi; ++xi) {
+                v[xi] = m[static_cast<std::int64_t>(xi) * stride + lane];
             }
-            float a0[4];
-            float a1[4];
-            for (int j = 0; j < 4; ++j) {
+            std::array<float, 4> a0{};
+            std::array<float, 4> a1{};
+            for (std::size_t j = 0; j < 4; ++j) {
                 a0[j] = v[0 * 4 + j] + v[1 * 4 + j] + v[2 * 4 + j];
                 a1[j] = v[1 * 4 + j] - v[2 * 4 + j] - v[3 * 4 + j];
             }
-            const auto put = [&](float * p, float x) { *p = add ? *p + x : x; };
+            const auto put = [&](float & p, float x) { p = add ? p + x : x; };
             const std::int64_t yy = 2 * ty;
             const std::int64_t xx = 2 * tx;
-            float * row0 = reinterpret_cast<float *>(plane + yy * c.ynb1);
-            put(row0 + xx, a0[0] + a0[1] + a0[2]);
+            const Elements<float> row0 = output(yy, 0);
+            put(row0[xx], a0[0] + a0[1] + a0[2]);
             if (xx + 1 < c.ow) {
-                put(row0 + xx + 1, a0[1] - a0[2] - a0[3]);
+                put(row0[xx + 1], a0[1] - a0[2] - a0[3]);
             }
             if (yy + 1 < c.oh) {
-                float * row1 = reinterpret_cast<float *>(plane + (yy + 1) * c.ynb1);
-                put(row1 + xx, a1[0] + a1[1] + a1[2]);
+                const Elements<float> row1 = output(yy + 1, 0);
+                put(row1[xx], a1[0] + a1[1] + a1[2]);
                 if (xx + 1 < c.ow) {
-                    put(row1 + xx + 1, a1[1] - a1[2] - a1[3]);
+                    put(row1[xx + 1], a1[1] - a1[2] - a1[3]);
                 }
             }
             ++t;
@@ -552,8 +614,7 @@ void transform_outputs(const Conv & c, const float * products, std::size_t strid
                 const std::int64_t x0 = 2 * txa;
                 const std::int64_t x1 = std::min(c.ow, 2 * txb);
                 for (std::int64_t yy = 2 * ty; yy < std::min(c.oh, 2 * ty + 2); ++yy) {
-                    float * row = reinterpret_cast<float *>(plane + yy * c.ynb1) + x0;
-                    chain.apply_positions(row, x1 - x0, yy * c.ow + x0, r, n);
+                    chain.apply_positions(output(yy, x0).first(x1 - x0), yy * c.ow + x0, r, n);
                 }
                 t += txb - txa;
             }
@@ -561,52 +622,49 @@ void transform_outputs(const Conv & c, const float * products, std::size_t strid
     }
 }
 
-
 // Small images: the transformed inputs of channels [k0, k1) of image n, every
 // tile of it, B^T d B as bt() computes it, element xi of the tile that is g-th
 // of all images at v[xi * inputs_stride() + ((g / kNr) * ic + k) * kNr + g % kNr]
 // -- the panels of B of each xi, [panel][ic][kNr]. The lanes past the last tile of
 // the last image are zeros. `scratch` holds a channel of the image with the
 // zeros around it that the tiles reach.
-void transform_inputs_small(float * v, const Conv & c, std::int64_t panels, std::int64_t n, std::int64_t k0,
-                            std::int64_t k1, float * scratch) {
+void transform_inputs_small(Elements<float> v, const Conv & c, std::int64_t panels, std::int64_t n, std::int64_t k0,
+                            std::int64_t k1, Elements<float> scratch) {
     const std::int64_t sw = 2 * c.tw + 2;
     const std::int64_t sh = 2 * c.th + 2;
     const std::int64_t tiles = c.tw * c.th;
     const std::int64_t last = c.n * tiles;
-    const auto at = [&](std::int64_t xi, std::int64_t g, std::int64_t k) {
-        return v + xi * inputs_stride(panels, c.ic) + ((g / kNr) * c.ic + k) * kNr + g % kNr;
+    const std::int64_t vstride = inputs_stride(panels, c.ic);
+    const auto at = [&](std::int64_t xi, std::int64_t g, std::int64_t k) -> float & {
+        return v[xi * vstride + ((g / kNr) * c.ic + k) * kNr + g % kNr];
     };
     for (std::int64_t k = k0; k < k1; ++k) {
-        const char * plane = c.x + n * c.xnb3 + k * c.xnb2;
+        const Elements<const float> plane = c.x.from(input_plane(c, n, k));
         for (std::int64_t y = 0; y < sh; ++y) {
-            float * row = scratch + y * sw;
+            const Elements<float> row = scratch.part(y * sw, sw);
             const std::int64_t iy = y - c.p1;
             for (std::int64_t x = 0; x < sw; ++x) {
-                const std::int64_t ix = x - c.p0;
-                row[x] = iy >= 0 && iy < c.ih && ix >= 0 && ix < c.iw
-                             ? reinterpret_cast<const float *>(plane + iy * c.xnb1)[ix]
-                             : 0.0f;
+                row[x] = input_at(c, plane, iy, x - c.p0);
             }
         }
         for (std::int64_t t = 0; t < tiles; ++t) {
-            const float * d = scratch + 2 * (t / c.tw) * sw + 2 * (t % c.tw);
+            const Elements<const float> d = scratch.from(2 * (t / c.tw) * sw + 2 * (t % c.tw));
             const std::int64_t g = n * tiles + t;
             for (int s = 0; s < 4; ++s) {
-                float row[4];
-                for (int i = 0; i < 4; ++i) {
-                    const float * di = d + i * sw;
+                std::array<float, 4> row{};
+                for (std::size_t i = 0; i < 4; ++i) {
+                    const Elements<const float> di = d.from(static_cast<std::int64_t>(i) * sw);
                     row[i] = bt(s, di[0], di[1], di[2], di[3]);
                 }
                 for (int r = 0; r < 4; ++r) {
-                    *at(r * 4 + s, g, k) = bt(r, row[0], row[1], row[2], row[3]);
+                    at(r * 4 + s, g, k) = bt(r, row[0], row[1], row[2], row[3]);
                 }
             }
         }
         if (n == c.n - 1) {
             for (std::int64_t g = last; g < panels * kNr; ++g) {
                 for (std::int64_t xi = 0; xi < kXi; ++xi) {
-                    *at(xi, g, k) = 0.0f;
+                    at(xi, g, k) = 0.0f;
                 }
             }
         }
@@ -615,55 +673,55 @@ void transform_inputs_small(float * v, const Conv & c, std::int64_t panels, std:
 
 // G g G^T of the kernels of output channels [r0, r0 + rows), rows <= kMr,
 // and input channels [k0, k1), into a panel of A of each xi, [k1 - k0][kMr]:
-// that of xi at dst + xi * stride. Each kWidened input channels are widened
-// first into `widened`, [channel][3 * 3][kMr], and their kernels transformed
-// kMr at a time, a channel to a lane: G g first, a column of g at a time, then
-// (G g) G^T, a row at a time, each sum of three taken left to right and halved
-// after.
-void transform_weights(float * dst, std::int64_t stride, const Conv & c, std::int64_t r0, std::int64_t rows,
-                       std::int64_t k0, std::int64_t k1, float * widened) {
+// that of xi `stride` floats after that of xi - 1. Each kWidened input channels
+// are widened first into `widened`, [channel][3 * 3][kMr], and their kernels
+// transformed kMr at a time, a channel to a lane: G g first, a column of g at a
+// time, then (G g) G^T, a row at a time, each sum of three taken left to right
+// and halved after.
+void transform_weights(Elements<float> dst, std::int64_t stride, const Conv & c, std::int64_t r0, std::int64_t rows,
+                       std::int64_t k0, std::int64_t k1, Elements<float> widened) {
+    SDASM_REQUIRE(dst.size() >= (kXi - 1) * stride + (k1 - k0) * kMr && widened.size() >= kWidenedFloats);
     for (std::int64_t s0 = k0; s0 < k1; s0 += kWidened) {
         const std::int64_t s1 = std::min(k1, s0 + kWidened);
-        if (c.wtype == GGML_TYPE_F16) {
-            pack_rows_f16(widened, reinterpret_cast<const std::uint16_t *>(c.w + r0 * c.wnb3), c.wnb3, rows, s0 * 9,
-                          s1 * 9, kMr);
-        }
-        else {
-            pack_rows_f32(widened, reinterpret_cast<const float *>(c.w + r0 * c.wnb3), c.wnb3, rows, s0 * 9, s1 * 9,
-                          kMr);
-        }
+        pack_weight_rows(widened, c, r0, rows, s0 * 9, s1 * 9, kMr);
 #if SDASM_X86_64
         if (avx2_kernels()) {
-            sdasm_winograd_weights_avx2(dst + (s0 - k0) * kMr, stride * static_cast<std::int64_t>(sizeof(float)), widened,
-                                        s1 - s0);
+            // The kernel writes a panel's channels eight floats at a time, two
+            // past the six of the last: into the next panel's, or the skew
+            // after the last.
+            sdasm_winograd_weights_avx2(dst.from((s0 - k0) * kMr).data(), bytes_of<float>(stride), widened.data(), s1 - s0);
             continue;
         }
 #endif
         for (std::int64_t k = s0; k < s1; ++k) {
             // The nine numbers of the kernels of the panel, kMr side by side.
-            const float * g = widened + (k - s0) * 9 * kMr;
-            float t[4][3][kMr];  // G g
-            for (int j = 0; j < 3; ++j) {
-                for (int lane = 0; lane < kMr; ++lane) {
-                    const float g0 = g[(0 * 3 + j) * kMr + lane];
-                    const float g1 = g[(1 * 3 + j) * kMr + lane];
-                    const float g2 = g[(2 * 3 + j) * kMr + lane];
+            const Elements<const float> g = widened.part((k - s0) * 9 * kMr, 9 * kMr);
+            std::array<std::array<std::array<float, kMr>, 3>, 4> t{};  // G g
+            for (std::size_t j = 0; j < 3; ++j) {
+                for (std::size_t lane = 0; lane < kMr; ++lane) {
+                    const auto jj = static_cast<std::int64_t>(j);
+                    const auto ll = static_cast<std::int64_t>(lane);
+                    const float g0 = g[(0 * 3 + jj) * kMr + ll];
+                    const float g1 = g[(1 * 3 + jj) * kMr + ll];
+                    const float g2 = g[(2 * 3 + jj) * kMr + ll];
                     t[0][j][lane] = g0;
                     t[1][j][lane] = 0.5f * (g0 + g1 + g2);
                     t[2][j][lane] = 0.5f * (g0 - g1 + g2);
                     t[3][j][lane] = g2;
                 }
             }
-            float * out = dst + (k - k0) * kMr;
-            for (int i = 0; i < 4; ++i) {
-                for (int lane = 0; lane < kMr; ++lane) {
+            const Elements<float> out = dst.from((k - k0) * kMr);
+            for (std::size_t i = 0; i < 4; ++i) {
+                const auto ii = static_cast<std::int64_t>(i);
+                for (std::size_t lane = 0; lane < kMr; ++lane) {
+                    const auto ll = static_cast<std::int64_t>(lane);
                     const float a = t[i][0][lane];
                     const float b = t[i][1][lane];
                     const float d = t[i][2][lane];
-                    out[(i * 4 + 0) * stride + lane] = a;
-                    out[(i * 4 + 1) * stride + lane] = 0.5f * (a + b + d);
-                    out[(i * 4 + 2) * stride + lane] = 0.5f * (a - b + d);
-                    out[(i * 4 + 3) * stride + lane] = d;
+                    out[(ii * 4 + 0) * stride + ll] = a;
+                    out[(ii * 4 + 1) * stride + ll] = 0.5f * (a + b + d);
+                    out[(ii * 4 + 2) * stride + ll] = 0.5f * (a - b + d);
+                    out[(ii * 4 + 3) * stride + ll] = d;
                 }
             }
         }
@@ -676,79 +734,65 @@ bool on_amx(const Conv & c) {
     return split_form(Split_use::winograd).kernel != nullptr && c.wtype == GGML_TYPE_F16;
 }
 
-// The bytes of the tiles of A of sixteen output channels over all input
+// Elements of two bytes in a block of k of a tile of AMX-BF16's form.
+constexpr std::int64_t kTileHalves = kAmxTileBytes / 2;
+
+// The elements of the tiles of A of sixteen output channels over all input
 // channels, and of all of an xi, the channels rounded up to 32.
-std::int64_t amx_row_tile_bytes(const Conv & c) {
-    return round_up(c.ic, kAmxBlock) / kAmxBlock * kAmxTileBytes;
+std::int64_t amx_row_tile(const Conv & c) {
+    return round_up(c.ic, kAmxBlock) / kAmxBlock * kTileHalves;
 }
 
-std::int64_t amx_xi_bytes(const Conv & c, std::int64_t rows) {
-    return round_up(rows, kAmxBlock) / kAmxTile * amx_row_tile_bytes(c);
+std::int64_t amx_xi(const Conv & c, std::int64_t rows) {
+    return round_up(rows, kAmxBlock) / kAmxTile * amx_row_tile(c);
 }
 
 // The scratch of the transform of the weights into tiles: the kernels of
 // sixteen output channels by 32 input channels, widened, [32 * 3 * 3][16], and
 // their transforms, [xi][32][16].
-constexpr std::int64_t kAmxRowsFloats = kAmxBlock * 9 * kAmxTile + kXi * kAmxBlock * kAmxTile;
+constexpr std::int64_t kAmxWidened = kAmxBlock * 9 * kAmxTile;
+constexpr std::int64_t kAmxRowsFloats = kAmxWidened + kXi * kAmxBlock * kAmxTile;
 
 // The tiles of A of output channels [r0, r0 + 16) over input channels [k0, k1),
-// k0 a multiple of 32: those of xi at dst + xi * xi_bytes, those of the block
-// of k at k0 at (k0 - kbase) / 32 * kAmxTileBytes after. The kernels of a block
-// of 32 input channels widened side by side (pack_rows_f16()), then
+// k0 a multiple of 32: those of xi `xi` elements after those of xi - 1, those of
+// the block of k at k0 at (k0 - kbase) / 32 * kTileHalves after. The kernels of
+// a block of 32 input channels widened side by side (pack_rows_f16()), then
 // transformed, sixteen output channels at a time, and split into the tiles
 // (x86_64/amx_winograd.S); the output channels past the last, and the input
 // channels, transform to zeros.
-void amx_weights_tile(std::uint16_t * dst, std::int64_t xi_bytes, std::int64_t kbase, const Conv & c, std::int64_t r0,
-                      std::int64_t k0, std::int64_t k1, float * scratch) {
-    float * widened = scratch;
-    float * transformed = scratch + kAmxBlock * 9 * kAmxTile;
+void amx_weights_tile(Elements<std::uint16_t> dst, std::int64_t xi, std::int64_t kbase, const Conv & c, std::int64_t r0,
+                      std::int64_t k0, std::int64_t k1, Elements<float> scratch) {
+    const Elements<float> widened = scratch.first(kAmxWidened);
+    const Elements<float> transformed = scratch.part(kAmxWidened, kAmxRowsFloats - kAmxWidened);
     const std::int64_t rows = std::clamp<std::int64_t>(c.oc - r0, 0, kAmxTile);
     for (std::int64_t kb = k0; kb < k1; kb += kAmxBlock) {
         const std::int64_t kc = std::min(kAmxBlock, c.ic - kb);
-        std::uint16_t * out = dst + (kb - kbase) / kAmxBlock * kAmxTileBytes / 2;
+        const Elements<std::uint16_t> out = dst.from((kb - kbase) / kAmxBlock * kTileHalves);
+        SDASM_CHECK(out.size() >= (kXi - 1) * xi + kTileHalves);
         if (rows == 0 || kc <= 0) {
-            for (int xi = 0; xi < kXi; ++xi) {
-                std::memset(out + xi * xi_bytes / 2, 0, kAmxTileBytes);
+            for (std::int64_t i = 0; i < kXi; ++i) {
+                fill_with(out.part(i * xi, kTileHalves), std::uint16_t{0});
             }
             continue;
         }
-        pack_rows_f16(widened, reinterpret_cast<const std::uint16_t *>(c.w + r0 * c.wnb3), c.wnb3, rows, kb * 9,
-                      (kb + kc) * 9, kAmxTile);
-        sdasm_amx_winograd_weights(out, xi_bytes, widened, kc, transformed);
+        pack_rows_f16(widened, c.w16.from(r0 * c.wnb3), c.wnb3, rows, kb * 9, (kb + kc) * 9, kAmxTile);
+        sdasm_amx_winograd_weights(out.data(), bytes_of<std::uint16_t>(xi), widened.data(), kc, transformed.data());
     }
 }
 
 struct Amx_plan {
     std::int64_t mc, kc, tiles, mblocks, tblocks;
-    std::int64_t stride;           // the floats between the panels of the inputs of two xi
-    std::size_t shared_bytes;      // the tiles of A of every xi; small images: the inputs too
-    std::size_t panel_bytes;       // the inputs of four xi in single precision
-    std::size_t column_bytes;      // the tiles of B of an xi; small images: the tiles of A of every xi
-    std::size_t product_bytes;
-    std::size_t rows_bytes;        // G g G^T of sixteen channels by 32
-    std::size_t scratch_bytes;     // small images: a channel of an image, padded
-    std::size_t thread_bytes;
-    std::int64_t panels;           // small images: the panels of sixteen tiles of all images, rounded up to two
-    std::size_t inputs_bytes;      // small images: the inputs of every xi in single precision
+    std::int64_t stride;  // the floats between the panels of the inputs of two xi
+    std::int64_t panels;  // small images: the panels of sixteen tiles of all images, rounded up to two
 };
 
 Amx_plan amx_plan(const Conv & c, int n_threads) {
     const Tuning & t = tuning();
     Amx_plan pl{};
-    pl.rows_bytes = align_up(static_cast<std::size_t>(kAmxRowsFloats) * sizeof(float));
-    const std::size_t spare_bytes = align_up(kAmxBlock * kAmxBlock * sizeof(float));
     if (small(c)) {
         pl.panels = round_up(ceil_div(c.n * c.tw * c.th, kNr), 2);
         pl.kc = std::min(round_up(c.ic, kAmxBlock), round_up(std::max(t.winograd_small_kc, 1), kAmxBlock));
         pl.mc = std::min(round_up(c.oc, kAmxBlock), round_up(std::max(t.winograd_small_mc, 1), kAmxBlock));
-        pl.inputs_bytes = align_up(static_cast<std::size_t>(kXi * inputs_stride(pl.panels, c.ic)) * sizeof(float));
-        pl.shared_bytes = pl.inputs_bytes +
-                          align_up(static_cast<std::size_t>(kXi * pl.panels * amx_row_tile_bytes(c)));
-        pl.column_bytes = align_up(static_cast<std::size_t>(kXi * pl.mc / kAmxTile * (pl.kc / kAmxBlock) * kAmxTileBytes));
-        pl.scratch_bytes = align_up(static_cast<std::size_t>((2 * c.th + 2) * (2 * c.tw + 2)) * sizeof(float));
-        pl.product_bytes =
-            align_up(static_cast<std::size_t>(kXi * products_stride(pl.mc, pl.panels * kNr)) * sizeof(float));
-        pl.thread_bytes = pl.column_bytes + pl.rows_bytes + pl.scratch_bytes + pl.product_bytes + spare_bytes;
         return pl;
     }
     pl.kc = std::min(round_up(c.ic, kAmxBlock), round_up(std::max(t.winograd_kc, 1), kAmxBlock));
@@ -762,50 +806,84 @@ Amx_plan amx_plan(const Conv & c, int n_threads) {
         pl.tiles = round_up(pl.tiles / 2, kNr);
         pl.tblocks = ceil_div(c.tw * c.th, pl.tiles);
     }
-    pl.shared_bytes = align_up(static_cast<std::size_t>(kXi * amx_xi_bytes(c, c.oc)));
     pl.stride = skewed(pl.kc * pl.tiles);
-    pl.panel_bytes = align_up(4 * static_cast<std::size_t>(pl.stride) * sizeof(float));
-    pl.column_bytes = align_up(static_cast<std::size_t>(round_up(pl.tiles, kAmxBlock) / kAmxTile * (pl.kc / kAmxBlock) *
-                                                        kAmxTileBytes));
-    pl.product_bytes = align_up(static_cast<std::size_t>(kXi * products_stride(pl.mc, pl.tiles)) * sizeof(float));
-    pl.thread_bytes = pl.panel_bytes + pl.column_bytes + std::max(pl.product_bytes, pl.rows_bytes) + spare_bytes;
     return pl;
 }
 
+// The work buffer on AMX. Large images: the tiles of A of every xi, shared;
+// each thread's inputs of four xi in single precision, the tiles of B of an
+// xi, its products -- or G g G^T of sixteen channels by 32, before the products
+// begin -- and the block it copies a part of. Small images: the inputs of every
+// xi in single precision and their tiles of B, shared; each thread's tiles of A
+// of every xi, G g G^T, a channel of an image with its padding, its products
+// and the block it copies a part of.
+struct Amx_layout {
+    Work_layout layout;
+    Shared<std::uint16_t> weights;  // large images
+    Shared<float> inputs;           // small images
+    Shared<std::uint16_t> inputs_amx;
+    Own<float> panels;
+    Own<std::uint16_t> columns;
+    Own<float> products;
+    Own<float> rows;     // small images
+    Own<float> scratch;  // small images
+    Own<float> spare;
+};
+
+Amx_layout amx_layout(const Conv & c, const Amx_plan & pl) {
+    Amx_layout l;
+    if (small(c)) {
+        l.inputs = l.layout.shared<float>(kXi * inputs_stride(pl.panels, c.ic));
+        l.inputs_amx = l.layout.shared<std::uint16_t>(kXi * pl.panels * amx_row_tile(c));
+        l.columns = l.layout.own<std::uint16_t>(kXi * pl.mc / kAmxTile * (pl.kc / kAmxBlock) * kTileHalves);
+        l.rows = l.layout.own<float>(kAmxRowsFloats);
+        l.scratch = l.layout.own<float>((2 * c.th + 2) * (2 * c.tw + 2));
+        l.products = l.layout.own<float>(kXi * products_stride(pl.mc, pl.panels * kNr));
+        l.spare = l.layout.own<float>(kAmxBlock * kAmxBlock);
+        return l;
+    }
+    l.weights = l.layout.shared<std::uint16_t>(kXi * amx_xi(c, c.oc));
+    l.panels = l.layout.own<float>(4 * pl.stride);
+    l.columns = l.layout.own<std::uint16_t>(round_up(pl.tiles, kAmxBlock) / kAmxTile * (pl.kc / kAmxBlock) * kTileHalves);
+    l.products = l.layout.own<float>(std::max(kXi * products_stride(pl.mc, pl.tiles), kAmxRowsFloats));
+    l.spare = l.layout.own<float>(kAmxBlock * kAmxBlock);
+    return l;
+}
+
 // The products of the tiles of A of an xi, rows [i0, i1) of them from `a`
-// (row_bytes between the tiles of sixteen rows), with the tiles of B of its
-// columns [0, nt) from `b` (column_bytes between the tiles of sixteen
-// columns), over `blocks` blocks of k, into [row][column] at `out`, rows nt
-// floats apart; added to it when accumulate says so.
-void amx_xi_products(const Split_form & f, const std::uint16_t * a, std::int64_t row_bytes, const std::uint16_t * b, std::int64_t column_bytes,
-                     std::int64_t blocks, std::int64_t i0, std::int64_t i1, std::int64_t nt, float * out, bool accumulate,
-                     float * spare) {
-    const std::int64_t ldc = nt * static_cast<std::int64_t>(sizeof(float));
+// (row_tile elements between the tiles of sixteen rows), with the tiles of B
+// of its columns [0, nt) from `b` (column elements between the tiles of
+// sixteen columns), over `blocks` blocks of k, into [row][column] at `out`,
+// rows nt floats apart; added to it when accumulate says so.
+void amx_xi_products(const Split_form & f, Elements<const std::uint16_t> a, std::int64_t row_tile,
+                     Elements<const std::uint16_t> b, std::int64_t column, std::int64_t blocks, std::int64_t i0,
+                     std::int64_t i1, std::int64_t nt, Elements<float> out, bool accumulate, Elements<float> spare) {
     for (std::int64_t jj = 0; jj < nt; jj += kAmxBlock) {
         for (std::int64_t ii = i0; ii < i1; ii += kAmxBlock) {
-            split_block(f, blocks, a + (ii - i0) / kAmxTile * row_bytes / 2, row_bytes,
-                        b + jj / kAmxTile * column_bytes / 2, column_bytes, out + (ii - i0) * nt + jj, ldc, accumulate,
-                        std::min(kAmxBlock, i1 - ii), std::min(kAmxBlock, nt - jj), spare);
+            split_block(f, blocks, a.from((ii - i0) / kAmxTile * row_tile), row_tile, b.from(jj / kAmxTile * column), column,
+                        out.from((ii - i0) * nt + jj), nt, accumulate, std::min(kAmxBlock, i1 - ii),
+                        std::min(kAmxBlock, nt - jj), spare);
         }
     }
 }
 
-void compute_large_amx(const ggml_compute_params * params, const Conv & c, const Amx_plan & pl, const Epilogue & chain) {
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    const std::int64_t xi_bytes = amx_xi_bytes(c, c.oc);
-    const std::int64_t row_bytes = amx_row_tile_bytes(c);
-    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::amx_winograd, static_cast<std::size_t>(kXi * xi_bytes));
-    auto * weights = reinterpret_cast<std::uint16_t *>(kept != nullptr ? reinterpret_cast<char *>(kept->data) : base);
+void compute_large_amx(const ggml_compute_params * const params, const Conv & c, const Amx_plan & pl,
+                       const Epilogue & chain) {
+    const Amx_layout l = amx_layout(c, pl);
+    Work_buffer buffer(params, l.layout);
+    const std::int64_t xi_tiles = amx_xi(c, c.oc);
+    const std::int64_t row_tile = amx_row_tile(c);
+    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::amx_winograd, kXi * xi_tiles);
     const bool fill = kept == nullptr || !kept->ready();
-    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    auto * panels = reinterpret_cast<float *>(mine);
-    auto * columns = reinterpret_cast<std::uint16_t *>(mine + pl.panel_bytes);
-    auto * products = reinterpret_cast<float *>(mine + pl.panel_bytes + pl.column_bytes);
-    auto * rows = products;  // G g G^T, before the products begin
-    auto * spare = reinterpret_cast<float *>(mine + pl.panel_bytes + pl.column_bytes + std::max(pl.product_bytes, pl.rows_bytes));
     const Split_form f = split_form(Split_use::winograd);
 
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<std::uint16_t> weights = kept != nullptr ? kept->halves() : buffer[l.weights];
+    const Elements<float> panels = buffer[l.panels];
+    const Elements<std::uint16_t> columns = buffer[l.columns];
+    const Elements<float> products = buffer[l.products];
+    const Elements<float> rows = products;  // G g G^T, before the products begin
+    const Elements<float> spare = buffer[l.spare];
     // The weights, a tile of sixteen output channels to an item, over every
     // input channel: those past the last are zeros.
     const std::int64_t pack_items = fill ? round_up(c.oc, kAmxBlock) / kAmxTile : 0;
@@ -813,7 +891,7 @@ void compute_large_amx(const ggml_compute_params * params, const Conv & c, const
     if (fill) {
         for (; item < pack_items; item = queue.next()) {
             const Phase_scope scope(Phase::pack_weights);
-            amx_weights_tile(weights + item * row_bytes / 2, xi_bytes, 0, c, item * kAmxTile, 0, round_up(c.ic, kAmxBlock),
+            amx_weights_tile(weights.from(item * row_tile), xi_tiles, 0, c, item * kAmxTile, 0, round_up(c.ic, kAmxBlock),
                              rows);
         }
         queue.barrier();
@@ -840,33 +918,34 @@ void compute_large_amx(const ggml_compute_params * params, const Conv & c, const
         const std::int64_t t0 = block.start;
         const std::int64_t t1 = t0 + block.size;
         const std::int64_t nt = round_up(t1 - t0, kNr);
-        const auto pstride = static_cast<std::size_t>(products_stride(pl.mc, nt));
+        const std::int64_t pstride = products_stride(pl.mc, nt);
         for (int r = 0; r < 4; ++r) {
             for (std::int64_t k0 = 0; k0 < c.ic; k0 += pl.kc) {
                 const std::int64_t kc = std::min(pl.kc, c.ic - k0);
                 const std::int64_t kb = ceil_div(kc, kAmxBlock);
-                const std::int64_t column_bytes = kb * kAmxTileBytes;
+                const std::int64_t column = kb * kTileHalves;
                 {
                     const Phase_scope scope(Phase::pack_inputs);
                     pack_inputs(panels, pl.stride, c, n, t0, t1, k0, k0 + kc, r, false);
                 }
-                for (int s = 0; s < 4; ++s) {
-                    const int xi = 4 * r + s;
+                for (std::int64_t s = 0; s < 4; ++s) {
+                    const std::int64_t xi = 4 * r + s;
                     {
                         // The tiles of B of this xi, from its panels; one more of
                         // zeros past an odd number of them, for the last pair.
                         const Phase_scope scope(Phase::pack_inputs);
                         for (std::int64_t p = 0; p < nt / kNr; ++p) {
-                            sdasm_amx_pack_panel(columns + p * column_bytes / 2, panels + s * pl.stride + p * kc * kNr, kc);
+                            const Elements<std::uint16_t> dst = columns.part(p * column, column);
+                            const Elements<const float> src = panels.part(s * pl.stride + p * kc * kNr, kc * kNr);
+                            sdasm_amx_pack_panel(dst.data(), src.data(), kc);
                         }
                         if ((nt / kNr) % 2 != 0) {
-                            std::memset(columns + (nt / kNr) * column_bytes / 2, 0, static_cast<std::size_t>(column_bytes));
+                            fill_with(columns.part((nt / kNr) * column, column), std::uint16_t{0});
                         }
                     }
                     const Phase_scope scope(Phase::product);
-                    amx_xi_products(f, weights + (xi * xi_bytes + i0 / kAmxTile * row_bytes + k0 / kAmxBlock * kAmxTileBytes) / 2,
-                                    row_bytes, columns, column_bytes, kb, i0, i1, nt, products + static_cast<std::size_t>(xi) * pstride, k0 > 0,
-                                    spare);
+                    amx_xi_products(f, weights.from(xi * xi_tiles + i0 / kAmxTile * row_tile + k0 / kAmxBlock * kTileHalves),
+                                    row_tile, columns, column, kb, i0, i1, nt, products.from(xi * pstride), k0 > 0, spare);
                 }
             }
         }
@@ -877,26 +956,27 @@ void compute_large_amx(const ggml_compute_params * params, const Conv & c, const
     }
 }
 
-void compute_small_amx(const ggml_compute_params * params, const Conv & c, const Amx_plan & pl, const Epilogue & chain) {
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    auto * inputs = reinterpret_cast<float *>(base);
-    auto * inputs_amx = reinterpret_cast<std::uint16_t *>(base + pl.inputs_bytes);
-    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    auto * weights = reinterpret_cast<std::uint16_t *>(mine);
-    auto * rows = reinterpret_cast<float *>(mine + pl.column_bytes);
-    auto * scratch = reinterpret_cast<float *>(mine + pl.column_bytes + pl.rows_bytes);
-    auto * products = reinterpret_cast<float *>(mine + pl.column_bytes + pl.rows_bytes + pl.scratch_bytes);
-    auto * spare = reinterpret_cast<float *>(mine + pl.column_bytes + pl.rows_bytes + pl.scratch_bytes + pl.product_bytes);
+void compute_small_amx(const ggml_compute_params * const params, const Conv & c, const Amx_plan & pl,
+                       const Epilogue & chain) {
+    const Amx_layout l = amx_layout(c, pl);
+    Work_buffer buffer(params, l.layout);
     const Split_form f = split_form(Split_use::winograd);
     const std::int64_t tiles = c.tw * c.th;
     const std::int64_t nt = pl.panels * kNr;
-    const std::int64_t panel_bytes = amx_row_tile_bytes(c);  // a panel of sixteen tiles over every input channel
+    const std::int64_t panel = amx_row_tile(c);  // a panel of sixteen tiles over every input channel
 
     // The inputs in single precision, by all threads together, sixteen channels
     // of an image to an item; then their tiles of B, an xi and a pair of panels
     // to an item.
     constexpr std::int64_t kInputChannels = 16;
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<float> inputs = buffer[l.inputs];
+    const Elements<std::uint16_t> inputs_amx = buffer[l.inputs_amx];
+    const Elements<std::uint16_t> weights = buffer[l.columns];
+    const Elements<float> rows = buffer[l.rows];
+    const Elements<float> scratch = buffer[l.scratch];
+    const Elements<float> products = buffer[l.products];
+    const Elements<float> spare = buffer[l.spare];
     const std::int64_t groups = ceil_div(c.ic, kInputChannels);
     const std::int64_t input_items = c.n * groups;
     int item = queue.next();
@@ -913,8 +993,9 @@ void compute_small_amx(const ggml_compute_params * params, const Conv & c, const
         const std::int64_t pair = (item - input_items) % (pl.panels / 2);
         const Phase_scope scope(Phase::pack_inputs);
         for (std::int64_t p = 2 * pair; p < 2 * pair + 2; ++p) {
-            sdasm_amx_pack_panel(inputs_amx + (xi * pl.panels + p) * panel_bytes / 2,
-                                 inputs + xi * inputs_stride(pl.panels, c.ic) + p * c.ic * kNr, c.ic);
+            const Elements<std::uint16_t> dst = inputs_amx.part((xi * pl.panels + p) * panel, panel);
+            const Elements<const float> src = inputs.part(xi * inputs_stride(pl.panels, c.ic) + p * c.ic * kNr, c.ic * kNr);
+            sdasm_amx_pack_panel(dst.data(), src.data(), c.ic);
         }
     }
     queue.barrier();
@@ -923,7 +1004,7 @@ void compute_small_amx(const ggml_compute_params * params, const Conv & c, const
     // weights of its channels a stretch of the input channels at a time.
     const std::vector<Block> blocks = guided_blocks(1, c.oc, kAmxBlock, pl.mc, params->nth);
     const auto units = static_cast<std::int64_t>(blocks.size());
-    const auto pstride = static_cast<std::size_t>(products_stride(pl.mc, nt));
+    const std::int64_t pstride = products_stride(pl.mc, nt);
     bool configured = false;
     for (; item < input_items + tile_items + units; item = queue.next()) {
         if (!configured) {
@@ -936,23 +1017,23 @@ void compute_small_amx(const ggml_compute_params * params, const Conv & c, const
         for (std::int64_t k0 = 0; k0 < c.ic; k0 += pl.kc) {
             const std::int64_t kc = std::min(pl.kc, round_up(c.ic, kAmxBlock) - k0);
             const std::int64_t kb = kc / kAmxBlock;
-            const std::int64_t row_bytes = kb * kAmxTileBytes;
-            const std::int64_t xi_bytes = round_up(i1 - i0, kAmxBlock) / kAmxTile * row_bytes;
+            const std::int64_t row_tile = kb * kTileHalves;
+            const std::int64_t xi_tiles = round_up(i1 - i0, kAmxBlock) / kAmxTile * row_tile;
             {
                 const Phase_scope scope(Phase::pack_weights);
                 for (std::int64_t r0 = i0; r0 < i0 + round_up(i1 - i0, kAmxBlock); r0 += kAmxTile) {
-                    amx_weights_tile(weights + (r0 - i0) / kAmxTile * row_bytes / 2, xi_bytes, k0, c, r0, k0, k0 + kc, rows);
+                    amx_weights_tile(weights.from((r0 - i0) / kAmxTile * row_tile), xi_tiles, k0, c, r0, k0, k0 + kc, rows);
                 }
             }
             const Phase_scope scope(Phase::product);
-            for (int xi = 0; xi < kXi; ++xi) {
-                amx_xi_products(f, weights + xi * xi_bytes / 2, row_bytes,
-                                inputs_amx + (xi * pl.panels * panel_bytes + k0 / kAmxBlock * kAmxTileBytes) / 2, panel_bytes,
-                                kb, i0, i1, nt, products + static_cast<std::size_t>(xi) * pstride, k0 > 0, spare);
+            for (std::int64_t xi = 0; xi < kXi; ++xi) {
+                amx_xi_products(f, weights.from(xi * xi_tiles), row_tile,
+                                inputs_amx.from(xi * pl.panels * panel + k0 / kAmxBlock * kTileHalves), panel, kb, i0, i1,
+                                nt, products.from(xi * pstride), k0 > 0, spare);
             }
         }
         for (std::int64_t n = 0; n < c.n; ++n) {
-            transform_outputs(c, products + n * tiles, pstride, nt, n, 0, tiles, i0, i1, chain, false);
+            transform_outputs(c, products.from(n * tiles), pstride, nt, n, 0, tiles, i0, i1, chain, false);
         }
     }
     if (configured) {
@@ -960,23 +1041,50 @@ void compute_small_amx(const ggml_compute_params * params, const Conv & c, const
     }
 }
 
-void compute_small(const ggml_compute_params * params, const Conv & c, const Plan & pl, const Epilogue & chain) {
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    float * inputs = reinterpret_cast<float *>(base);
-    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    float * widened = reinterpret_cast<float *>(mine);
-    float * weights = reinterpret_cast<float *>(mine + pl.panel_bytes);
-    float * scratch = reinterpret_cast<float *>(mine + pl.panel_bytes + pl.weight_bytes);
-    float * products = reinterpret_cast<float *>(mine + pl.panel_bytes + pl.weight_bytes + pl.scratch_bytes);
+// The weights of the next stretch of input channels [next0, next1) of output
+// channels [r0, r1), fetched into the cache while the products of this one are
+// computed: their nine numbers of each input channel, a line of the cache at a
+// time. A hint to the processor, which reads nothing it would not.
+void prefetch_weights(const Conv & c, std::int64_t r0, std::int64_t r1, std::int64_t next0, std::int64_t next1) {
+    if (next0 >= next1) {
+        return;
+    }
+    const auto lines = [&](auto weights, std::int64_t per_line) {
+        for (std::int64_t r = r0; r < r1; ++r) {
+            const auto row = weights.part(r * c.wnb3 + next0 * 9, (next1 - next0) * 9);
+            for (std::int64_t e = 0; e < row.size(); e += per_line) {
+                __builtin_prefetch(row.from(e).data(), 0, 2);
+            }
+            __builtin_prefetch(row.from(row.size() - 1).data(), 0, 2);
+        }
+    };
+    if (c.wtype == GGML_TYPE_F16) {
+        lines(c.w16, 32);
+    }
+    else {
+        lines(c.w32, 16);
+    }
+}
+
+void compute_small(const ggml_compute_params * const params, const Conv & c, const Plan & pl, const Epilogue & chain) {
+    const Single_layout l = single_layout(c, pl);
+    Work_buffer buffer(params, l.layout);
     const Microkernel uk = microkernel();
     const Microkernel_wide wide = microkernel_wide();
     const std::int64_t tiles = c.tw * c.th;
     const std::int64_t nt = pl.panels * kNr;
+    const std::int64_t vstride = inputs_stride(pl.panels, c.ic);
+    const std::int64_t pstride = products_stride(pl.mc, nt);
 
     // The inputs, by all threads together, sixteen channels of an image to an
     // item.
     constexpr std::int64_t kInputChannels = 16;
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<float> inputs = buffer[l.shared];
+    const Elements<float> widened = buffer[l.panels];
+    const Elements<float> weights = buffer[l.weights];
+    const Elements<float> scratch = buffer[l.scratch];
+    const Elements<float> products = buffer[l.products];
     const std::int64_t groups = ceil_div(c.ic, kInputChannels);
     const std::int64_t input_items = c.n * groups;
     int item = queue.next();
@@ -1003,8 +1111,8 @@ void compute_small(const ggml_compute_params * params, const Conv & c, const Pla
                 // past it is written over by the next one's.
                 const Phase_scope scope(Phase::pack_weights);
                 for (std::int64_t ii = i0; ii < i1; ii += kMr) {
-                    transform_weights(weights + (ii - i0) * kc, stride, c, ii, std::min<std::int64_t>(kMr, i1 - ii), k0, k0 + kc,
-                                      widened);
+                    transform_weights(weights.from((ii - i0) * kc), stride, c, ii, std::min<std::int64_t>(kMr, i1 - ii), k0,
+                                      k0 + kc, widened);
                 }
             }
             const Phase_scope scope(Phase::product);
@@ -1015,34 +1123,22 @@ void compute_small(const ggml_compute_params * params, const Conv & c, const Pla
             // faster than it reads them.
             const std::int64_t next0 = k0 + kc;
             const std::int64_t next1 = tuning().prefetch != 0 ? std::min(c.ic, next0 + pl.kc) : next0;
-            const std::int64_t width = 9 * static_cast<std::int64_t>(ggml_type_size(c.wtype));
             const std::int64_t rows_per_xi = ceil_div(i1 - i0, kXi);
-            for (int xi = 0; xi < kXi; ++xi) {
-                for (std::int64_t r = i0 + xi * rows_per_xi; next0 < next1 && r < std::min(i1, i0 + (xi + 1) * rows_per_xi); ++r) {
-                    const auto line = [&](std::int64_t channel) {
-                        return reinterpret_cast<std::uintptr_t>(c.w + r * c.wnb3 + channel * width) / 64 * 64;
-                    };
-                    for (std::uintptr_t q = line(next0); q < line(next1 - 1) + 64; q += 64) {
-                        __builtin_prefetch(reinterpret_cast<const char *>(q), 0, 2);
-                    }
-                }
-                const float * u = weights + static_cast<std::size_t>(xi) * static_cast<std::size_t>(stride);
-                float * product = products + static_cast<std::size_t>(xi) * static_cast<std::size_t>(products_stride(pl.mc, nt));
+            for (std::int64_t xi = 0; xi < kXi; ++xi) {
+                prefetch_weights(c, i0 + xi * rows_per_xi, std::min(i1, i0 + (xi + 1) * rows_per_xi), next0, next1);
+                const Elements<const float> u = weights.from(xi * stride);
+                const Elements<float> product = products.from(xi * pstride);
                 for (std::int64_t ii = i0; ii < i1; ii += kMr) {
-                    const float * a = u + (ii - i0) * kc;
                     for (std::int64_t p = 0; p < pl.panels; p += panel_step(wide) / kNr) {
-                        const float * b = inputs + xi * inputs_stride(pl.panels, c.ic) + (p * c.ic + k0) * kNr;
-                        float * out = product + (ii - i0) * nt + p * kNr;
-                        sdasm::tiles(uk, wide, kc, a, b, c.ic * kNr * static_cast<std::int64_t>(sizeof(float)), out,
-                                     nt * static_cast<std::int64_t>(sizeof(float)), k0 > 0,
+                        sdasm::tiles(uk, wide, kc, u.from((ii - i0) * kc), inputs.from(xi * vstride + (p * c.ic + k0) * kNr),
+                                     c.ic * kNr, product.from((ii - i0) * nt + p * kNr), nt, k0 > 0,
                                      std::min<std::int64_t>(kMr, i1 - ii), std::min(panel_step(wide), nt - p * kNr));
                     }
                 }
             }
         }
         for (std::int64_t n = 0; n < c.n; ++n) {
-            transform_outputs(c, products + n * tiles, static_cast<std::size_t>(products_stride(pl.mc, nt)), nt, n, 0,
-                              tiles, i0, i1, chain, false);
+            transform_outputs(c, products.from(n * tiles), pstride, nt, n, 0, tiles, i0, i1, chain, false);
         }
     }
 }
@@ -1074,13 +1170,24 @@ void compute_small(const ggml_compute_params * params, const Conv & c, const Pla
 // 10^-5.
 
 constexpr int kXi4 = 36;
-constexpr float kBT4[6][6] = {{1.0f, 1.5f, -2.0f, -1.5f, 1.0f, 0.0f}, {0.0f, -1.0f, -2.5f, -0.5f, 1.0f, 0.0f},
-                              {0.0f, 1.0f, 0.5f, -2.5f, 1.0f, 0.0f},  {0.0f, -0.5f, -1.0f, 0.5f, 1.0f, 0.0f},
-                              {0.0f, 2.0f, -1.0f, -2.0f, 1.0f, 0.0f}, {0.0f, 1.0f, 1.5f, -2.0f, -1.5f, 1.0f}};
-constexpr float kAT4[4][6] = {{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f},
-                              {0.0f, 1.0f, -1.0f, 2.0f, -0.5f, 0.0f},
-                              {0.0f, 1.0f, 1.0f, 4.0f, 0.25f, 0.0f},
-                              {0.0f, 1.0f, -1.0f, 8.0f, -0.125f, 1.0f}};
+using Row6 = std::array<float, 6>;
+constexpr std::array<Row6, 6> kBT4 = {{{1.0f, 1.5f, -2.0f, -1.5f, 1.0f, 0.0f},
+                                       {0.0f, -1.0f, -2.5f, -0.5f, 1.0f, 0.0f},
+                                       {0.0f, 1.0f, 0.5f, -2.5f, 1.0f, 0.0f},
+                                       {0.0f, -0.5f, -1.0f, 0.5f, 1.0f, 0.0f},
+                                       {0.0f, 2.0f, -1.0f, -2.0f, 1.0f, 0.0f},
+                                       {0.0f, 1.0f, 1.5f, -2.0f, -1.5f, 1.0f}}};
+constexpr std::array<Row6, 4> kAT4 = {{{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f},
+                                       {0.0f, 1.0f, -1.0f, 2.0f, -0.5f, 0.0f},
+                                       {0.0f, 1.0f, 1.0f, 4.0f, 0.25f, 0.0f},
+                                       {0.0f, 1.0f, -1.0f, 8.0f, -0.125f, 1.0f}}};
+
+float bt4(std::int64_t i, std::int64_t j) {
+    return kBT4[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)];
+}
+float at4(std::int64_t i, std::int64_t j) {
+    return kAT4[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)];
+}
 
 // For FP16 weights alone, whose products ggml computes of the image rounded to
 // FP16: those of FP32 weights it computes in single precision, closer than
@@ -1088,10 +1195,10 @@ constexpr float kAT4[4][6] = {{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f},
 // The kernels written by hand for AVX2 leave the eight tiles of each eight of a
 // panel in the order 0, 2, 4, 6, 1, 3, 5, 7 (x86_64/winograd4_avx2.S): tile l
 // of a block in lane shuffled4(l).
-constexpr std::int64_t kShuffle4[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+constexpr std::array<std::int64_t, 8> kShuffle4 = {0, 4, 1, 5, 2, 6, 3, 7};
 
 std::int64_t shuffled4(std::int64_t l) {
-    return (l & ~std::int64_t{7}) | kShuffle4[l & 7];
+    return (l & ~std::int64_t{7}) | kShuffle4[static_cast<std::size_t>(l & 7)];
 }
 
 bool four(const Conv & c) {
@@ -1102,7 +1209,6 @@ struct Plan4 {
     std::int64_t tw, th;  // tiles of four by four across and down
     std::int64_t mc, kc, tiles, mblocks, tblocks;
     std::int64_t stride;  // the floats between the panels of the inputs of two xi
-    std::size_t shared_bytes, panel_bytes, product_bytes, thread_bytes;
 };
 
 Plan4 plan4(const Conv & c, int n_threads) {
@@ -1121,62 +1227,72 @@ Plan4 plan4(const Conv & c, int n_threads) {
         pl.tiles = round_up(pl.tiles / 2, kNr);
         pl.tblocks = ceil_div(pl.tw * pl.th, pl.tiles);
     }
-    pl.shared_bytes = align_up(static_cast<std::size_t>(kXi4 * xi_stride(round_up(c.oc, kMr), c.ic)) * sizeof(float));
     pl.stride = skewed(pl.kc * pl.tiles);
-    pl.panel_bytes = std::max(6 * static_cast<std::size_t>(pl.stride) * sizeof(float),
-                              align_up(static_cast<std::size_t>(kMr * 9) * sizeof(float)));
-    pl.product_bytes = align_up(static_cast<std::size_t>(kXi4 * products_stride(pl.mc, pl.tiles)) * sizeof(float));
-    pl.thread_bytes = pl.panel_bytes + pl.product_bytes;
     return pl;
+}
+
+// The transformed weights of every xi, shared; each thread's panels of the
+// inputs of six xi -- where its widened weights go first -- and its products.
+struct Layout4 {
+    Work_layout layout;
+    Shared<float> weights;
+    Own<float> panels;
+    Own<float> products;
+};
+
+Layout4 layout4(const Conv & c, const Plan4 & pl) {
+    Layout4 l;
+    l.weights = l.layout.shared<float>(kXi4 * xi_stride(round_up(c.oc, kMr), c.ic));
+    l.panels = l.layout.own<float>(std::max(6 * pl.stride, round_up(kWidenedFloats, kSkew)));
+    l.products = l.layout.own<float>(kXi4 * products_stride(pl.mc, pl.tiles));
+    return l;
 }
 
 // G g G^T of the kernels of output channels [r0, r0 + rows), rows <= kMr, and
 // input channels [k0, k1), into a panel of A of each xi, [k1 - k0][kMr]: that
-// of xi at dst + xi * stride. The kernels of each eight input channels are widened
-// first into `widened`, [channel][3 * 3][kMr] (pack_rows_f16()), and
-// transformed kMr at a time, a lane to each output channel, in single
-// precision: G g a column at a time, then (G g) G^T a row at a time.
-constexpr float kG4f[6][3] = {{1.0f, 0.0f, 0.0f},
-                              {-1.0f / 3, -1.0f / 3, -1.0f / 3},
-                              {1.0f / 3, -1.0f / 3, 1.0f / 3},
-                              {1.0f / 15, 2.0f / 15, 4.0f / 15},
-                              {-16.0f / 15, 8.0f / 15, -4.0f / 15},
-                              {0.0f, 0.0f, 1.0f}};
+// of xi `stride` floats after that of xi - 1. The kernels of each eight input
+// channels are widened first into `widened`, [channel][3 * 3][kMr]
+// (pack_rows_f16()), and transformed kMr at a time, a lane to each output
+// channel, in single precision: G g a column at a time, then (G g) G^T a row
+// at a time.
+using Row3 = std::array<float, 3>;
+constexpr std::array<Row3, 6> kG4f = {{{1.0f, 0.0f, 0.0f},
+                                       {-1.0f / 3, -1.0f / 3, -1.0f / 3},
+                                       {1.0f / 3, -1.0f / 3, 1.0f / 3},
+                                       {1.0f / 15, 2.0f / 15, 4.0f / 15},
+                                       {-16.0f / 15, 8.0f / 15, -4.0f / 15},
+                                       {0.0f, 0.0f, 1.0f}}};
 
-void transform_weights4(float * dst, std::int64_t stride, const Conv & c, std::int64_t r0, std::int64_t rows,
-                        std::int64_t k0, std::int64_t k1, float * widened) {
+void transform_weights4(Elements<float> dst, std::int64_t stride, const Conv & c, std::int64_t r0, std::int64_t rows,
+                        std::int64_t k0, std::int64_t k1, Elements<float> widened) {
+    SDASM_REQUIRE(dst.size() >= (kXi4 - 1) * stride + (k1 - k0) * kMr && widened.size() >= kWidenedFloats);
     for (std::int64_t s0 = k0; s0 < k1; s0 += kWidened) {
         const std::int64_t s1 = std::min(k1, s0 + kWidened);
-        if (c.wtype == GGML_TYPE_F16) {
-            pack_rows_f16(widened, reinterpret_cast<const std::uint16_t *>(c.w + r0 * c.wnb3), c.wnb3, rows, s0 * 9,
-                          s1 * 9, kMr);
-        }
-        else {
-            pack_rows_f32(widened, reinterpret_cast<const float *>(c.w + r0 * c.wnb3), c.wnb3, rows, s0 * 9, s1 * 9, kMr);
-        }
+        pack_weight_rows(widened, c, r0, rows, s0 * 9, s1 * 9, kMr);
 #if SDASM_X86_64
         if (avx2_kernels()) {
-            sdasm_winograd4_weights_avx2(dst + (s0 - k0) * kMr, stride * static_cast<std::int64_t>(sizeof(float)), widened,
-                                         s1 - s0);
+            sdasm_winograd4_weights_avx2(dst.from((s0 - k0) * kMr).data(), bytes_of<float>(stride), widened.data(), s1 - s0);
             continue;
         }
 #endif
         for (std::int64_t k = s0; k < s1; ++k) {
-            const float * g = widened + (k - s0) * 9 * kMr;
-            float t[6][3][kMr];  // G g
-            for (int i = 0; i < 6; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    for (int lane = 0; lane < kMr; ++lane) {
-                        t[i][j][lane] = kG4f[i][0] * g[(0 * 3 + j) * kMr + lane] + kG4f[i][1] * g[(1 * 3 + j) * kMr + lane] +
-                                        kG4f[i][2] * g[(2 * 3 + j) * kMr + lane];
+            const Elements<const float> g = widened.part((k - s0) * 9 * kMr, 9 * kMr);
+            std::array<std::array<std::array<float, kMr>, 3>, 6> t{};  // G g
+            for (std::size_t i = 0; i < 6; ++i) {
+                for (std::size_t j = 0; j < 3; ++j) {
+                    for (std::size_t lane = 0; lane < kMr; ++lane) {
+                        const auto jj = static_cast<std::int64_t>(j);
+                        const auto ll = static_cast<std::int64_t>(lane);
+                        t[i][j][lane] = kG4f[i][0] * g[(0 * 3 + jj) * kMr + ll] + kG4f[i][1] * g[(1 * 3 + jj) * kMr + ll] +
+                                        kG4f[i][2] * g[(2 * 3 + jj) * kMr + ll];
                     }
                 }
             }
-            float * out = dst + (k - k0) * kMr;
-            for (int i = 0; i < 6; ++i) {
-                for (int j = 0; j < 6; ++j) {
-                    for (int lane = 0; lane < kMr; ++lane) {
-                        out[(i * 6 + j) * stride + lane] =
+            const Elements<float> out = dst.from((k - k0) * kMr);
+            for (std::size_t i = 0; i < 6; ++i) {
+                for (std::size_t j = 0; j < 6; ++j) {
+                    for (std::size_t lane = 0; lane < kMr; ++lane) {
+                        out[static_cast<std::int64_t>(i * 6 + j) * stride + static_cast<std::int64_t>(lane)] =
                             t[i][0][lane] * kG4f[j][0] + t[i][1][lane] * kG4f[j][1] + t[i][2][lane] * kG4f[j][2];
                     }
                 }
@@ -1185,16 +1301,44 @@ void transform_weights4(float * dst, std::int64_t stride, const Conv & c, std::i
     }
 }
 
+#if SDASM_X86_64
+// The rows of image n, channel k0, that row r of B^T takes of the tiles whose
+// first input is at row y0, column x0, for the kernels written by hand: each
+// row's first number and its coefficient; the bytes from each to the tiles'
+// first input; the bytes to the next channel's rows. The rows outside the
+// image, and those of coefficient 0, are left out.
+void rows4(Winograd4_inputs & job, const Conv & c, std::int64_t n, std::int64_t k0, std::int64_t kc, std::int64_t y0,
+           std::int64_t x0, std::int64_t r) {
+    job.step = bytes_of<float>(c.xnb2);
+    job.channels = kc;
+    job.offset = bytes_of<float>(x0);
+    job.rows = 0;
+    for (std::int64_t i = 0; i < 6; ++i) {
+        const std::int64_t y = y0 + i;
+        if (bt4(r, i) == 0.0f || y < 0 || y >= c.ih) {
+            continue;
+        }
+        const Elements<const float> first = c.x.from(input_plane(c, n, k0) + y * c.xnb1);
+        SDASM_CHECK(first.size() >= (kc - 1) * c.xnb2 + c.iw);
+        const auto at = static_cast<std::size_t>(job.rows);
+        job.row[at] = first.data();
+        job.coefficient[at] = bt4(r, i);
+        ++job.rows;
+    }
+}
+#endif
+
 // The elements xi = (r, s), s = 0..5, of the transformed inputs of tiles [t0,
 // t1) of image n and channels [k0, k1), into panels of kNr tiles, [panel][k1 -
-// k0][kNr], zeros past t1: those of (r, s) at dst + s * stride. Row r of B^T
-// first takes its combination of the six rows of each tile, then each s its
-// combination of the six numbers of that.
-void pack_inputs4(float * dst, std::int64_t stride, const Conv & c, const Plan4 & pl, std::int64_t n, std::int64_t t0,
-                  std::int64_t t1, std::int64_t k0, std::int64_t k1, int r, bool shuffle) {
+// k0][kNr], zeros past t1: those of (r, s) `stride` floats after those of
+// (r, s - 1). Row r of B^T first takes its combination of the six rows of each
+// tile, then each s its combination of the six numbers of that.
+void pack_inputs4(Elements<float> dst, std::int64_t stride, const Conv & c, const Plan4 & pl, std::int64_t n,
+                  std::int64_t t0, std::int64_t t1, std::int64_t k0, std::int64_t k1, int r, bool shuffle) {
     const std::int64_t kc = k1 - k0;
-    const char * image = c.x + n * c.xnb3;
-    for (std::int64_t tt = t0; tt < t1; tt += kNr, dst += kc * kNr) {
+    SDASM_REQUIRE(dst.size() >= 5 * stride + ceil_div(t1 - t0, kNr) * kc * kNr);
+    for (std::int64_t tt = t0; tt < t1; tt += kNr) {
+        const Elements<float> out = dst.from((tt - t0) / kNr * kc * kNr);
         const std::int64_t valid = std::min<std::int64_t>(kNr, t1 - tt);
         const std::int64_t row_of_tiles = tt / pl.tw;
         const std::int64_t first = tt % pl.tw;
@@ -1205,28 +1349,15 @@ void pack_inputs4(float * dst, std::int64_t stride, const Conv & c, const Plan4 
             // Sixteen tiles of a row by the kernel for AVX-512: the rows that
             // row r of B^T takes, inside the image, and the lanes of its loads.
             Winograd4_inputs job{};
-            job.dst = dst;
-            job.stride = stride * static_cast<std::int64_t>(sizeof(float));
-            job.step = c.xnb2;
-            job.channels = kc;
-            for (int i = 0; i < 6; ++i) {
-                const std::int64_t y = y0 + i;
-                if (kBT4[r][i] == 0.0f || y < 0 || y >= c.ih) {
-                    continue;
-                }
-                // The address of the first input, which may lie before the
-                // row: it is formed but never read.
-                job.row[job.rows] = reinterpret_cast<const char *>(
-                    reinterpret_cast<std::uintptr_t>(image + k0 * c.xnb2 + y * c.xnb1) +
-                    static_cast<std::uintptr_t>(x0 * static_cast<std::int64_t>(sizeof(float))));
-                job.coefficient[job.rows] = kBT4[r][i];
-                ++job.rows;
-            }
-            for (int m = 0; m < 5; ++m) {
+            job.dst = out.data();
+            job.stride = bytes_of<float>(stride);
+            rows4(job, c, n, k0, kc, y0, x0, r);
+            for (std::size_t m = 0; m < 5; ++m) {
                 std::uint16_t lanes = 0;
                 for (int lane = 0; lane < 16; ++lane) {
-                    const std::int64_t x = x0 + 16 * m + lane;
-                    lanes = static_cast<std::uint16_t>(lanes | ((x >= 0 && x < c.iw && 16 * m + lane < 4 * kNr + 2 ? 1u : 0u) << lane));
+                    const std::int64_t x = x0 + 16 * static_cast<std::int64_t>(m) + lane;
+                    const bool inside = x >= 0 && x < c.iw && 16 * static_cast<std::int64_t>(m) + lane < 4 * kNr + 2;
+                    lanes = static_cast<std::uint16_t>(lanes | ((inside ? 1u : 0u) << lane));
                 }
                 job.lanes[m] = lanes;
             }
@@ -1236,33 +1367,22 @@ void pack_inputs4(float * dst, std::int64_t stride, const Conv & c, const Plan4 
         if (valid == kNr && first + kNr <= pl.tw && shuffle) {
             // Sixteen tiles of a row by the kernel for AVX2, eight at a time,
             // with masks for the loads that reach past the image.
-            for (int half = 0; half < 2; ++half) {
+            for (std::int64_t half = 0; half < 2; ++half) {
                 const std::int64_t xh = x0 + 32 * half;
                 Winograd4_inputs job{};
-                job.dst = dst + 8 * half;
-                job.stride = stride * static_cast<std::int64_t>(sizeof(float));
-                job.step = c.xnb2;
-                job.channels = kc;
-                for (int i = 0; i < 6; ++i) {
-                    const std::int64_t y = y0 + i;
-                    if (kBT4[r][i] == 0.0f || y < 0 || y >= c.ih) {
-                        continue;
-                    }
-                    job.row[job.rows] = reinterpret_cast<const char *>(
-                        reinterpret_cast<std::uintptr_t>(image + k0 * c.xnb2 + y * c.xnb1) +
-                        static_cast<std::uintptr_t>(xh * static_cast<std::int64_t>(sizeof(float))));
-                    job.coefficient[job.rows] = kBT4[r][i];
-                    ++job.rows;
-                }
-                alignas(32) std::int32_t masks[5][8];
+                job.dst = out.from(8 * half).data();
+                job.stride = bytes_of<float>(stride);
+                rows4(job, c, n, k0, kc, y0, xh, r);
+                alignas(32) std::array<std::int32_t, 5 * 8> masks{};
                 const bool inside = xh >= 0 && xh + 34 <= c.iw;
-                for (int m = 0; m < 5; ++m) {
-                    for (int lane = 0; lane < 8; ++lane) {
-                        const std::int64_t x = xh + 8 * m + lane;
-                        masks[m][lane] = x >= 0 && x < c.iw && 8 * m + lane < 34 ? -1 : 0;
+                for (std::size_t m = 0; m < 5; ++m) {
+                    for (std::size_t lane = 0; lane < 8; ++lane) {
+                        const std::int64_t at = static_cast<std::int64_t>(8 * m + lane);
+                        const std::int64_t x = xh + at;
+                        masks[8 * m + lane] = x >= 0 && x < c.iw && at < 34 ? -1 : 0;
                     }
                 }
-                job.masks = inside ? nullptr : &masks[0][0];
+                job.masks = inside ? nullptr : masks.data();
                 sdasm_winograd4_inputs_avx2(&job);
             }
             continue;
@@ -1276,67 +1396,66 @@ void pack_inputs4(float * dst, std::int64_t stride, const Conv & c, const Plan4 
             const std::int64_t xa = std::max<std::int64_t>(0, -x0);
             const std::int64_t xb = std::min<std::int64_t>(kSpan, c.iw - x0);
             for (std::int64_t k = k0; k < k1; ++k) {
-                const char * plane = image + k * c.xnb2;
-                float row[kSpan] = {};
-                for (int i = 0; i < 6; ++i) {
-                    const float b = kBT4[r][i];
+                const Elements<const float> plane = c.x.from(input_plane(c, n, k));
+                std::array<float, kSpan> row{};
+                for (std::int64_t i = 0; i < 6; ++i) {
+                    const float b = bt4(r, i);
                     const std::int64_t y = y0 + i;
                     if (b == 0.0f || y < 0 || y >= c.ih) {
                         continue;
                     }
-                    const float * p = reinterpret_cast<const float *>(plane + y * c.xnb1);
                     for (std::int64_t x = xa; x < xb; ++x) {
-                        row[x] += b * p[x0 + x];
+                        row[static_cast<std::size_t>(x)] += b * plane[y * c.xnb1 + x0 + x];
                     }
                 }
-                float u[6][kNr];
-                for (int l = 0; l < kNr; ++l) {
-                    for (int j = 0; j < 6; ++j) {
+                std::array<std::array<float, kNr>, 6> u{};
+                for (std::size_t l = 0; l < kNr; ++l) {
+                    for (std::size_t j = 0; j < 6; ++j) {
                         u[j][l] = row[4 * l + j];
                     }
                 }
-                for (int s4 = 0; s4 < 6; ++s4) {
-                    float * out = dst + s4 * stride + (k - k0) * kNr;
-                    for (int l = 0; l < kNr; ++l) {
+                for (std::int64_t s4 = 0; s4 < 6; ++s4) {
+                    const Elements<float> o = out.part(s4 * stride + (k - k0) * kNr, kNr);
+                    for (std::size_t l = 0; l < kNr; ++l) {
                         float v = 0.0f;
-                        for (int j = 0; j < 6; ++j) {
-                            v += kBT4[s4][j] * u[j][l];
+                        for (std::size_t j = 0; j < 6; ++j) {
+                            v += bt4(s4, static_cast<std::int64_t>(j)) * u[j][l];
                         }
-                        out[l] = v;
+                        o[static_cast<std::int64_t>(l)] = v;
                     }
                 }
             }
             continue;
         }
         for (std::int64_t k = k0; k < k1; ++k) {
-            const char * plane = image + k * c.xnb2;
+            const Elements<const float> plane = c.x.from(input_plane(c, n, k));
             for (std::int64_t l = 0; l < kNr; ++l) {
-                float out[6] = {};
+                std::array<float, 6> o{};
                 if (l < valid) {
                     const std::int64_t t = tt + l;
                     const std::int64_t ty0 = 4 * (t / pl.tw) - c.p1;
                     const std::int64_t tx0 = 4 * (t % pl.tw) - c.p0;
-                    float u[6] = {};
-                    for (int i = 0; i < 6; ++i) {
-                        const float b = kBT4[r][i];
+                    std::array<float, 6> u{};
+                    for (std::int64_t i = 0; i < 6; ++i) {
+                        const float b = bt4(r, i);
                         if (b == 0.0f) {
                             continue;
                         }
-                        for (int j = 0; j < 6; ++j) {
-                            u[j] += b * input_at(c, plane, ty0 + i, tx0 + j);
+                        for (std::size_t j = 0; j < 6; ++j) {
+                            u[j] += b * input_at(c, plane, ty0 + i, tx0 + static_cast<std::int64_t>(j));
                         }
                     }
-                    for (int s4 = 0; s4 < 6; ++s4) {
+                    for (std::size_t s4 = 0; s4 < 6; ++s4) {
                         float v = 0.0f;
-                        for (int j = 0; j < 6; ++j) {
+                        for (std::size_t j = 0; j < 6; ++j) {
                             v += kBT4[s4][j] * u[j];
                         }
-                        out[s4] = v;
+                        o[s4] = v;
                     }
                 }
                 const std::int64_t lane = shuffle ? shuffled4(l) : l;
-                for (int s4 = 0; s4 < 6; ++s4) {
-                    dst[s4 * stride + (k - k0) * kNr + lane] = out[s4];
+                for (std::size_t s4 = 0; s4 < 6; ++s4) {
+                    out[static_cast<std::int64_t>(s4) * stride + (k - k0) * kNr + lane] = o[s4];
                 }
             }
         }
@@ -1346,15 +1465,15 @@ void pack_inputs4(float * dst, std::int64_t stride, const Conv & c, const Plan4 
 // Y = A^T M A for tiles [t0, t1) of image n and output channels [r0, r1), from
 // their 36 products, [xi][channel][tile], those of xi `stride` floats apart;
 // added to the outputs when the chain begins its sum from them. Then the chain.
-void transform_outputs4(const Conv & c, const Plan4 & pl, const float * products, std::size_t stride, std::int64_t nt,
-                        std::int64_t n, std::int64_t t0, std::int64_t t1, std::int64_t r0, std::int64_t r1,
-                        const Epilogue & chain, bool shuffle) {
+void transform_outputs4(const Conv & c, const Plan4 & pl, Elements<const float> products, std::int64_t stride,
+                        std::int64_t nt, std::int64_t n, std::int64_t t0, std::int64_t t1, std::int64_t r0,
+                        std::int64_t r1, const Epilogue & chain, bool shuffle) {
     const Phase_scope scope(Phase::transform_out);
     const bool add = chain.from_redirect;
-    char * image = c.y + n * c.ynb3;
     for (std::int64_t r = r0; r < r1; ++r) {
-        const float * m = products + (r - r0) * nt;
-        char * plane = image + r * c.ynb2;
+        const Elements<const float> m = products.from((r - r0) * nt);
+        const std::int64_t plane = output_plane(c, n, r);
+        const auto output = [&](std::int64_t y, std::int64_t x) { return c.y.from(plane + y * c.ynb1 + x); };
         for (std::int64_t t = t0; t < t1;) {
 #if SDASM_X86_64
             const std::int64_t ty = t / pl.tw;
@@ -1364,9 +1483,11 @@ void transform_outputs4(const Conv & c, const Plan4 & pl, const float * products
             if (!shuffle && whole >= 16 && 4 * ty + 4 <= c.oh && avx512_kernels()) {
                 // Sixteen tiles at a time by the kernel for AVX-512.
                 const std::int64_t groups = whole / 16;
-                sdasm_winograd4_outputs_avx512(m + (t - t0), static_cast<std::int64_t>(stride * sizeof(float)),
-                                               reinterpret_cast<float *>(plane + 4 * ty * c.ynb1) + 4 * tx, c.ynb1, groups,
-                                               add ? 1 : 0);
+                SDASM_CHECK(m.size() >= (kXi4 - 1) * stride + (t - t0) + 16 * groups);
+                const Elements<float> rows = output(4 * ty, 4 * tx);
+                SDASM_CHECK(rows.size() >= 3 * c.ynb1 + 64 * groups);
+                sdasm_winograd4_outputs_avx512(m.from(t - t0).data(), bytes_of<float>(stride), rows.data(),
+                                               bytes_of<float>(c.ynb1), groups, add ? 1 : 0);
                 t += 16 * groups;
                 continue;
             }
@@ -1374,32 +1495,34 @@ void transform_outputs4(const Conv & c, const Plan4 & pl, const float * products
                 // Eight tiles at a time, in the shuffled lanes the packing left
                 // them in, by the kernel for AVX2.
                 const std::int64_t groups = whole / 8;
-                sdasm_winograd4_outputs_avx2(m + (t - t0), static_cast<std::int64_t>(stride * sizeof(float)),
-                                             reinterpret_cast<float *>(plane + 4 * ty * c.ynb1) + 4 * tx, c.ynb1, groups,
-                                             add ? 1 : 0);
+                SDASM_CHECK(m.size() >= (kXi4 - 1) * stride + (t - t0) + 8 * groups);
+                const Elements<float> rows = output(4 * ty, 4 * tx);
+                SDASM_CHECK(rows.size() >= 3 * c.ynb1 + 32 * groups);
+                sdasm_winograd4_outputs_avx2(m.from(t - t0).data(), bytes_of<float>(stride), rows.data(),
+                                             bytes_of<float>(c.ynb1), groups, add ? 1 : 0);
                 t += 8 * groups;
                 continue;
             }
 #endif
-            const auto l = static_cast<std::size_t>(shuffle ? shuffled4(t - t0) : t - t0);
-            float a[4][6];
-            for (int i = 0; i < 4; ++i) {
-                for (int j = 0; j < 6; ++j) {
+            const std::int64_t l = shuffle ? shuffled4(t - t0) : t - t0;
+            std::array<Row6, 4> a{};
+            for (std::size_t i = 0; i < 4; ++i) {
+                for (std::size_t j = 0; j < 6; ++j) {
                     float sum = 0.0f;
-                    for (int x = 0; x < 6; ++x) {
-                        sum += kAT4[i][x] * m[static_cast<std::size_t>(x * 6 + j) * stride + l];
+                    for (std::size_t x = 0; x < 6; ++x) {
+                        sum += kAT4[i][x] * m[static_cast<std::int64_t>(x * 6 + j) * stride + l];
                     }
                     a[i][j] = sum;
                 }
             }
             const std::int64_t yy = 4 * (t / pl.tw);
             const std::int64_t xx = 4 * (t % pl.tw);
-            for (int i = 0; i < 4 && yy + i < c.oh; ++i) {
-                float * row = reinterpret_cast<float *>(plane + (yy + i) * c.ynb1);
-                for (int jj = 0; jj < 4 && xx + jj < c.ow; ++jj) {
+            for (std::int64_t i = 0; i < 4 && yy + i < c.oh; ++i) {
+                const Elements<float> row = output(yy + i, 0);
+                for (std::int64_t jj = 0; jj < 4 && xx + jj < c.ow; ++jj) {
                     float y = 0.0f;
-                    for (int j = 0; j < 6; ++j) {
-                        y += a[i][j] * kAT4[jj][j];
+                    for (std::int64_t j = 0; j < 6; ++j) {
+                        y += a[static_cast<std::size_t>(i)][static_cast<std::size_t>(j)] * at4(jj, j);
                     }
                     row[xx + jj] = add ? row[xx + jj] + y : y;
                 }
@@ -1414,8 +1537,7 @@ void transform_outputs4(const Conv & c, const Plan4 & pl, const float * products
                 const std::int64_t x0 = 4 * txa;
                 const std::int64_t x1 = std::min(c.ow, 4 * txb);
                 for (std::int64_t yy = 4 * ty; yy < std::min(c.oh, 4 * ty + 4); ++yy) {
-                    float * row = reinterpret_cast<float *>(plane + yy * c.ynb1) + x0;
-                    chain.apply_positions(row, x1 - x0, yy * c.ow + x0, r, n);
+                    chain.apply_positions(output(yy, x0).first(x1 - x0), yy * c.ow + x0, r, n);
                 }
                 t += txb - txa;
             }
@@ -1423,28 +1545,29 @@ void transform_outputs4(const Conv & c, const Plan4 & pl, const float * products
     }
 }
 
-void compute_large4(const ggml_compute_params * params, const Conv & c, const Plan4 & pl, const Epilogue & chain) {
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    float * weights = reinterpret_cast<float *>(base);
-    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    float * panels = reinterpret_cast<float *>(mine);
-    float * products = reinterpret_cast<float *>(mine + pl.panel_bytes);
+void compute_large4(const ggml_compute_params * const params, const Conv & c, const Plan4 & pl,
+                    const Epilogue & chain) {
+    const Layout4 l = layout4(c, pl);
+    Work_buffer buffer(params, l.layout);
     const Microkernel uk = microkernel();
     const Microkernel_wide wide = microkernel_wide();
     const std::int64_t step = panel_step(wide);
-    const auto per_xi = static_cast<std::size_t>(xi_stride(round_up(c.oc, kMr), c.ic));
+    const std::int64_t per_xi = xi_stride(round_up(c.oc, kMr), c.ic);
     // The kernels written by hand for AVX2 shuffle the tiles of each eight;
     // those for AVX-512, like the C++ ones, keep them in their order.
     const bool shuffle = avx2_kernels() && !avx512_kernels();
 
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<float> weights = buffer[l.weights];
+    const Elements<float> panels = buffer[l.panels];
+    const Elements<float> products = buffer[l.products];
     // The weights, a panel of kMr output channels to an item.
     const std::int64_t pack_items = ceil_div(c.oc, kMr);
     int item = queue.next();
     for (; item < pack_items; item = queue.next()) {
         const Phase_scope scope(Phase::pack_weights);
-        transform_weights4(weights + item * c.ic * kMr, static_cast<std::int64_t>(per_xi), c, item * kMr,
-                           std::min<std::int64_t>(kMr, c.oc - item * kMr), 0, c.ic, panels);
+        transform_weights4(weights.from(item * c.ic * kMr), per_xi, c, item * kMr, std::min<std::int64_t>(kMr, c.oc - item * kMr),
+                           0, c.ic, panels);
     }
     queue.barrier();
 
@@ -1461,8 +1584,7 @@ void compute_large4(const ggml_compute_params * params, const Conv & c, const Pl
         const std::int64_t t0 = block.start;
         const std::int64_t t1 = t0 + block.size;
         const std::int64_t nt = round_up(t1 - t0, kNr);
-        const std::int64_t ldc = nt * static_cast<std::int64_t>(sizeof(float));
-        const auto pstride = static_cast<std::size_t>(products_stride(pl.mc, nt));
+        const std::int64_t pstride = products_stride(pl.mc, nt);
         for (int r = 0; r < 6; ++r) {
             for (std::int64_t k0 = 0; k0 < c.ic; k0 += pl.kc) {
                 const std::int64_t kc = std::min(pl.kc, c.ic - k0);
@@ -1471,17 +1593,16 @@ void compute_large4(const ggml_compute_params * params, const Conv & c, const Pl
                     pack_inputs4(panels, pl.stride, c, pl, n, t0, t1, k0, k0 + kc, r, shuffle);
                 }
                 const Phase_scope scope(Phase::product);
-                for (int s4 = 0; s4 < 6; ++s4) {
-                    const int xi = 6 * r + s4;
-                    float * product = products + static_cast<std::size_t>(xi) * pstride;
-                    const float * u_xi = weights + static_cast<std::size_t>(xi) * per_xi;
+                for (std::int64_t s4 = 0; s4 < 6; ++s4) {
+                    const std::int64_t xi = 6 * r + s4;
+                    const Elements<float> product = products.from(xi * pstride);
+                    const Elements<const float> u_xi = weights.from(xi * per_xi);
                     for (std::int64_t jj = 0; jj < nt; jj += step) {
-                        const float * b = panels + s4 * pl.stride + (jj / kNr) * kc * kNr;
+                        const Elements<const float> b = panels.from(s4 * pl.stride + (jj / kNr) * kc * kNr);
                         for (std::int64_t ii = i0; ii < i1; ii += kMr) {
-                            const float * a = u_xi + (ii / kMr * c.ic + k0) * kMr;
-                            float * out = product + (ii - i0) * nt + jj;
-                            sdasm::tiles(uk, wide, kc, a, b, kc * kNr * static_cast<std::int64_t>(sizeof(float)), out, ldc,
-                                         k0 > 0, std::min<std::int64_t>(kMr, i1 - ii), std::min(step, nt - jj));
+                            sdasm::tiles(uk, wide, kc, u_xi.from((ii / kMr * c.ic + k0) * kMr), b, kc * kNr,
+                                         product.from((ii - i0) * nt + jj), nt, k0 > 0, std::min<std::int64_t>(kMr, i1 - ii),
+                                         std::min(step, nt - jj));
                         }
                     }
                 }
@@ -1503,7 +1624,6 @@ bool small4(const Conv & c) {
 
 struct Plan4_small {
     std::int64_t tw, th, panels, mc, kc;
-    std::size_t shared_bytes, widened_bytes, weight_bytes, scratch_bytes, product_bytes, thread_bytes;
 };
 
 Plan4_small plan4_small(const Conv & c) {
@@ -1514,73 +1634,81 @@ Plan4_small plan4_small(const Conv & c) {
     pl.panels = ceil_div(c.n * pl.tw * pl.th, kNr);
     pl.kc = std::min<std::int64_t>(c.ic, std::max(kWidened, static_cast<std::int64_t>(t.winograd_small_kc)));
     pl.mc = round_up(std::min<std::int64_t>(c.oc, std::max(kMr, t.winograd_small_mc)), kMr);
-    pl.shared_bytes = align_up(static_cast<std::size_t>(kXi4 * inputs_stride(pl.panels, c.ic)) * sizeof(float));
-    pl.widened_bytes = align_up(static_cast<std::size_t>(kWidened * 9 * kMr + 8) * sizeof(float));
-    pl.weight_bytes = align_up(static_cast<std::size_t>(kXi4 * xi_stride(pl.mc, pl.kc)) * sizeof(float));
-    pl.scratch_bytes = align_up(static_cast<std::size_t>((4 * pl.th + 2) * (4 * pl.tw + 2)) * sizeof(float));
-    pl.product_bytes = align_up(static_cast<std::size_t>(kXi4 * products_stride(pl.mc, pl.panels * kNr)) * sizeof(float));
-    pl.thread_bytes = pl.widened_bytes + pl.weight_bytes + pl.scratch_bytes + pl.product_bytes;
     return pl;
+}
+
+// The transformed inputs of every tile, shared; each thread's widened weights,
+// transformed weights, a channel of an image with its padding and products.
+struct Layout4_small {
+    Work_layout layout;
+    Shared<float> inputs;
+    Own<float> widened, weights, scratch, products;
+};
+
+Layout4_small layout4_small(const Conv & c, const Plan4_small & pl) {
+    Layout4_small l;
+    l.inputs = l.layout.shared<float>(kXi4 * inputs_stride(pl.panels, c.ic));
+    l.widened = l.layout.own<float>(kWidenedFloats);
+    l.weights = l.layout.own<float>(kXi4 * xi_stride(pl.mc, pl.kc));
+    l.scratch = l.layout.own<float>((4 * pl.th + 2) * (4 * pl.tw + 2));
+    l.products = l.layout.own<float>(kXi4 * products_stride(pl.mc, pl.panels * kNr));
+    return l;
 }
 
 // The transformed inputs of channels [k0, k1) of image n, every tile, element
 // xi of the tile that is g-th of all images at v[xi * inputs_stride() + ((g /
 // kNr) * ic + k) * kNr + g % kNr]; the lanes past the last tile of the last
 // image, zeros. `scratch` holds a channel of the image with the zeros around it.
-void transform_inputs_small4(float * v, const Conv & c, const Plan4_small & pl, std::int64_t n, std::int64_t k0,
-                             std::int64_t k1, float * scratch, bool shuffle) {
+void transform_inputs_small4(Elements<float> v, const Conv & c, const Plan4_small & pl, std::int64_t n, std::int64_t k0,
+                             std::int64_t k1, Elements<float> scratch, bool shuffle) {
     const std::int64_t sw = 4 * pl.tw + 2;
     const std::int64_t sh = 4 * pl.th + 2;
     const std::int64_t tiles = pl.tw * pl.th;
     const std::int64_t last = c.n * tiles;
     const std::int64_t vstride = inputs_stride(pl.panels, c.ic);
+    const auto at = [&](std::int64_t xi, std::int64_t g, std::int64_t k) -> float & {
+        return v[xi * vstride + ((g / kNr) * c.ic + k) * kNr + g % kNr];
+    };
+    const auto zeros_past_last = [&](std::int64_t k) {
+        if (n == c.n - 1) {
+            for (std::int64_t g = last; g < pl.panels * kNr; ++g) {
+                for (std::int64_t xi = 0; xi < kXi4; ++xi) {
+                    at(xi, g, k) = 0.0f;
+                }
+            }
+        }
+    };
 #if SDASM_X86_64
     if (shuffle && pl.tw % 8 == 0) {
         // Every row of tiles in eights, each eight in a lane of eight of its
         // panel, by the kernel for AVX2, a row of B^T at a time over the
         // channels.
-        const char * image = c.x + n * c.xnb3;
         for (std::int64_t t = 0; t < tiles; t += 8) {
             const std::int64_t g = n * tiles + t;
             const std::int64_t y0 = 4 * (t / pl.tw) - c.p1;
             const std::int64_t x0 = 4 * (t % pl.tw) - c.p0;
-            alignas(32) std::int32_t masks[5][8];
+            alignas(32) std::array<std::int32_t, 5 * 8> masks{};
             const bool inside = x0 >= 0 && x0 + 34 <= c.iw;
-            for (int m = 0; m < 5; ++m) {
-                for (int lane = 0; lane < 8; ++lane) {
-                    const std::int64_t x = x0 + 8 * m + lane;
-                    masks[m][lane] = x >= 0 && x < c.iw && 8 * m + lane < 34 ? -1 : 0;
+            for (std::size_t m = 0; m < 5; ++m) {
+                for (std::size_t lane = 0; lane < 8; ++lane) {
+                    const auto o = static_cast<std::int64_t>(8 * m + lane);
+                    const std::int64_t x = x0 + o;
+                    masks[8 * m + lane] = x >= 0 && x < c.iw && o < 34 ? -1 : 0;
                 }
             }
-            for (int r = 0; r < 6; ++r) {
+            for (std::int64_t r = 0; r < 6; ++r) {
                 Winograd4_inputs job{};
-                job.dst = v + 6 * r * vstride + ((g / kNr) * c.ic + k0) * kNr + g % kNr;
-                job.stride = vstride * static_cast<std::int64_t>(sizeof(float));
-                job.step = c.xnb2;
-                job.channels = k1 - k0;
-                for (int i = 0; i < 6; ++i) {
-                    const std::int64_t y = y0 + i;
-                    if (kBT4[r][i] == 0.0f || y < 0 || y >= c.ih) {
-                        continue;
-                    }
-                    job.row[job.rows] = reinterpret_cast<const char *>(
-                        reinterpret_cast<std::uintptr_t>(image + k0 * c.xnb2 + y * c.xnb1) +
-                        static_cast<std::uintptr_t>(x0 * static_cast<std::int64_t>(sizeof(float))));
-                    job.coefficient[job.rows] = kBT4[r][i];
-                    ++job.rows;
-                }
-                job.masks = inside ? nullptr : &masks[0][0];
+                const Elements<float> dst = v.from(6 * r * vstride + ((g / kNr) * c.ic + k0) * kNr + g % kNr);
+                SDASM_CHECK(dst.size() >= 5 * vstride + (k1 - k0) * kNr);
+                job.dst = dst.data();
+                job.stride = bytes_of<float>(vstride);
+                rows4(job, c, n, k0, k1 - k0, y0, x0, r);
+                job.masks = inside ? nullptr : masks.data();
                 sdasm_winograd4_inputs_avx2(&job);
             }
         }
-        if (n == c.n - 1) {
-            for (std::int64_t k = k0; k < k1; ++k) {
-                for (std::int64_t g = last; g < pl.panels * kNr; ++g) {
-                    for (int xi = 0; xi < kXi4; ++xi) {
-                        v[xi * vstride + ((g / kNr) * c.ic + k) * kNr + g % kNr] = 0.0f;
-                    }
-                }
-            }
+        for (std::int64_t k = k0; k < k1; ++k) {
+            zeros_past_last(k);
         }
         return;
     }
@@ -1588,68 +1716,60 @@ void transform_inputs_small4(float * v, const Conv & c, const Plan4_small & pl, 
     (void) shuffle;
 #endif
     for (std::int64_t k = k0; k < k1; ++k) {
-        const char * plane = c.x + n * c.xnb3 + k * c.xnb2;
+        const Elements<const float> plane = c.x.from(input_plane(c, n, k));
         for (std::int64_t y = 0; y < sh; ++y) {
-            float * row = scratch + y * sw;
+            const Elements<float> row = scratch.part(y * sw, sw);
             const std::int64_t iy = y - c.p1;
             for (std::int64_t x = 0; x < sw; ++x) {
-                const std::int64_t ix = x - c.p0;
-                row[x] = iy >= 0 && iy < c.ih && ix >= 0 && ix < c.iw ? reinterpret_cast<const float *>(plane + iy * c.xnb1)[ix]
-                                                                      : 0.0f;
+                row[x] = input_at(c, plane, iy, x - c.p0);
             }
         }
         for (std::int64_t t = 0; t < tiles; ++t) {
-            const float * d = scratch + 4 * (t / pl.tw) * sw + 4 * (t % pl.tw);
+            const Elements<const float> d = scratch.from(4 * (t / pl.tw) * sw + 4 * (t % pl.tw));
             const std::int64_t g = n * tiles + t;
-            float * out = v + ((g / kNr) * c.ic + k) * kNr + g % kNr;
-            for (int r = 0; r < 6; ++r) {
-                float u[6] = {};
-                for (int i = 0; i < 6; ++i) {
-                    const float b = kBT4[r][i];
-                    for (int j = 0; j < 6; ++j) {
-                        u[j] += b * d[i * sw + j];
+            for (std::int64_t r = 0; r < 6; ++r) {
+                std::array<float, 6> u{};
+                for (std::int64_t i = 0; i < 6; ++i) {
+                    const float b = bt4(r, i);
+                    for (std::size_t j = 0; j < 6; ++j) {
+                        u[j] += b * d[i * sw + static_cast<std::int64_t>(j)];
                     }
                 }
-                for (int s4 = 0; s4 < 6; ++s4) {
+                for (std::int64_t s4 = 0; s4 < 6; ++s4) {
                     float x = 0.0f;
-                    for (int j = 0; j < 6; ++j) {
-                        x += kBT4[s4][j] * u[j];
+                    for (std::size_t j = 0; j < 6; ++j) {
+                        x += bt4(s4, static_cast<std::int64_t>(j)) * u[j];
                     }
-                    out[(r * 6 + s4) * vstride] = x;
+                    at(r * 6 + s4, g, k) = x;
                 }
             }
         }
-        if (n == c.n - 1) {
-            for (std::int64_t g = last; g < pl.panels * kNr; ++g) {
-                for (int xi = 0; xi < kXi4; ++xi) {
-                    v[xi * vstride + ((g / kNr) * c.ic + k) * kNr + g % kNr] = 0.0f;
-                }
-            }
-        }
+        zeros_past_last(k);
     }
 }
 
-void compute_small4(const ggml_compute_params * params, const Conv & c, const Plan4_small & pl, const Epilogue & chain) {
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    float * inputs = reinterpret_cast<float *>(base);
-    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    float * widened = reinterpret_cast<float *>(mine);
-    float * weights = reinterpret_cast<float *>(mine + pl.widened_bytes);
-    float * scratch = reinterpret_cast<float *>(mine + pl.widened_bytes + pl.weight_bytes);
-    float * products = reinterpret_cast<float *>(mine + pl.widened_bytes + pl.weight_bytes + pl.scratch_bytes);
+void compute_small4(const ggml_compute_params * const params, const Conv & c, const Plan4_small & pl,
+                    const Epilogue & chain) {
+    const Layout4_small l = layout4_small(c, pl);
+    Work_buffer buffer(params, l.layout);
     const Microkernel uk = microkernel();
     const Microkernel_wide wide = microkernel_wide();
     const std::int64_t tiles = pl.tw * pl.th;
     const std::int64_t nt = pl.panels * kNr;
     const std::int64_t vstride = inputs_stride(pl.panels, c.ic);
-    const auto pstride = static_cast<std::size_t>(products_stride(pl.mc, nt));
-    const Plan4 layout = {pl.tw, pl.th, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    const std::int64_t pstride = products_stride(pl.mc, nt);
+    const Plan4 layout = {pl.tw, pl.th, 0, 0, 0, 0, 0, 0};
     // The kernels for AVX2 take rows of tiles of eights, in their shuffled
     // order, on any processor with AVX2: at 32 by 32, rows are of eight tiles.
     const bool shuffle = avx2_kernels() && pl.tw % 8 == 0;
 
     constexpr std::int64_t kInputChannels = 16;
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<float> inputs = buffer[l.inputs];
+    const Elements<float> widened = buffer[l.widened];
+    const Elements<float> weights = buffer[l.weights];
+    const Elements<float> scratch = buffer[l.scratch];
+    const Elements<float> products = buffer[l.products];
     const std::int64_t groups = ceil_div(c.ic, kInputChannels);
     const std::int64_t input_items = c.n * groups;
     int item = queue.next();
@@ -1673,8 +1793,8 @@ void compute_small4(const ggml_compute_params * params, const Conv & c, const Pl
             {
                 const Phase_scope scope(Phase::pack_weights);
                 for (std::int64_t ii = i0; ii < i1; ii += kMr) {
-                    transform_weights4(weights + (ii - i0) * kc, stride, c, ii, std::min<std::int64_t>(kMr, i1 - ii), k0, k0 + kc,
-                                       widened);
+                    transform_weights4(weights.from((ii - i0) * kc), stride, c, ii, std::min<std::int64_t>(kMr, i1 - ii), k0,
+                                       k0 + kc, widened);
                 }
             }
             const Phase_scope scope(Phase::product);
@@ -1683,40 +1803,25 @@ void compute_small4(const ggml_compute_params * params, const Conv & c, const Pl
             // compute_small() fetches them: a 36th of the rows at each xi.
             const std::int64_t next0 = k0 + kc;
             const std::int64_t next1 = tuning().prefetch != 0 ? std::min(c.ic, next0 + pl.kc) : next0;
-            const std::int64_t width = 9 * static_cast<std::int64_t>(ggml_type_size(c.wtype));
             const std::int64_t rows_per_xi = ceil_div(i1 - i0, kXi4);
-            for (int xi = 0; xi < kXi4; ++xi) {
-                for (std::int64_t r = i0 + xi * rows_per_xi; next0 < next1 && r < std::min(i1, i0 + (xi + 1) * rows_per_xi); ++r) {
-                    const auto line = [&](std::int64_t channel) {
-                        return reinterpret_cast<std::uintptr_t>(c.w + r * c.wnb3 + channel * width) / 64 * 64;
-                    };
-                    for (std::uintptr_t q = line(next0); q < line(next1 - 1) + 64; q += 64) {
-                        __builtin_prefetch(reinterpret_cast<const char *>(q), 0, 2);
-                    }
-                }
-                const float * u = weights + static_cast<std::size_t>(xi) * static_cast<std::size_t>(stride);
-                float * product = products + static_cast<std::size_t>(xi) * pstride;
+            for (std::int64_t xi = 0; xi < kXi4; ++xi) {
+                prefetch_weights(c, i0 + xi * rows_per_xi, std::min(i1, i0 + (xi + 1) * rows_per_xi), next0, next1);
+                const Elements<const float> u = weights.from(xi * stride);
+                const Elements<float> product = products.from(xi * pstride);
                 for (std::int64_t ii = i0; ii < i1; ii += kMr) {
-                    const float * a = u + (ii - i0) * kc;
                     for (std::int64_t p = 0; p < pl.panels; p += panel_step(wide) / kNr) {
-                        const float * b = inputs + xi * vstride + (p * c.ic + k0) * kNr;
-                        float * out = product + (ii - i0) * nt + p * kNr;
-                        sdasm::tiles(uk, wide, kc, a, b, c.ic * kNr * static_cast<std::int64_t>(sizeof(float)), out,
-                                     nt * static_cast<std::int64_t>(sizeof(float)), k0 > 0,
+                        sdasm::tiles(uk, wide, kc, u.from((ii - i0) * kc), inputs.from(xi * vstride + (p * c.ic + k0) * kNr),
+                                     c.ic * kNr, product.from((ii - i0) * nt + p * kNr), nt, k0 > 0,
                                      std::min<std::int64_t>(kMr, i1 - ii), std::min(panel_step(wide), nt - p * kNr));
                     }
                 }
             }
         }
         for (std::int64_t n = 0; n < c.n; ++n) {
-            transform_outputs4(c, layout, products + n * tiles, pstride, nt, n, 0, tiles, i0, i1, chain, shuffle);
+            transform_outputs4(c, layout, products.from(n * tiles), pstride, nt, n, 0, tiles, i0, i1, chain, shuffle);
         }
     }
 }
-
-}  // namespace
-
-namespace {
 
 // ---------------------------------------------------------------- quantized
 
@@ -1732,15 +1837,13 @@ namespace {
 // whose transforms make more of the rounding of the products.
 struct Qplan {
     Quant q;
-    std::int64_t kc;          // a stretch of the input channels, a multiple of the group
-    std::int64_t opanels;     // panels of kMr output channels
-    std::int64_t u_panel;     // a quantized panel of transformed weights over every input channel
-    std::int64_t v_panel;     // a quantized panel of kNr tiles' transformed inputs over a stretch (large)
-                              // or over every input channel (small)
-    std::size_t weights_bytes, shared_bytes;
-    std::size_t widened_bytes, scratch_bytes, floats_bytes, quantized_bytes, product_bytes;
-    std::size_t thread_bytes;
-    Plan base;                // the blocks of the products, as in single precision
+    std::int64_t kc;       // a stretch of the input channels, a multiple of the group
+    std::int64_t opanels;  // panels of kMr output channels
+    std::int64_t u_panel;  // a quantized panel of transformed weights over every input channel
+    std::int64_t v_panel;  // a quantized panel of kNr tiles' transformed inputs over a stretch (large)
+                           // or over every input channel (small)
+    std::int64_t fstride;  // large images: the floats between the panels of the inputs of two xi
+    Plan base;             // the blocks of the products, as in single precision
 };
 
 std::uint64_t qvariant(const Quant & q) {
@@ -1748,20 +1851,68 @@ std::uint64_t qvariant(const Quant & q) {
            static_cast<std::uint64_t>(q.weight_groups ? 1 : 0) << 32;
 }
 
-// The quantized transformed weights, the store's or the work buffer's at
-// `base`, packed by the queue's first items, from `item`, when they are not
-// ready -- a panel of kMr output channels to an item -- and the threads met
-// after them: the weights, and the number of those items, which the items
-// after count from.
+Qplan qplan(const Conv & c, int n_threads) {
+    Qplan pl{};
+    pl.q = quant();
+    pl.base = plan(c, n_threads);
+    const std::int64_t group = 4 * pl.q.quads;
+    pl.kc = std::max(group, pl.base.kc / group * group);
+    pl.opanels = ceil_div(c.oc, kMr);
+    pl.u_panel = qpanel_bytes(c.ic, kMr, pl.q);
+    pl.v_panel = pl.base.small ? qpanel_bytes(c.ic, kNr, pl.q) : qpanel_bytes(pl.kc, kNr, pl.q);
+    pl.fstride = panels_stride(pl.base.kc, pl.base.tiles);
+    return pl;
+}
+
+// The quantized weights of every xi and output channel, by all threads
+// together, or the store's; each thread transforms a panel of them a stretch of
+// input channels at a time. Small images: the inputs of every tile, in single
+// precision and quantized, by all threads. Large: each thread's inputs of a
+// block of tiles, in single precision and quantized.
+struct Quantized_layout {
+    Work_layout layout;
+    Shared<std::uint8_t> weights;
+    Shared<float> inputs;            // small images
+    Shared<std::uint8_t> qinputs;    // small images
+    Own<float> widened, floats;
+    Own<std::uint8_t> quantized;     // large images
+    Own<float> scratch;              // small images
+    Own<float> products;
+};
+
+Quantized_layout quantized_layout(const Conv & c, const Qplan & pl) {
+    Quantized_layout l;
+    const Plan & bp = pl.base;
+    l.weights = l.layout.shared<std::uint8_t>(kXi * pl.opanels * pl.u_panel);
+    const std::int64_t transformed = kXi * xi_stride(kMr, pl.kc);
+    l.widened = l.layout.own<float>(kWidenedFloats);
+    if (bp.small) {
+        l.inputs = l.layout.shared<float>(kXi * inputs_stride(bp.panels, c.ic));
+        l.qinputs = l.layout.shared<std::uint8_t>(kXi * bp.panels * pl.v_panel);
+        l.floats = l.layout.own<float>(transformed);
+        l.scratch = l.layout.own<float>((2 * c.th + 2) * (2 * c.tw + 2));
+        l.products = l.layout.own<float>(kXi * products_stride(bp.mc, bp.panels * kNr));
+        return l;
+    }
+    l.floats = l.layout.own<float>(std::max(panels_count(bp.kc, bp.tiles), transformed));
+    l.quantized = l.layout.own<std::uint8_t>(4 * (bp.tiles / kNr) * pl.v_panel);
+    l.products = l.layout.own<float>(kXi * products_stride(bp.mc, bp.tiles));
+    return l;
+}
+
+// The quantized transformed weights, the store's or the work buffer's, packed
+// by the queue's first items, from `item`, when they are not ready -- a panel
+// of kMr output channels to an item -- and the threads met after them: the
+// weights, and the number of those items, which the items after count from.
 struct Quantized_weights {
-    std::uint8_t * data;
+    Elements<const std::uint8_t> data;
     std::int64_t items;
 };
 
-Quantized_weights quantized_weights(const ggml_compute_params * params, const Conv & c, const Qplan & pl, char * base,
-                                    float * floats, float * widened, Work_queue & queue, int & item) {
-    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::quantized_winograd, pl.weights_bytes, qvariant(pl.q));
-    auto * weights = reinterpret_cast<std::uint8_t *>(kept != nullptr ? reinterpret_cast<char *>(kept->data) : base);
+Quantized_weights quantized_weights(const ggml_compute_params * const params, const Conv & c, const Qplan & pl,
+                                    const std::shared_ptr<Packed> & kept, Elements<std::uint8_t> work,
+                                    Elements<float> floats, Elements<float> widened, Work_queue & queue, int & item) {
+    const Elements<std::uint8_t> weights = kept != nullptr ? kept->octets() : work;
     if (kept != nullptr && kept->ready()) {
         return {weights, 0};
     }
@@ -1774,9 +1925,9 @@ Quantized_weights quantized_weights(const ggml_compute_params * params, const Co
             const std::int64_t kc = std::min(pl.kc, c.ic - k0);
             transform_weights(floats, stride, c, item * kMr, std::min<std::int64_t>(kMr, c.oc - item * kMr), k0, k0 + kc,
                               widened);
-            for (int xi = 0; xi < kXi; ++xi) {
-                quantize_panel_weights(weights + (xi * pl.opanels + item) * pl.u_panel + k0 / group * a_group,
-                                       floats + xi * stride, kc, kMr, pl.q);
+            for (std::int64_t xi = 0; xi < kXi; ++xi) {
+                quantize_panel_weights(weights.from((xi * pl.opanels + item) * pl.u_panel + k0 / group * a_group),
+                                       floats.part(xi * stride, kc * kMr), kc, kMr, Qlayout::rows, pl.q);
             }
         }
     }
@@ -1787,72 +1938,38 @@ Quantized_weights quantized_weights(const ggml_compute_params * params, const Co
     return {weights, pl.opanels};
 }
 
-Qplan qplan(const Conv & c, int n_threads) {
-    Qplan pl{};
-    pl.q = quant();
-    pl.base = plan(c, n_threads);
-    const std::int64_t group = 4 * pl.q.quads;
-    pl.kc = std::max(group, pl.base.kc / group * group);
-    pl.opanels = ceil_div(c.oc, kMr);
-    pl.u_panel = qpanel_bytes(c.ic, kMr, pl.q);
-    pl.widened_bytes = align_up(static_cast<std::size_t>(kWidened * 9 * kMr + 8) * sizeof(float));
-    // The quantized weights of every xi and output channel, by all threads
-    // together, or the store's; each thread transforms a panel of them a
-    // stretch of input channels at a time.
-    pl.weights_bytes = align_up(static_cast<std::size_t>(kXi * pl.opanels * pl.u_panel));
-    const std::size_t transformed = align_up(static_cast<std::size_t>(kXi * xi_stride(kMr, pl.kc)) * sizeof(float));
-    if (pl.base.small) {
-        // The inputs of every tile, in single precision and quantized, by all
-        // threads.
-        pl.v_panel = qpanel_bytes(c.ic, kNr, pl.q);
-        pl.shared_bytes = pl.weights_bytes + pl.base.shared_bytes +
-                          align_up(static_cast<std::size_t>(kXi * pl.base.panels * pl.v_panel));
-        pl.floats_bytes = transformed;
-        pl.quantized_bytes = 0;
-        pl.scratch_bytes = pl.base.scratch_bytes;
-        pl.product_bytes = pl.base.product_bytes;
-    }
-    else {
-        // Each thread's inputs of a block of tiles, in single precision and
-        // quantized.
-        pl.v_panel = qpanel_bytes(pl.kc, kNr, pl.q);
-        pl.shared_bytes = pl.weights_bytes;
-        pl.floats_bytes = std::max(pl.base.panel_bytes, transformed);
-        pl.quantized_bytes = align_up(static_cast<std::size_t>(4 * (pl.base.tiles / kNr) * pl.v_panel));
-        pl.scratch_bytes = 0;
-        pl.product_bytes = pl.base.product_bytes;
-    }
-    pl.thread_bytes = pl.widened_bytes + pl.floats_bytes + pl.quantized_bytes + pl.scratch_bytes + pl.product_bytes;
-    return pl;
+std::shared_ptr<Packed> quantized_kept(const Conv & c, const Qplan & pl) {
+    return packed(c.kernel, Layout::quantized_winograd, kXi * pl.opanels * pl.u_panel, qvariant(pl.q));
 }
 
-void compute_large_quantized(const ggml_compute_params * params, const Conv & c, const Qplan & pl, const Epilogue & chain) {
+void compute_large_quantized(const ggml_compute_params * const params, const Conv & c, const Qplan & pl,
+                             const Epilogue & chain) {
     const Quant & q = pl.q;
     const std::int64_t group = 4 * q.quads;
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    auto * weights = reinterpret_cast<std::uint8_t *>(base);
-    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    auto * widened = reinterpret_cast<float *>(mine);
-    auto * floats = reinterpret_cast<float *>(mine + pl.widened_bytes);
-    auto * inputs = reinterpret_cast<std::uint8_t *>(mine + pl.widened_bytes + pl.floats_bytes);
-    auto * products = reinterpret_cast<float *>(mine + pl.widened_bytes + pl.floats_bytes + pl.quantized_bytes);
+    const Quantized_layout l = quantized_layout(c, pl);
+    Work_buffer buffer(params, l.layout);
+    const std::shared_ptr<Packed> kept = quantized_kept(c, pl);
     const Qkernel kernel = qkernel_b_unsigned();
     const Qkernel_wide wide = qkernel_wide_b_unsigned();
     const std::int64_t step = wide != nullptr ? 2 * kNr : kNr;
     const bool shuffle = avx2_kernels() && !avx512_kernels();
     const std::int64_t a_group = qgroup_bytes(q.quads, kMr);
 
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<float> widened = buffer[l.widened];
+    const Elements<float> floats = buffer[l.floats];
+    const Elements<std::uint8_t> inputs = buffer[l.quantized];
+    const Elements<float> products = buffer[l.products];
     int item = queue.next();
-    const Quantized_weights packed_weights = quantized_weights(params, c, pl, base, floats, widened, queue, item);
-    weights = packed_weights.data;
+    const Quantized_weights packed_weights =
+        quantized_weights(params, c, pl, kept, buffer[l.weights], floats, widened, queue, item);
+    const Elements<const std::uint8_t> weights = packed_weights.data;
     const std::int64_t pack_items = packed_weights.items;
 
     const Plan & bp = pl.base;
     const std::int64_t tiles = c.tw * c.th;
     const std::vector<Block> blocks = guided_blocks(c.n, tiles, kNr, bp.tiles, params->nth);
     const auto units = static_cast<std::int64_t>(blocks.size()) * bp.mblocks;
-    const std::int64_t fstride = static_cast<std::int64_t>(pl.floats_bytes / 4 / sizeof(float)) / kSkew * kSkew;
     for (; item < pack_items + units; item = queue.next()) {
         const std::int64_t u = item - pack_items;
         const std::int64_t ib = u % bp.mblocks;
@@ -1864,32 +1981,33 @@ void compute_large_quantized(const ggml_compute_params * params, const Conv & c,
         const std::int64_t t1 = t0 + block.size;
         const std::int64_t nt = round_up(t1 - t0, kNr);
         const std::int64_t ntp = nt / kNr;
-        const std::int64_t ldc = nt * static_cast<std::int64_t>(sizeof(float));
-        const auto pstride = static_cast<std::size_t>(products_stride(bp.mc, nt));
+        const std::int64_t pstride = products_stride(bp.mc, nt);
         for (int r = 0; r < 4; ++r) {
             for (std::int64_t k0 = 0; k0 < c.ic; k0 += pl.kc) {
                 const std::int64_t kc = std::min(pl.kc, c.ic - k0);
                 {
                     const Phase_scope scope(Phase::pack_inputs);
-                    pack_inputs(floats, fstride, c, n, t0, t1, k0, k0 + kc, r, shuffle);
-                    for (int s = 0; s < 4; ++s) {
+                    pack_inputs(floats, pl.fstride, c, n, t0, t1, k0, k0 + kc, r, shuffle);
+                    for (std::int64_t s = 0; s < 4; ++s) {
                         for (std::int64_t p = 0; p < ntp; ++p) {
-                            quantize_panel_inputs(inputs + (s * ntp + p) * pl.v_panel, floats + s * fstride + p * kc * kNr, kc, kNr,
-                                                  q);
+                            quantize_panel_inputs(inputs.part((s * ntp + p) * pl.v_panel, pl.v_panel),
+                                                  floats.part(s * pl.fstride + p * kc * kNr, kc * kNr), kc, kNr,
+                                                  Qlayout::columns, q);
                         }
                     }
                 }
                 const Phase_scope scope(Phase::product);
                 const std::int64_t groups = ceil_div(kc, group);
-                for (int s = 0; s < 4; ++s) {
-                    const int xi = 4 * r + s;
-                    float * product = products + static_cast<std::size_t>(xi) * pstride;
+                for (std::int64_t s = 0; s < 4; ++s) {
+                    const std::int64_t xi = 4 * r + s;
+                    const Elements<float> product = products.from(xi * pstride);
                     for (std::int64_t jj = 0; jj < nt; jj += step) {
-                        const std::uint8_t * b = inputs + (s * ntp + jj / kNr) * pl.v_panel;
+                        const Elements<const std::uint8_t> b = inputs.from((s * ntp + jj / kNr) * pl.v_panel);
                         for (std::int64_t ii = i0; ii < i1; ii += kMr) {
-                            const std::uint8_t * a = weights + (xi * pl.opanels + ii / kMr) * pl.u_panel + k0 / group * a_group;
-                            qtiles(kernel, wide, groups, q.quads, a, b, pl.v_panel, product + (ii - i0) * nt + jj, ldc, k0 > 0,
-                                   std::min<std::int64_t>(kMr, i1 - ii), std::min(step, nt - jj));
+                            const Elements<const std::uint8_t> a =
+                                weights.from((xi * pl.opanels + ii / kMr) * pl.u_panel + k0 / group * a_group);
+                            qtiles(kernel, wide, groups, q.quads, a, b, pl.v_panel, product.from((ii - i0) * nt + jj), nt,
+                                   k0 > 0, std::min<std::int64_t>(kMr, i1 - ii), std::min(step, nt - jj));
                         }
                     }
                 }
@@ -1899,34 +2017,37 @@ void compute_large_quantized(const ggml_compute_params * params, const Conv & c,
     }
 }
 
-void compute_small_quantized(const ggml_compute_params * params, const Conv & c, const Qplan & pl, const Epilogue & chain) {
+void compute_small_quantized(const ggml_compute_params * const params, const Conv & c, const Qplan & pl,
+                             const Epilogue & chain) {
     const Quant & q = pl.q;
     const Plan & bp = pl.base;
     const std::int64_t group = 4 * q.quads;
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    auto * inputs = reinterpret_cast<float *>(base + pl.weights_bytes);
-    auto * qinputs = reinterpret_cast<std::uint8_t *>(base + pl.weights_bytes + bp.shared_bytes);
-    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    auto * widened = reinterpret_cast<float *>(mine);
-    auto * floats = reinterpret_cast<float *>(mine + pl.widened_bytes);
-    auto * scratch = reinterpret_cast<float *>(mine + pl.widened_bytes + pl.floats_bytes + pl.quantized_bytes);
-    auto * products =
-        reinterpret_cast<float *>(mine + pl.widened_bytes + pl.floats_bytes + pl.quantized_bytes + pl.scratch_bytes);
+    const Quantized_layout l = quantized_layout(c, pl);
+    Work_buffer buffer(params, l.layout);
+    const std::shared_ptr<Packed> kept = quantized_kept(c, pl);
     const Qkernel kernel = qkernel_b_unsigned();
     const Qkernel_wide wide = qkernel_wide_b_unsigned();
     const std::int64_t step = wide != nullptr ? 2 * kNr : kNr;
     const std::int64_t tiles = c.tw * c.th;
     const std::int64_t nt = bp.panels * kNr;
     const std::int64_t b_group = qgroup_bytes(q.quads, kNr);
+    const std::int64_t pstride = products_stride(bp.mc, nt);
 
     // The weights, when they are not ready; the inputs, by all threads
     // together, sixteen channels of an image to an item; then quantized, a
     // panel of an xi to an item.
     constexpr std::int64_t kInputChannels = 16;
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<float> inputs = buffer[l.inputs];
+    const Elements<std::uint8_t> qinputs = buffer[l.qinputs];
+    const Elements<float> widened = buffer[l.widened];
+    const Elements<float> floats = buffer[l.floats];
+    const Elements<float> scratch = buffer[l.scratch];
+    const Elements<float> products = buffer[l.products];
     int item = queue.next();
-    const Quantized_weights packed_weights = quantized_weights(params, c, pl, base, floats, widened, queue, item);
-    const std::uint8_t * weights = packed_weights.data;
+    const Quantized_weights packed_weights =
+        quantized_weights(params, c, pl, kept, buffer[l.weights], floats, widened, queue, item);
+    const Elements<const std::uint8_t> weights = packed_weights.data;
     const std::int64_t channel_groups = ceil_div(c.ic, kInputChannels);
     const std::int64_t input_items = packed_weights.items + c.n * channel_groups;
     for (; item < input_items; item = queue.next()) {
@@ -1943,8 +2064,9 @@ void compute_small_quantized(const ggml_compute_params * params, const Conv & c,
         const std::int64_t xi = i / bp.panels;
         const std::int64_t p = i % bp.panels;
         const Phase_scope scope(Phase::pack_inputs);
-        quantize_panel_inputs(qinputs + i * pl.v_panel, inputs + xi * inputs_stride(bp.panels, c.ic) + p * c.ic * kNr, c.ic,
-                              kNr, q);
+        quantize_panel_inputs(qinputs.part(i * pl.v_panel, pl.v_panel),
+                              inputs.part(xi * inputs_stride(bp.panels, c.ic) + p * c.ic * kNr, c.ic * kNr), c.ic, kNr,
+                              Qlayout::columns, q);
     }
     queue.barrier();
 
@@ -1960,71 +2082,157 @@ void compute_small_quantized(const ggml_compute_params * params, const Conv & c,
             const std::int64_t kc = std::min(pl.kc, c.ic - k0);
             const Phase_scope scope(Phase::product);
             const std::int64_t groups = ceil_div(kc, group);
-            for (int xi = 0; xi < kXi; ++xi) {
-                float * product = products + static_cast<std::size_t>(xi) * static_cast<std::size_t>(products_stride(bp.mc, nt));
+            for (std::int64_t xi = 0; xi < kXi; ++xi) {
+                const Elements<float> product = products.from(xi * pstride);
                 for (std::int64_t ip = 0; ip < panels; ++ip) {
-                    const std::uint8_t * a =
-                        weights + (xi * pl.opanels + i0 / kMr + ip) * pl.u_panel + k0 / group * a_group;
+                    const Elements<const std::uint8_t> a =
+                        weights.from((xi * pl.opanels + i0 / kMr + ip) * pl.u_panel + k0 / group * a_group);
                     for (std::int64_t jj = 0; jj < nt; jj += step) {
-                        const std::uint8_t * b = qinputs + (xi * bp.panels + jj / kNr) * pl.v_panel + k0 / group * b_group;
-                        qtiles(kernel, wide, groups, q.quads, a, b, pl.v_panel, product + ip * kMr * nt + jj,
-                               nt * static_cast<std::int64_t>(sizeof(float)), k0 > 0, std::min<std::int64_t>(kMr, i1 - i0 - ip * kMr),
-                               std::min(step, nt - jj));
+                        const Elements<const std::uint8_t> b =
+                            qinputs.from((xi * bp.panels + jj / kNr) * pl.v_panel + k0 / group * b_group);
+                        qtiles(kernel, wide, groups, q.quads, a, b, pl.v_panel, product.from(ip * kMr * nt + jj), nt, k0 > 0,
+                               std::min<std::int64_t>(kMr, i1 - i0 - ip * kMr), std::min(step, nt - jj));
                     }
                 }
             }
         }
         for (std::int64_t n = 0; n < c.n; ++n) {
-            transform_outputs(c, products + n * tiles, static_cast<std::size_t>(products_stride(bp.mc, nt)), nt, n, 0, tiles,
-                              i0, i1, chain, false);
+            transform_outputs(c, products.from(n * tiles), pstride, nt, n, 0, tiles, i0, i1, chain, false);
         }
     }
 }
 
 }  // namespace
 
-bool winograd_supported(const ggml_tensor * node) {
+bool winograd_supported(const ggml_tensor * const node) {
     if (node->op != GGML_OP_CONV_2D || tuning().winograd == 0) {
         return false;
     }
-    const ggml_tensor * kernel = node->src[0];
-    const ggml_tensor * input = node->src[1];
-    const int * p = node->op_params;
-    return kernel->ne[0] == 3 && kernel->ne[1] == 3 && p[0] == 1 && p[1] == 1 && p[4] == 1 && p[5] == 1 &&
-           p[2] >= 0 && p[2] <= 2 && p[3] >= 0 && p[3] <= 2 &&
-           (kernel->type == GGML_TYPE_F16 || kernel->type == GGML_TYPE_F32) && ggml_is_contiguous(kernel) &&
-           input->type == GGML_TYPE_F32 && input->nb[0] == sizeof(float) && node->type == GGML_TYPE_F32 &&
-           ggml_is_contiguous(node) && kernel->ne[2] == input->ne[2] &&
-           (node->ne[0] * node->ne[1] >= tuning().winograd_positions || small(geometry(node)));
+    const ggml_tensor * const kernel = node->src[0];
+    const ggml_tensor * const input = node->src[1];
+    const std::span<const std::int32_t> p(node->op_params);
+    const bool weights = (kernel->type == GGML_TYPE_F16 && holds<std::uint16_t>(kernel)) ||
+                         (kernel->type == GGML_TYPE_F32 && holds<float>(kernel));
+    if (!(kernel->ne[0] == 3 && kernel->ne[1] == 3 && p[0] == 1 && p[1] == 1 && p[4] == 1 && p[5] == 1 && p[2] >= 0 &&
+          p[2] <= 2 && p[3] >= 0 && p[3] <= 2 && weights && ggml_is_contiguous(kernel) && holds<float>(input) &&
+          input->nb[0] == sizeof(float) && holds<float>(node) && ggml_is_contiguous(node) &&
+          kernel->ne[2] == input->ne[2])) {
+        return false;
+    }
+    return node->ne[0] * node->ne[1] >= tuning().winograd_positions || small(geometry(node));
 }
 
-std::size_t winograd_work_size(const ggml_tensor * node, int n_threads) {
+std::size_t winograd_work_size(const ggml_tensor * const node, int n_threads) {
     const Conv c = geometry(node);
     if (quantized(Quantized_op::convolution)) {
-        const Qplan pl = qplan(c, n_threads);
-        return kAlign + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(n_threads);
+        return quantized_layout(c, qplan(c, n_threads)).layout.bytes(n_threads);
     }
     if (four(c)) {
         if (small4(c)) {
-            const Plan4_small pl = plan4_small(c);
-            return kAlign + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(n_threads);
+            return layout4_small(c, plan4_small(c)).layout.bytes(n_threads);
         }
-        const Plan4 pl = plan4(c, n_threads);
-        return kAlign + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(n_threads);
+        return layout4(c, plan4(c, n_threads)).layout.bytes(n_threads);
     }
     if (on_amx(c)) {
-        const Amx_plan pl = amx_plan(c, n_threads);
-        return kAlign + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(n_threads);
+        return amx_layout(c, amx_plan(c, n_threads)).layout.bytes(n_threads);
     }
-    const Plan pl = plan(c, n_threads);
-    return kAlign + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(n_threads);
+    return single_layout(c, plan(c, n_threads)).layout.bytes(n_threads);
 }
 
-void winograd_compute(const ggml_compute_params * params, ggml_tensor * node, const Epilogue & chain) {
+namespace {
+
+void compute_large(const ggml_compute_params * const params, const Conv & c, const Plan & pl, const Epilogue & chain) {
+    const Single_layout l = single_layout(c, pl);
+    Work_buffer buffer(params, l.layout);
+    // The transformed weights: the store's, transformed here the first time,
+    // or the work buffer's, transformed here every time.
+    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::winograd, weights_count(c));
+    const bool fill = kept == nullptr || !kept->ready();
+    const Microkernel uk = microkernel();
+    const Microkernel_wide wide = microkernel_wide();
+    const std::int64_t step = panel_step(wide);
+    const std::int64_t per_xi = xi_stride(round_up(c.oc, kMr), c.ic);
+    // The kernels written by hand for AVX2 pack the tiles of each eight in
+    // shuffled lanes, and transform the outputs from them; those for AVX-512,
+    // like the C++ ones, keep the tiles in their order.
+    const bool shuffle = avx2_kernels() && !avx512_kernels();
+
+    Work_queue queue(params, buffer);
+    const Elements<float> weights = kept != nullptr ? kept->singles() : buffer[l.shared];
+    const Elements<float> panels = buffer[l.panels];
+    const Elements<float> products = buffer[l.products];
+    // The weights, two panels of kMr output channels to an item, widened in
+    // the thread's panels of inputs, which it has not begun to fill.
+    constexpr std::int64_t kPanels = 2;
+    const std::int64_t pack_items = fill ? ceil_div(ceil_div(c.oc, kMr), kPanels) : 0;
+    int item = queue.next();
+    if (fill) {
+        for (; item < pack_items; item = queue.next()) {
+            const Phase_scope scope(Phase::pack_weights);
+            for (std::int64_t panel = item * kPanels; panel < std::min((item + 1) * kPanels, ceil_div(c.oc, kMr)); ++panel) {
+                transform_weights(weights.from(panel * c.ic * kMr), per_xi, c, panel * kMr,
+                                  std::min<std::int64_t>(kMr, c.oc - panel * kMr), 0, c.ic, panels);
+            }
+        }
+        queue.barrier();
+        if (params->ith == 0) {
+            publish(kept);
+        }
+    }
+
+    const std::int64_t tiles = c.tw * c.th;
+    const std::int64_t stride = panels_stride(pl.kc, pl.tiles);
+    const std::vector<Block> blocks = guided_blocks(c.n, tiles, kNr, pl.tiles, params->nth);
+    const auto units = static_cast<std::int64_t>(blocks.size()) * pl.mblocks;
+    for (; item < pack_items + units; item = queue.next()) {
+        const std::int64_t u = item - pack_items;
+        const std::int64_t ib = u % pl.mblocks;
+        const Block & block = blocks[static_cast<std::size_t>(u / pl.mblocks)];
+        const std::int64_t n = block.segment;
+        const std::int64_t i0 = ib * pl.mc;
+        const std::int64_t i1 = std::min(c.oc, i0 + pl.mc);
+        const std::int64_t t0 = block.start;
+        const std::int64_t t1 = t0 + block.size;
+        const std::int64_t nt = round_up(t1 - t0, kNr);
+        const std::int64_t pstride = products_stride(pl.mc, nt);
+        // The sixteen products, [xi][channel][tile]: the four of a row r of
+        // B^T a stretch of input channels at a time, from the panels of their
+        // inputs, packed together.
+        for (int r = 0; r < 4; ++r) {
+            for (std::int64_t k0 = 0; k0 < c.ic; k0 += pl.kc) {
+                const std::int64_t kc = std::min(pl.kc, c.ic - k0);
+                {
+                    const Phase_scope scope(Phase::pack_inputs);
+                    pack_inputs(panels, stride, c, n, t0, t1, k0, k0 + kc, r, shuffle);
+                }
+                const Phase_scope scope(Phase::product);
+                for (std::int64_t s = 0; s < 4; ++s) {
+                    const std::int64_t xi = 4 * r + s;
+                    const Elements<float> product = products.from(xi * pstride);
+                    const Elements<const float> u_xi = weights.from(xi * per_xi);
+                    for (std::int64_t jj = 0; jj < nt; jj += step) {
+                        const Elements<const float> b = panels.from(s * stride + (jj / kNr) * kc * kNr);
+                        for (std::int64_t ii = i0; ii < i1; ii += kMr) {
+                            sdasm::tiles(uk, wide, kc, u_xi.from((ii / kMr * c.ic + k0) * kMr), b, kc * kNr,
+                                         product.from((ii - i0) * nt + jj), nt, k0 > 0, std::min<std::int64_t>(kMr, i1 - ii),
+                                         std::min(step, nt - jj));
+                        }
+                    }
+                }
+            }
+        }
+        transform_outputs(c, products, pstride, nt, n, t0, t1, i0, i1, chain, shuffle);
+    }
+}
+
+}  // namespace
+
+void winograd_compute(const ggml_compute_params * const params, const ggml_tensor * const node,
+                      const Epilogue & chain) {
     Conv c = geometry(node);
     if (chain.redirect != nullptr) {
         // The residual connection's tensor, of the same layout (fusion.h).
-        c.y = static_cast<char *>(chain.redirect->data);
+        c.y = elements_of<float>(chain.redirect);
     }
     if (quantized(Quantized_op::convolution)) {
         const Qplan pl = qplan(c, params->nth);
@@ -2060,89 +2268,7 @@ void winograd_compute(const ggml_compute_params * params, ggml_tensor * node, co
         compute_small(params, c, pl, chain);
         return;
     }
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    // The transformed weights: the store's, transformed here the first time,
-    // or the work buffer's, transformed here every time.
-    const std::shared_ptr<Packed> kept = packed(c.kernel, Layout::winograd, pl.shared_bytes);
-    float * weights = kept != nullptr ? kept->data : reinterpret_cast<float *>(base);
-    const bool fill = kept == nullptr || !kept->ready();
-    char * mine = base + pl.shared_bytes + pl.thread_bytes * static_cast<std::size_t>(params->ith);
-    float * panels = reinterpret_cast<float *>(mine);
-    float * products = reinterpret_cast<float *>(mine + pl.panel_bytes);
-    const Microkernel uk = microkernel();
-    const Microkernel_wide wide = microkernel_wide();
-    const std::int64_t step = panel_step(wide);
-    const auto per_xi = static_cast<std::size_t>(xi_stride(round_up(c.oc, kMr), c.ic));
-    // The kernels written by hand for AVX2 pack the tiles of each eight in
-    // shuffled lanes, and transform the outputs from them; those for AVX-512,
-    // like the C++ ones, keep the tiles in their order.
-    const bool shuffle = avx2_kernels() && !avx512_kernels();
-
-    Work_queue queue(params);
-    // The weights, two panels of kMr output channels to an item, widened in
-    // the thread's panels of inputs, which it has not begun to fill.
-    constexpr std::int64_t kPanels = 2;
-    const std::int64_t pack_items = fill ? ceil_div(ceil_div(c.oc, kMr), kPanels) : 0;
-    int item = queue.next();
-    if (fill) {
-        for (; item < pack_items; item = queue.next()) {
-            const Phase_scope scope(Phase::pack_weights);
-            for (std::int64_t panel = item * kPanels; panel < std::min((item + 1) * kPanels, ceil_div(c.oc, kMr)); ++panel) {
-                transform_weights(weights + panel * c.ic * kMr, static_cast<std::int64_t>(per_xi), c, panel * kMr,
-                                  std::min<std::int64_t>(kMr, c.oc - panel * kMr), 0, c.ic, panels);
-            }
-        }
-        queue.barrier();
-        if (params->ith == 0) {
-            publish(kept);
-        }
-    }
-
-    const std::int64_t tiles = c.tw * c.th;
-    const std::vector<Block> blocks = guided_blocks(c.n, tiles, kNr, pl.tiles, params->nth);
-    const auto units = static_cast<std::int64_t>(blocks.size()) * pl.mblocks;
-    for (; item < pack_items + units; item = queue.next()) {
-        const std::int64_t u = item - pack_items;
-        const std::int64_t ib = u % pl.mblocks;
-        const Block & block = blocks[static_cast<std::size_t>(u / pl.mblocks)];
-        const std::int64_t n = block.segment;
-        const std::int64_t i0 = ib * pl.mc;
-        const std::int64_t i1 = std::min(c.oc, i0 + pl.mc);
-        const std::int64_t t0 = block.start;
-        const std::int64_t t1 = t0 + block.size;
-        const std::int64_t nt = round_up(t1 - t0, kNr);
-        const std::int64_t ldc = nt * static_cast<std::int64_t>(sizeof(float));
-        // The sixteen products, [xi][channel][tile]: the four of a row r of
-        // B^T a stretch of input channels at a time, from the panels of their
-        // inputs, packed together.
-        const std::int64_t stride = static_cast<std::int64_t>(pl.panel_bytes / 4 / sizeof(float)) / kSkew * kSkew;
-        for (int r = 0; r < 4; ++r) {
-            for (std::int64_t k0 = 0; k0 < c.ic; k0 += pl.kc) {
-                const std::int64_t kc = std::min(pl.kc, c.ic - k0);
-                {
-                    const Phase_scope scope(Phase::pack_inputs);
-                    pack_inputs(panels, stride, c, n, t0, t1, k0, k0 + kc, r, shuffle);
-                }
-                const Phase_scope scope(Phase::product);
-                for (int s = 0; s < 4; ++s) {
-                    const int xi = 4 * r + s;
-                    float * product = products + static_cast<std::size_t>(xi) * static_cast<std::size_t>(products_stride(pl.mc, nt));
-                    const float * u_xi = weights + static_cast<std::size_t>(xi) * per_xi;
-                    for (std::int64_t jj = 0; jj < nt; jj += step) {
-                        const float * b = panels + s * stride + (jj / kNr) * kc * kNr;
-                        for (std::int64_t ii = i0; ii < i1; ii += kMr) {
-                            const float * a = u_xi + (ii / kMr * c.ic + k0) * kMr;
-                            float * out = product + (ii - i0) * nt + jj;
-                            sdasm::tiles(uk, wide, kc, a, b, kc * kNr * static_cast<std::int64_t>(sizeof(float)), out, ldc,
-                                         k0 > 0, std::min<std::int64_t>(kMr, i1 - ii), std::min(step, nt - jj));
-                        }
-                    }
-                }
-            }
-        }
-        transform_outputs(c, products, static_cast<std::size_t>(products_stride(pl.mc, nt)), nt, n, t0, t1, i0, i1, chain,
-                          shuffle);
-    }
+    compute_large(params, c, pl, chain);
 }
 
 }  // namespace sdasm

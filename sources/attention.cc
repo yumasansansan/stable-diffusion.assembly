@@ -38,7 +38,10 @@
 // stretch taken just before the values are summed by them, while they are in
 // the nearest cache. Its output is the transposed output of the block,
 // dimensions by queries, which is divided by the sums and written out a query
-// at a time.
+// at a time. Where the wide micro-kernel is taken (gemm.h: AVX-512's tile of
+// 32 columns, whose loads keep up with its multiplications), both products
+// take two panels of queries at a time, the scores' kernel writing its two
+// halves to the two panels (scores_kernel_wide()).
 //
 // The sums are kept short, as ggml's dot product keeps them -- it sums 32 at a
 // time and then the 32 sums -- so that they round no more than its own do: a
@@ -63,15 +66,17 @@
 // it adds them to its sums, as ggml's dot product sums 32 at a time.
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 
 #include "gemm.h"
 #include "kernels.h"
-#include "quant.h"
+#include "memory.h"
 #include "ops.h"
 #include "phases.h"
+#include "quant.h"
 
 #include "ggml-cpu-impl.h"
 #include "ggml.h"
@@ -81,17 +86,19 @@ namespace sdasm {
 
 namespace {
 
-
+// The strides are in elements of each tensor's own type.
 struct Attention {
-    const char * q;  // [d, lq, h, b]
+    Elements<const float> q;  // [d, lq, h, b]
     std::int64_t qnb1, qnb2, qnb3;
-    const char * k;  // [d, lk, hk, b]
-    std::int64_t knb1, knb2, knb3;
     ggml_type ktype;
-    const char * v;  // [dv, lk, hk, b]
-    std::int64_t vnb1, vnb2, vnb3;
+    Elements<const float> k32;          // [d, lk, hk, b], of single precision
+    Elements<const std::uint16_t> k16;  // or FP16
+    std::int64_t knb1, knb2, knb3;
     ggml_type vtype;
-    char * out;  // [dv, h, lq, b]
+    Elements<const float> v32;  // [dv, lk, hk, b]
+    Elements<const std::uint16_t> v16;
+    std::int64_t vnb1, vnb2, vnb3;
+    Elements<float> out;  // [dv, h, lq, b]
     std::int64_t onb1, onb2, onb3;
     std::int64_t d, dv, lq, lk, h, hk, b;
     float scale;
@@ -101,29 +108,46 @@ struct Attention {
     std::int64_t sum_dims;   // the most dimensions it sums a score over at once
 };
 
-Attention geometry(const ggml_tensor * node) {
-    const ggml_tensor * q = node->src[0];
-    const ggml_tensor * k = node->src[1];
-    const ggml_tensor * v = node->src[2];
+// Of a node that attention_supported() takes.
+Attention geometry(const ggml_tensor * const node) {
+    const ggml_tensor * const q = node->src[0];
+    const ggml_tensor * const k = node->src[1];
+    const ggml_tensor * const v = node->src[2];
     Attention a{};
-    a.q = static_cast<const char *>(q->data);
-    a.qnb1 = static_cast<std::int64_t>(q->nb[1]);
-    a.qnb2 = static_cast<std::int64_t>(q->nb[2]);
-    a.qnb3 = static_cast<std::int64_t>(q->nb[3]);
-    a.k = static_cast<const char *>(k->data);
-    a.knb1 = static_cast<std::int64_t>(k->nb[1]);
-    a.knb2 = static_cast<std::int64_t>(k->nb[2]);
-    a.knb3 = static_cast<std::int64_t>(k->nb[3]);
+    a.q = elements_of<const float>(q);
+    a.qnb1 = stride_of<float>(q, 1);
+    a.qnb2 = stride_of<float>(q, 2);
+    a.qnb3 = stride_of<float>(q, 3);
     a.ktype = k->type;
-    a.v = static_cast<const char *>(v->data);
-    a.vnb1 = static_cast<std::int64_t>(v->nb[1]);
-    a.vnb2 = static_cast<std::int64_t>(v->nb[2]);
-    a.vnb3 = static_cast<std::int64_t>(v->nb[3]);
+    if (k->type == GGML_TYPE_F16) {
+        a.k16 = elements_of<const std::uint16_t>(k);
+        a.knb1 = stride_of<std::uint16_t>(k, 1);
+        a.knb2 = stride_of<std::uint16_t>(k, 2);
+        a.knb3 = stride_of<std::uint16_t>(k, 3);
+    }
+    else {
+        a.k32 = elements_of<const float>(k);
+        a.knb1 = stride_of<float>(k, 1);
+        a.knb2 = stride_of<float>(k, 2);
+        a.knb3 = stride_of<float>(k, 3);
+    }
     a.vtype = v->type;
-    a.out = static_cast<char *>(node->data);
-    a.onb1 = static_cast<std::int64_t>(node->nb[1]);
-    a.onb2 = static_cast<std::int64_t>(node->nb[2]);
-    a.onb3 = static_cast<std::int64_t>(node->nb[3]);
+    if (v->type == GGML_TYPE_F16) {
+        a.v16 = elements_of<const std::uint16_t>(v);
+        a.vnb1 = stride_of<std::uint16_t>(v, 1);
+        a.vnb2 = stride_of<std::uint16_t>(v, 2);
+        a.vnb3 = stride_of<std::uint16_t>(v, 3);
+    }
+    else {
+        a.v32 = elements_of<const float>(v);
+        a.vnb1 = stride_of<float>(v, 1);
+        a.vnb2 = stride_of<float>(v, 2);
+        a.vnb3 = stride_of<float>(v, 3);
+    }
+    a.out = elements_of<float>(node);
+    a.onb1 = stride_of<float>(node, 1);
+    a.onb2 = stride_of<float>(node, 2);
+    a.onb3 = stride_of<float>(node, 3);
     a.d = q->ne[0];
     a.dv = v->ne[0];
     a.lq = q->ne[1];
@@ -131,7 +155,7 @@ Attention geometry(const ggml_tensor * node) {
     a.h = q->ne[2];
     a.hk = k->ne[2];
     a.b = q->ne[3];
-    std::memcpy(&a.scale, &node->op_params[0], sizeof a.scale);
+    a.scale = std::bit_cast<float>(node->op_params[0]);
     a.queries = std::max<std::int64_t>(kNr, tuning().attention_queries / kNr * kNr);
     a.key_block = std::max(8, tuning().attention_keys / 8 * 8);
     a.sum_keys = std::max(1, tuning().attention_sum_keys);
@@ -143,47 +167,80 @@ std::int64_t ceil_div(std::int64_t a, std::int64_t b) {
     return (a + b - 1) / b;
 }
 
-
-
 std::int64_t round_up(std::int64_t a, std::int64_t b) {
     return ceil_div(a, b) * b;
 }
 
+// The first element of the keys, and of the values, of head hk of image b.
+std::int64_t keys_at(const Attention & a, std::int64_t b, std::int64_t hk) {
+    return b * a.knb3 + hk * a.knb2;
+}
+std::int64_t values_at(const Attention & a, std::int64_t b, std::int64_t hk) {
+    return b * a.vnb3 + hk * a.vnb2;
+}
+
+// The number of a value, widened.
+float value(const Attention & a, std::int64_t at) {
+    return a.vtype == GGML_TYPE_F16 ? static_cast<float>(std::bit_cast<_Float16>(a.v16[at])) : a.v32[at];
+}
+
+// Keys [r0, r0 + rows) of head hk of image b over the head's dimensions into
+// panels of p (gemm.h).
+void pack_keys(Elements<float> dst, const Attention & a, std::int64_t b, std::int64_t hk, std::int64_t r0, std::int64_t rows,
+               int p) {
+    const std::int64_t at = keys_at(a, b, hk) + r0 * a.knb1;
+    if (a.ktype == GGML_TYPE_F16) {
+        pack_rows_f16(dst, a.k16.from(at), a.knb1, rows, 0, a.d, p);
+    }
+    else {
+        pack_rows_f32(dst, a.k32.from(at), a.knb1, rows, 0, a.d, p);
+    }
+}
+
+// Row i of the output of head h of image b: query q of it, dv numbers.
+Elements<float> output_row(const Attention & a, std::int64_t b, std::int64_t h, std::int64_t q) {
+    return a.out.part(b * a.onb3 + h * a.onb1 + q * a.onb2, a.dv);
+}
+
+// The work buffer of attention in single precision: the packed keys and
+// values of every head, shared; and each thread's packed queries, its scores,
+// its transposed output and the sum of a stretch of keys, the largest score of
+// each of its queries and the sum of the exponentials of each, in double
+// precision.
 struct Layout {
-    std::size_t keys_floats;    // the packed keys of one head
-    std::size_t values_floats;  // the packed values of one head
-    std::size_t shared_bytes;
-    std::size_t queries_bytes;  // a thread's packed queries
-    std::size_t scores_bytes;   // a thread's scores
-    std::size_t output_bytes;   // a thread's transposed output, and its sum over a stretch of keys
-    std::size_t maxima_bytes;   // the largest score of each of a thread's queries
-    std::size_t sums_bytes;     // the sum of the exponentials of each, in double precision
-    std::size_t thread_bytes;
+    std::int64_t keys_floats;    // the packed keys of one head
+    std::int64_t values_floats;  // the packed values of one head
+    Work_layout layout;
+    Shared<float> heads;
+    Own<float> queries, scores, output, stretch_sum, maxima;
+    Own<double> sums;
 };
 
 Layout layout(const Attention & a) {
-    Layout l{};
-    l.keys_floats = static_cast<std::size_t>(round_up(a.lk, kMr) * a.d);
-    l.values_floats = static_cast<std::size_t>(round_up(a.dv, kMr) * a.lk);
-    l.shared_bytes = align_up((l.keys_floats + l.values_floats) * sizeof(float) * static_cast<std::size_t>(a.hk * a.b));
-    l.queries_bytes = align_up(static_cast<std::size_t>(a.queries * a.d) * sizeof(float));
-    l.scores_bytes = align_up(static_cast<std::size_t>(a.queries * round_up(a.lk, kMr)) * sizeof(float));
-    l.output_bytes = align_up(static_cast<std::size_t>(round_up(a.dv, kMr) * a.queries) * sizeof(float));
-    l.maxima_bytes = align_up(static_cast<std::size_t>(a.queries) * sizeof(float));
-    l.sums_bytes = align_up(static_cast<std::size_t>(a.queries) * sizeof(double));
-    l.thread_bytes = l.queries_bytes + l.scores_bytes + 2 * l.output_bytes + l.maxima_bytes + l.sums_bytes;
+    Layout l;
+    l.keys_floats = round_up(a.lk, kMr) * a.d;
+    l.values_floats = round_up(a.dv, kMr) * a.lk;
+    l.heads = l.layout.shared<float>((l.keys_floats + l.values_floats) * a.hk * a.b);
+    l.queries = l.layout.own<float>(a.queries * a.d);
+    l.scores = l.layout.own<float>(a.queries * round_up(a.lk, kMr));
+    l.output = l.layout.own<float>(round_up(a.dv, kMr) * a.queries);
+    l.stretch_sum = l.layout.own<float>(round_up(a.dv, kMr) * a.queries);
+    l.maxima = l.layout.own<float>(a.queries);
+    l.sums = l.layout.own<double>(a.queries);
     return l;
 }
 
-// Packs the values [0, lk) of one head into panels of kMr dimensions:
-// [panel][lk][kMr], zeros past the last dimension.
+// Packs the values [0, lk) of one head, src from its first, into panels of kMr
+// dimensions: [panel][lk][kMr], zeros past the last dimension.
 template <class T, class Convert>
-void pack_values(float * dst, const char * src, std::int64_t stride, std::int64_t lk, std::int64_t dv, Convert convert) {
-    for (std::int64_t d0 = 0; d0 < dv; d0 += kMr, dst += lk * kMr) {
+void pack_values(Elements<float> dst, Elements<const T> src, std::int64_t stride, std::int64_t lk, std::int64_t dv,
+                 Convert convert) {
+    for (std::int64_t d0 = 0; d0 < dv; d0 += kMr) {
+        const Elements<float> panel = dst.part(d0 / kMr * lk * kMr, lk * kMr);
         const std::int64_t width = std::min<std::int64_t>(kMr, dv - d0);
         for (std::int64_t j = 0; j < lk; ++j) {
-            const T * row = reinterpret_cast<const T *>(src + j * stride) + d0;
-            float * out = dst + j * kMr;
+            const Elements<const T> row = src.part(j * stride + d0, width);
+            const Elements<float> out = panel.part(j * kMr, kMr);
             std::int64_t i = 0;
             for (; i < width; ++i) {
                 out[i] = convert(row[i]);
@@ -201,10 +258,18 @@ void pack_values(float * dst, const char * src, std::int64_t stride, std::int64_
 // added to total: the C++ form of sdasm_exponentials_avx2 (x86_64/softmax_avx2.S),
 // a loop over the sixteen queries of a key for the compiler to vectorize, each
 // query's sum in double precision.
-void exponentials_cxx(float * s, std::int64_t n, const float * max, double * total) {
+void exponentials_cxx(float * const s_first, std::int64_t n, const float * const max_first,
+                      double * const total_first) {
+    SDASM_REQUIRE(n >= 0);
+    // The kernel's operands, handed over as pointers: n keys of kNr queries.
+#pragma clang unsafe_buffer_usage begin
+    const Elements<float> s = elements_at(s_first, n * kNr);
+    const Elements<const float> max = elements_at(max_first, kNr);
+    const Elements<double> total = elements_at(total_first, kNr);
+#pragma clang unsafe_buffer_usage end
     for (std::int64_t j = 0; j < n; ++j) {
-        float * row = s + j * kNr;
-        for (int l = 0; l < kNr; ++l) {
+        const Elements<float> row = s.part(j * kNr, kNr);
+        for (std::int64_t l = 0; l < kNr; ++l) {
             const float e = exponential(row[l] - max[l]);
             row[l] = e;
             total[l] += static_cast<double>(e);
@@ -219,14 +284,15 @@ namespace {
 // time, and their sums added to total, in double precision: eight keys at a
 // time from j0, a multiple of eight, by the kernel of the form taken; and at
 // the end of the keys, those past the last eight by expf, each added to total.
-void exponentials(float * s, std::int64_t j0, std::int64_t j1, const float * max, double * total) {
+void exponentials(Elements<float> s, std::int64_t j0, std::int64_t j1, Elements<const float> max, Elements<double> total) {
     const std::int64_t whole = (j1 - j0) / 8 * 8;
+    SDASM_CHECK(s.size() >= j1 * kNr && max.size() >= kNr && total.size() >= kNr);
     if (whole > 0) {
-        exponentials_kernel()(s + j0 * kNr, whole, max, total);
+        exponentials_kernel()(s.from(j0 * kNr).data(), whole, max.data(), total.data());
     }
     for (std::int64_t j = j0 + whole; j < j1; ++j) {
-        float * row = s + j * kNr;
-        for (int l = 0; l < kNr; ++l) {
+        const Elements<float> row = s.part(j * kNr, kNr);
+        for (std::int64_t l = 0; l < kNr; ++l) {
             const float e = std::exp(row[l] - max[l]);
             row[l] = e;
             total[l] += static_cast<double>(e);
@@ -234,77 +300,104 @@ void exponentials(float * s, std::int64_t j0, std::int64_t j1, const float * max
     }
 }
 
-}  // namespace
-
-namespace {
-
 // ---------------------------------------------------------------- on AMX
 
 constexpr std::int64_t kTileRows = 16;
 constexpr std::int64_t kBlock = 32;           // the rows and columns of a block of the kernel, and its k
-constexpr std::int64_t kBlockBytes = 3072;    // a block of k of a tile's rows or columns, three parts
+constexpr std::int64_t kBlockHalves = 1536;   // a block of k of a tile's rows or columns, three parts of two bytes
 
-bool on_amx(const Attention &) {
-    return amx_kernels() && tuning().amx_attention != 0;
+// On the tiles, or, with products of 16 bits (Tuning::bits), on AVX512-BF16's
+// vector units where there are no tiles: the same tiles in memory, the first
+// parts of each multiplied alone (x86_64/half.S).
+bool half_products() {
+    return tuning().bits == 16;
 }
 
+bool on_vectors(const Attention &) {
+    return half_products() && !amx_kernels() && avx512_kernels() && cpu().avx512_bf16;
+}
+
+// In single precision, attention on the tiles takes six products for each one,
+// and runs at half the rate of AVX-512's FMAs on Emerald Rapids (measured on
+// GitHub's runners): it is taken when Tuning::amx_attention asks. With
+// products of 16 bits, one for each, it is taken where the tiles are.
+bool on_amx(const Attention & a) {
+    return (amx_kernels() && (tuning().amx_attention != 0 || half_products())) || on_vectors(a);
+}
+
+using Single_kernel = void (*)(std::int64_t, const std::uint16_t *, std::int64_t, const std::uint16_t *, std::int64_t,
+                               float *, std::int64_t, std::int64_t);
+
+Single_kernel single_kernel(const Attention & a) {
+#if SDASM_X86_64
+    if (on_vectors(a)) {
+        return sdasm_bf16_single_1x1_avx512;
+    }
+    return half_products() ? sdasm_amx_single_1x1 : sdasm_amx_single_2x2;
+#else
+    (void) a;
+    return nullptr;
+#endif
+}
+
+// The work buffer on AMX's tiles, in elements of two bytes or of their own
+// type: the tiles of every head's keys and values, shared; and each thread's
+// tiles of its queries, its scores, the tiles of its exponentials, its output
+// and the sum of a stretch of keys, the largest score of each of its queries
+// and the sum of the exponentials of each.
 struct Amx_layout {
-    std::int64_t queries;    // a block's, a multiple of 32
-    std::int64_t stretch;    // the keys of a stretch of the second product, a multiple of 32
+    std::int64_t queries;  // a block's, a multiple of 32
+    std::int64_t stretch;  // the keys of a stretch of the second product, a multiple of 32
     std::int64_t dp, kp, vp;  // d, lk and dv rounded up to 32
-    std::int64_t key_tile_bytes;    // a tile of sixteen keys over the whole of d
-    std::int64_t value_tile_bytes;  // a tile of sixteen dimensions over all the keys
-    std::size_t head_bytes;         // a head's keys and values
-    std::size_t shared_bytes;
-    std::size_t queries_bytes, scores_bytes, weights_bytes, output_bytes, maxima_bytes, sums_bytes;
-    std::size_t thread_bytes;
+    std::int64_t key_tile;    // a tile of sixteen keys over the whole of d
+    std::int64_t value_tile;  // a tile of sixteen dimensions over all the keys
+    std::int64_t head;        // a head's keys and values
+    Work_layout layout;
+    Shared<std::uint16_t> heads;
+    Own<std::uint16_t> queries_tiles;
+    Own<float> scores;
+    Own<std::uint16_t> weights;
+    Own<float> output, stretch_sum, maxima;
+    Own<double> sums;
 };
 
 Amx_layout amx_layout(const Attention & a) {
-    Amx_layout l{};
+    Amx_layout l;
     l.queries = std::max<std::int64_t>(kBlock, tuning().amx_queries / kBlock * kBlock);
     l.stretch = std::max<std::int64_t>(kBlock, a.key_block / kBlock * kBlock);
     l.dp = round_up(a.d, kBlock);
     l.kp = round_up(a.lk, kBlock);
     l.vp = round_up(a.dv, kBlock);
-    l.key_tile_bytes = l.dp / kBlock * kBlockBytes;
-    l.value_tile_bytes = l.kp / kBlock * kBlockBytes;
-    l.head_bytes = align_up(static_cast<std::size_t>(l.kp / kTileRows * l.key_tile_bytes + l.vp / kTileRows * l.value_tile_bytes));
-    l.shared_bytes = l.head_bytes * static_cast<std::size_t>(a.hk * a.b);
-    l.queries_bytes = align_up(static_cast<std::size_t>(l.queries / kTileRows * l.key_tile_bytes));
-    l.scores_bytes = align_up(static_cast<std::size_t>(l.queries * l.kp) * sizeof(float));
-    l.weights_bytes = align_up(static_cast<std::size_t>(l.queries / kTileRows * (l.stretch / kBlock) * kBlockBytes));
-    l.output_bytes = align_up(static_cast<std::size_t>(l.queries * l.vp) * sizeof(float));
-    l.maxima_bytes = align_up(static_cast<std::size_t>(l.queries) * sizeof(float));
-    l.sums_bytes = align_up(static_cast<std::size_t>(l.queries) * sizeof(double));
-    l.thread_bytes = l.queries_bytes + l.scores_bytes + l.weights_bytes + 2 * l.output_bytes + l.maxima_bytes + l.sums_bytes;
+    l.key_tile = l.dp / kBlock * kBlockHalves;
+    l.value_tile = l.kp / kBlock * kBlockHalves;
+    // Each head's tiles a line of the cache from the last.
+    l.head = round_up(l.kp / kTileRows * l.key_tile + l.vp / kTileRows * l.value_tile, 32);
+    l.heads = l.layout.shared<std::uint16_t>(l.head * a.hk * a.b);
+    l.queries_tiles = l.layout.own<std::uint16_t>(l.queries / kTileRows * l.key_tile);
+    l.scores = l.layout.own<float>(l.queries * l.kp);
+    l.weights = l.layout.own<std::uint16_t>(l.queries / kTileRows * (l.stretch / kBlock) * kBlockHalves);
+    l.output = l.layout.own<float>(l.queries * l.vp);
+    l.stretch_sum = l.layout.own<float>(l.queries * l.vp);
+    l.maxima = l.layout.own<float>(l.queries);
+    l.sums = l.layout.own<double>(l.queries);
     return l;
 }
 
-void compute_amx(const ggml_compute_params * params, const Attention & a) {
+void compute_amx(const ggml_compute_params * const params, const Attention & a) {
     const Amx_layout l = amx_layout(a);
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    char * mine = base + l.shared_bytes + l.thread_bytes * static_cast<std::size_t>(params->ith);
-    auto * queries = reinterpret_cast<std::uint16_t *>(mine);
-    mine += l.queries_bytes;
-    auto * scores = reinterpret_cast<float *>(mine);
-    mine += l.scores_bytes;
-    auto * weights = reinterpret_cast<std::uint16_t *>(mine);
-    mine += l.weights_bytes;
-    auto * output = reinterpret_cast<float *>(mine);
-    mine += l.output_bytes;
-    auto * stretch_sum = reinterpret_cast<float *>(mine);
-    mine += l.output_bytes;
-    auto * maxima = reinterpret_cast<float *>(mine);
-    mine += l.maxima_bytes;
-    auto * sums = reinterpret_cast<double *>(mine);
-    const auto head_of = [&](std::int64_t b, std::int64_t hk) {
-        return reinterpret_cast<std::uint16_t *>(base + l.head_bytes * static_cast<std::size_t>(b * a.hk + hk));
-    };
-    const auto at = [](std::uint16_t * p, std::int64_t bytes) { return p + bytes / 2; };
-    const std::int64_t values_offset = l.kp / kTileRows * l.key_tile_bytes;
+    Work_buffer buffer(params, l.layout);
+    const std::int64_t values_offset = l.kp / kTileRows * l.key_tile;
 
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<std::uint16_t> heads = buffer[l.heads];
+    const Elements<std::uint16_t> queries = buffer[l.queries_tiles];
+    const Elements<float> scores = buffer[l.scores];
+    const Elements<std::uint16_t> weights = buffer[l.weights];
+    const Elements<float> output = buffer[l.output];
+    const Elements<float> stretch_sum = buffer[l.stretch_sum];
+    const Elements<float> maxima = buffer[l.maxima];
+    const Elements<double> sums = buffer[l.sums];
+    const auto head_of = [&](std::int64_t b, std::int64_t hk) { return heads.part((b * a.hk + hk) * l.head, l.head); };
     // The keys and the values of every head, an item each: a tile of the keys
     // for each sixteen keys, over d; one of the values for each sixteen
     // dimensions, over the keys; those past the last, zeros.
@@ -314,41 +407,47 @@ void compute_amx(const ggml_compute_params * params, const Attention & a) {
         const std::int64_t head = item / 2;
         const std::int64_t b = head / a.hk;
         const std::int64_t hk = head % a.hk;
-        std::uint16_t * tiles = head_of(b, hk);
+        const Elements<std::uint16_t> tiles = head_of(b, hk);
         const Phase_scope scope(Phase::pack_weights);
         if (item % 2 == 0) {
-            const char * src = a.k + b * a.knb3 + hk * a.knb2;
+            const std::int64_t src = keys_at(a, b, hk);
             for (std::int64_t j = 0; j < l.kp; j += kTileRows) {
-                std::uint16_t * dst = at(tiles, j / kTileRows * l.key_tile_bytes);
+                const Elements<std::uint16_t> dst = tiles.part(j / kTileRows * l.key_tile, l.key_tile);
                 if (j >= a.lk) {
-                    std::memset(dst, 0, static_cast<std::size_t>(l.key_tile_bytes));
+                    fill_with(dst, std::uint16_t{0});
                     continue;
                 }
                 const std::int64_t cols = std::min(kTileRows, a.lk - j);
                 if (a.ktype == GGML_TYPE_F16) {
-                    sdasm_amx_pack_columns3_f16(dst, reinterpret_cast<const std::uint16_t *>(src + j * a.knb1), a.knb1, cols, a.d);
+                    const Elements<const std::uint16_t> keys = a.k16.from(src + j * a.knb1);
+                    SDASM_CHECK(keys.size() >= (cols - 1) * a.knb1 + a.d);
+                    sdasm_amx_pack_columns3_f16(dst.data(), keys.data(), bytes_of<std::uint16_t>(a.knb1), cols, a.d);
                 }
                 else {
-                    sdasm_amx_pack_columns3_f32(dst, reinterpret_cast<const float *>(src + j * a.knb1), a.knb1, cols, a.d);
+                    const Elements<const float> keys = a.k32.from(src + j * a.knb1);
+                    SDASM_CHECK(keys.size() >= (cols - 1) * a.knb1 + a.d);
+                    sdasm_amx_pack_columns3_f32(dst.data(), keys.data(), bytes_of<float>(a.knb1), cols, a.d);
                 }
             }
         }
         else {
-            const char * src = a.v + b * a.vnb3 + hk * a.vnb2;
-            const std::size_t element = a.vtype == GGML_TYPE_F16 ? 2 : 4;
+            const std::int64_t src = values_at(a, b, hk);
             for (std::int64_t c = 0; c < l.vp; c += kTileRows) {
-                std::uint16_t * dst = at(tiles, values_offset + c / kTileRows * l.value_tile_bytes);
+                const Elements<std::uint16_t> dst = tiles.part(values_offset + c / kTileRows * l.value_tile, l.value_tile);
                 if (c >= a.dv) {
-                    std::memset(dst, 0, static_cast<std::size_t>(l.value_tile_bytes));
+                    fill_with(dst, std::uint16_t{0});
                     continue;
                 }
                 const std::int64_t cols = std::min(kTileRows, a.dv - c);
-                const char * column = src + static_cast<std::size_t>(c) * element;
                 if (a.vtype == GGML_TYPE_F16) {
-                    sdasm_amx_pack_panel3_f16(dst, reinterpret_cast<const std::uint16_t *>(column), a.vnb1, cols, a.lk);
+                    const Elements<const std::uint16_t> column = a.v16.from(src + c);
+                    SDASM_CHECK(column.size() >= (a.lk - 1) * a.vnb1 + cols);
+                    sdasm_amx_pack_panel3_f16(dst.data(), column.data(), bytes_of<std::uint16_t>(a.vnb1), cols, a.lk);
                 }
                 else {
-                    sdasm_amx_pack_panel3_f32(dst, reinterpret_cast<const float *>(column), a.vnb1, cols, a.lk);
+                    const Elements<const float> column = a.v32.from(src + c);
+                    SDASM_CHECK(column.size() >= (a.lk - 1) * a.vnb1 + cols);
+                    sdasm_amx_pack_panel3_f32(dst.data(), column.data(), bytes_of<float>(a.vnb1), cols, a.lk);
                 }
             }
         }
@@ -357,11 +456,22 @@ void compute_amx(const ggml_compute_params * params, const Attention & a) {
 
     const std::int64_t blocks = ceil_div(a.lq, l.queries);
     const std::int64_t units = a.b * a.h * blocks;
-    const std::int64_t ld_scores = l.kp * static_cast<std::int64_t>(sizeof(float));
-    const std::int64_t ld_output = l.vp * static_cast<std::int64_t>(sizeof(float));
+    const Single_kernel kernel = single_kernel(a);
+    const bool tiles = !on_vectors(a);
+    const bool half = half_products();
     bool configured = false;
+    // The kernel's products of tiles a of `blocks` blocks of k and b, rows
+    // a_next and columns b_next elements apart, into c, rows ldc apart.
+    const auto product = [&](std::int64_t count, Elements<const std::uint16_t> ta, std::int64_t a_next,
+                             Elements<const std::uint16_t> tb, std::int64_t b_next, Elements<float> c, std::int64_t ldc,
+                             bool accumulate) {
+        SDASM_CHECK(ta.size() >= a_next + count * kBlockHalves && tb.size() >= b_next + count * kBlockHalves &&
+                    c.size() >= (kBlock - 1) * ldc + kBlock);
+        kernel(count, ta.data(), bytes_of<std::uint16_t>(a_next), tb.data(), bytes_of<std::uint16_t>(b_next), c.data(),
+               bytes_of<float>(ldc), accumulate ? 1 : 0);
+    };
     for (; item < pack_items + units; item = queue.next()) {
-        if (!configured) {
+        if (tiles && !configured) {
             sdasm_amx_configure();
             configured = true;
         }
@@ -374,16 +484,18 @@ void compute_amx(const ggml_compute_params * params, const Attention & a) {
         const std::int64_t q0 = block * l.queries;
         const std::int64_t nq = std::min(l.queries, a.lq - q0);
         const std::int64_t rows = round_up(nq, kBlock);
-        std::uint16_t * keys = head_of(b, hk);
-        std::uint16_t * values = at(keys, values_offset);
+        const Elements<const std::uint16_t> keys = head_of(b, hk);
+        const Elements<const std::uint16_t> values = keys.from(values_offset);
         {
             // The queries' tiles, sixteen to a tile; past nq, zeros.
             const Phase_scope scope(Phase::pack_inputs);
-            const char * src = a.q + b * a.qnb3 + h * a.qnb2 + q0 * a.qnb1;
+            const std::int64_t src = b * a.qnb3 + h * a.qnb2 + q0 * a.qnb1;
             for (std::int64_t r = 0; r < rows; r += kTileRows) {
-                sdasm_amx_pack_rows3(at(queries, r / kTileRows * l.key_tile_bytes),
-                                     reinterpret_cast<const float *>(src + r * a.qnb1), a.qnb1,
-                                     std::clamp<std::int64_t>(nq - r, 0, kTileRows), a.d);
+                const std::int64_t count = std::clamp<std::int64_t>(nq - r, 0, kTileRows);
+                const Elements<std::uint16_t> dst = queries.part(r / kTileRows * l.key_tile, l.key_tile);
+                const Elements<const float> from = count > 0 ? a.q.from(src + r * a.qnb1) : a.q;
+                SDASM_CHECK(count == 0 || from.size() >= (count - 1) * a.qnb1 + a.d);
+                sdasm_amx_pack_rows3(dst.data(), from.data(), bytes_of<float>(a.qnb1), count, a.d);
             }
         }
         {
@@ -392,20 +504,19 @@ void compute_amx(const ggml_compute_params * params, const Attention & a) {
             const Phase_scope scope(Phase::product);
             for (std::int64_t jj = 0; jj < l.kp; jj += kBlock) {
                 for (std::int64_t ii = 0; ii < rows; ii += kBlock) {
-                    sdasm_amx_single_2x2(l.dp / kBlock, at(queries, ii / kTileRows * l.key_tile_bytes), l.key_tile_bytes,
-                                         at(keys, jj / kTileRows * l.key_tile_bytes), l.key_tile_bytes,
-                                         scores + ii * l.kp + jj, ld_scores, 0);
+                    product(l.dp / kBlock, queries.from(ii / kTileRows * l.key_tile), l.key_tile,
+                            keys.from(jj / kTileRows * l.key_tile), l.key_tile, scores.from(ii * l.kp + jj), l.kp, false);
                 }
             }
         }
         {
             const Phase_scope scope(Phase::softmax);
             for (std::int64_t i = 0; i < nq; ++i) {
-                float * row = scores + i * l.kp;
+                const Elements<float> row = scores.part(i * l.kp, a.lk);
                 float top = -INFINITY;
-                for (std::int64_t j = 0; j < a.lk; ++j) {
-                    row[j] *= a.scale;
-                    top = std::max(top, row[j]);
+                for (float & x : row) {
+                    x *= a.scale;
+                    top = std::max(top, x);
                 }
                 maxima[i] = top;
                 sums[i] = 0;
@@ -419,10 +530,10 @@ void compute_amx(const ggml_compute_params * params, const Attention & a) {
             {
                 const Phase_scope scope(Phase::softmax);
                 for (std::int64_t i = 0; i < nq; ++i) {
-                    float * row = scores + i * l.kp;
+                    const Elements<float> row = scores.part(i * l.kp, a.lk);
                     const std::int64_t whole = (j1 - j0) / 64 * 64;
                     if (whole > 0) {
-                        sdasm_exponentials_row_avx512(row + j0, whole, maxima[i], sums + i);
+                        sdasm_exponentials_row_avx512(row.part(j0, whole).data(), whole, maxima[i], sums.part(i, 1).data());
                     }
                     for (std::int64_t j = j0 + whole; j < j1; ++j) {
                         row[j] = std::exp(row[j] - maxima[i]);
@@ -435,24 +546,26 @@ void compute_amx(const ggml_compute_params * params, const Attention & a) {
                 // zeros, as are the queries past nq.
                 const Phase_scope scope(Phase::pack_inputs);
                 for (std::int64_t r = 0; r < rows; r += kTileRows) {
-                    sdasm_amx_pack_rows3(at(weights, r / kTileRows * kb * kBlockBytes),
-                                         scores + r * l.kp + j0, ld_scores, std::clamp<std::int64_t>(nq - r, 0, kTileRows),
-                                         j1 - j0);
+                    const std::int64_t count = std::clamp<std::int64_t>(nq - r, 0, kTileRows);
+                    const Elements<std::uint16_t> dst = weights.part(r / kTileRows * kb * kBlockHalves, kb * kBlockHalves);
+                    const Elements<const float> from = count > 0 ? Elements<const float>(scores.from(r * l.kp + j0)) : scores;
+                    SDASM_CHECK(count == 0 || from.size() >= (count - 1) * l.kp + (j1 - j0));
+                    sdasm_amx_pack_rows3(dst.data(), from.data(), bytes_of<float>(l.kp), count, j1 - j0);
                 }
             }
             // The stretch's sum, begun from zeros and added to the output
             // after: the kernel adds its small products first only to sums of
-            // its own.
+            // its own. Products of 16 bits add to the output itself.
             const Phase_scope scope(Phase::product);
-            float * into = j0 == 0 ? output : stretch_sum;
+            const Elements<float> into = j0 == 0 || half ? output : stretch_sum;
             for (std::int64_t dd = 0; dd < l.vp; dd += kBlock) {
                 for (std::int64_t ii = 0; ii < rows; ii += kBlock) {
-                    sdasm_amx_single_2x2(kb, at(weights, ii / kTileRows * kb * kBlockBytes), kb * kBlockBytes,
-                                         at(values, dd / kTileRows * l.value_tile_bytes + j0 / kBlock * kBlockBytes),
-                                         l.value_tile_bytes, into + ii * l.vp + dd, ld_output, 0);
+                    product(kb, weights.from(ii / kTileRows * kb * kBlockHalves), kb * kBlockHalves,
+                            values.from(dd / kTileRows * l.value_tile + j0 / kBlock * kBlockHalves), l.value_tile,
+                            into.from(ii * l.vp + dd), l.vp, half && j0 > 0);
                 }
             }
-            if (j0 > 0) {
+            if (j0 > 0 && !half) {
                 for (std::int64_t i = 0; i < rows * l.vp; ++i) {
                     output[i] += stretch_sum[i];
                 }
@@ -461,11 +574,10 @@ void compute_amx(const ggml_compute_params * params, const Attention & a) {
         // Each query's output divided by the sum of its exponentials: by the
         // reciprocal of the sum, rounded to single precision.
         const Phase_scope scope(Phase::transform_out);
-        char * dst = a.out + b * a.onb3 + h * a.onb1;
         for (std::int64_t i = 0; i < nq; ++i) {
             const auto reciprocal = static_cast<float>(1.0 / sums[i]);
-            float * row = reinterpret_cast<float *>(dst + (q0 + i) * a.onb2);
-            const float * o = output + i * l.vp;
+            const Elements<float> row = output_row(a, b, h, q0 + i);
+            const Elements<const float> o = output.part(i * l.vp, a.dv);
             for (std::int64_t c = 0; c < a.dv; ++c) {
                 row[c] = o[c] * reciprocal;
             }
@@ -475,10 +587,6 @@ void compute_amx(const ggml_compute_params * params, const Attention & a) {
         sdasm_amx_release();
     }
 }
-
-}  // namespace
-
-namespace {
 
 // ---------------------------------------------------------------- quantized
 
@@ -516,74 +624,70 @@ Quant over_keys() {
     return q;
 }
 
+// The work buffer of attention in integers: every head's quantized keys and
+// values, shared; and each thread's panel of single precision, for the
+// packing, its queries in single precision and quantized, its scores, its
+// quantized exponentials, its output, the largest score of each of its queries
+// and the sum of the exponentials of each.
 struct Quantized_layout {
-    std::int64_t key_block;     // the keys of a stretch, a multiple of 32
-    std::int64_t lk_groups;     // lk rounded up to 32
-    std::size_t keys_bytes;     // a head's quantized keys: panels of kMr keys
-    std::size_t values_bytes;   // and values: panels of kMr dimensions over every key
-    std::size_t head_bytes, shared_bytes;
-    std::size_t floats_bytes;   // a thread's panel of single precision, for the packing
-    std::size_t queries_bytes;  // its queries, in single precision and quantized
-    std::size_t qqueries_bytes;
-    std::size_t scores_bytes, weights_bytes, output_bytes, maxima_bytes, sums_bytes;
-    std::size_t thread_bytes;
+    std::int64_t key_block;  // the keys of a stretch, a multiple of 32
+    std::int64_t lk_groups;  // lk rounded up to 32
+    std::int64_t keys;       // a head's quantized keys: panels of kMr keys
+    std::int64_t head;       // and its values: panels of kMr dimensions over every key
+    Work_layout layout;
+    Shared<std::uint8_t> heads;
+    Own<float> floats, queries;
+    Own<std::uint8_t> qqueries;
+    Own<float> scores;
+    Own<std::uint8_t> weights;
+    Own<float> output, maxima;
+    Own<double> sums;
 };
 
 Quantized_layout quantized_layout(const Attention & a) {
-    Quantized_layout l{};
+    Quantized_layout l;
     const Quant qd = over_dims(a);
     const Quant qk = over_keys();
     const std::int64_t group = 4 * qk.quads;
     l.key_block = std::max<std::int64_t>(group, a.key_block / group * group);
     l.lk_groups = round_up(a.lk, group);
-    l.keys_bytes = align_up(static_cast<std::size_t>(ceil_div(a.lk, kMr) * qpanel_bytes(a.d, kMr, qd)));
-    l.values_bytes = align_up(static_cast<std::size_t>(ceil_div(a.dv, kMr) * qpanel_bytes(l.lk_groups, kMr, qk)));
-    l.head_bytes = l.keys_bytes + l.values_bytes;
-    l.shared_bytes = l.head_bytes * static_cast<std::size_t>(a.hk * a.b);
-    l.floats_bytes = align_up(static_cast<std::size_t>(std::max(a.d, l.lk_groups) * kMr) * sizeof(float));
-    l.queries_bytes = align_up(static_cast<std::size_t>(a.queries * a.d) * sizeof(float));
-    l.qqueries_bytes = align_up(static_cast<std::size_t>(a.queries / kNr * qpanel_bytes(a.d, kNr, qd)));
-    l.scores_bytes = align_up(static_cast<std::size_t>(a.queries * round_up(a.lk, kMr)) * sizeof(float));
-    l.weights_bytes = align_up(static_cast<std::size_t>(a.queries / kNr * qpanel_bytes(l.key_block, kNr, qk)));
-    l.output_bytes = align_up(static_cast<std::size_t>(round_up(a.dv, kMr) * a.queries) * sizeof(float));
-    l.maxima_bytes = align_up(static_cast<std::size_t>(a.queries) * sizeof(float));
-    l.sums_bytes = align_up(static_cast<std::size_t>(a.queries) * sizeof(double));
-    l.thread_bytes = l.floats_bytes + l.queries_bytes + l.qqueries_bytes + l.scores_bytes + l.weights_bytes +
-                     l.output_bytes + l.maxima_bytes + l.sums_bytes;
+    // Each head's keys, and its values, a line of the cache from the last.
+    l.keys = round_up(ceil_div(a.lk, kMr) * qpanel_bytes(a.d, kMr, qd), 64);
+    l.head = l.keys + round_up(ceil_div(a.dv, kMr) * qpanel_bytes(l.lk_groups, kMr, qk), 64);
+    l.heads = l.layout.shared<std::uint8_t>(l.head * a.hk * a.b);
+    l.floats = l.layout.own<float>(std::max(a.d, l.lk_groups) * kMr);
+    l.queries = l.layout.own<float>(a.queries * a.d);
+    l.qqueries = l.layout.own<std::uint8_t>(a.queries / kNr * qpanel_bytes(a.d, kNr, qd));
+    l.scores = l.layout.own<float>(a.queries * round_up(a.lk, kMr));
+    l.weights = l.layout.own<std::uint8_t>(a.queries / kNr * qpanel_bytes(l.key_block, kNr, qk));
+    l.output = l.layout.own<float>(round_up(a.dv, kMr) * a.queries);
+    l.maxima = l.layout.own<float>(a.queries);
+    l.sums = l.layout.own<double>(a.queries);
     return l;
 }
 
-void compute_quantized(const ggml_compute_params * params, const Attention & a) {
+void compute_quantized(const ggml_compute_params * const params, const Attention & a) {
     const Quantized_layout l = quantized_layout(a);
+    Work_buffer buffer(params, l.layout);
     const Quant qd = over_dims(a);
     const Quant qk = over_keys();
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    char * mine = base + l.shared_bytes + l.thread_bytes * static_cast<std::size_t>(params->ith);
-    auto * floats = reinterpret_cast<float *>(mine);
-    mine += l.floats_bytes;
-    auto * queries = reinterpret_cast<float *>(mine);
-    mine += l.queries_bytes;
-    auto * qqueries = reinterpret_cast<std::uint8_t *>(mine);
-    mine += l.qqueries_bytes;
-    auto * scores = reinterpret_cast<float *>(mine);
-    mine += l.scores_bytes;
-    auto * weights = reinterpret_cast<std::uint8_t *>(mine);
-    mine += l.weights_bytes;
-    auto * output = reinterpret_cast<float *>(mine);
-    mine += l.output_bytes;
-    auto * maxima = reinterpret_cast<float *>(mine);
-    mine += l.maxima_bytes;
-    auto * sums = reinterpret_cast<double *>(mine);
     const Qkernel kernel = qkernel_b_unsigned();
     const std::int64_t key_panel = qpanel_bytes(a.d, kMr, qd);
     const std::int64_t value_panel = qpanel_bytes(l.lk_groups, kMr, qk);
     const std::int64_t query_panel = qpanel_bytes(a.d, kNr, qd);
     const std::int64_t weight_panel = qpanel_bytes(l.key_block, kNr, qk);
-    const auto head_of = [&](std::int64_t b, std::int64_t hk) {
-        return reinterpret_cast<std::uint8_t *>(base) + static_cast<std::size_t>(b * a.hk + hk) * l.head_bytes;
-    };
 
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<std::uint8_t> heads = buffer[l.heads];
+    const Elements<float> floats = buffer[l.floats];
+    const Elements<float> queries = buffer[l.queries];
+    const Elements<std::uint8_t> qqueries = buffer[l.qqueries];
+    const Elements<float> scores = buffer[l.scores];
+    const Elements<std::uint8_t> weights = buffer[l.weights];
+    const Elements<float> output = buffer[l.output];
+    const Elements<float> maxima = buffer[l.maxima];
+    const Elements<double> sums = buffer[l.sums];
+    const auto head_of = [&](std::int64_t b, std::int64_t hk) { return heads.part((b * a.hk + hk) * l.head, l.head); };
     // The keys and the values of every head: a panel of kMr keys, or of kMr
     // dimensions, to an item, packed in single precision and quantized.
     const std::int64_t key_panels = ceil_div(a.lk, kMr);
@@ -596,39 +700,26 @@ void compute_quantized(const ggml_compute_params * params, const Attention & a) 
         const std::int64_t panel = item % per_head;
         const std::int64_t b = head / a.hk;
         const std::int64_t hk = head % a.hk;
-        std::uint8_t * keys = head_of(b, hk);
+        const Elements<std::uint8_t> keys = head_of(b, hk);
         const Phase_scope scope(Phase::pack_weights);
         if (panel < key_panels) {
             const std::int64_t r0 = panel * kMr;
-            const char * src = a.k + b * a.knb3 + hk * a.knb2 + r0 * a.knb1;
-            const std::int64_t rows = std::min<std::int64_t>(kMr, a.lk - r0);
-            if (a.ktype == GGML_TYPE_F16) {
-                pack_rows_f16(floats, reinterpret_cast<const std::uint16_t *>(src), a.knb1, rows, 0, a.d, kMr);
-            }
-            else {
-                pack_rows_f32(floats, reinterpret_cast<const float *>(src), a.knb1, rows, 0, a.d, kMr);
-            }
-            quantize_panel_weights(keys + panel * key_panel, floats, a.d, kMr, qd);
+            pack_keys(floats, a, b, hk, r0, std::min<std::int64_t>(kMr, a.lk - r0), kMr);
+            quantize_panel_weights(keys.part(panel * key_panel, key_panel), floats, a.d, kMr, Qlayout::rows, qd);
         }
         else {
             const std::int64_t d0 = (panel - key_panels) * kMr;
-            const char * src = a.v + b * a.vnb3 + hk * a.vnb2;
+            const std::int64_t src = values_at(a, b, hk);
             const std::int64_t width = std::min<std::int64_t>(kMr, a.dv - d0);
             // The panel of kMr dimensions over the keys, [lk][kMr], zeros past
             // the last dimension and the last key.
             for (std::int64_t j = 0; j < l.lk_groups; ++j) {
-                float * out = floats + j * kMr;
                 for (std::int64_t i = 0; i < kMr; ++i) {
-                    float x = 0.0f;
-                    if (j < a.lk && i < width) {
-                        const char * p = src + j * a.vnb1;
-                        x = a.vtype == GGML_TYPE_F16 ? _cvtsh_ss(reinterpret_cast<const std::uint16_t *>(p)[d0 + i])
-                                                     : reinterpret_cast<const float *>(p)[d0 + i];
-                    }
-                    out[i] = x;
+                    floats[j * kMr + i] = j < a.lk && i < width ? value(a, src + j * a.vnb1 + d0 + i) : 0.0f;
                 }
             }
-            quantize_panel_weights(keys + l.keys_bytes + (panel - key_panels) * value_panel, floats, l.lk_groups, kMr, qk);
+            quantize_panel_weights(keys.part(l.keys + (panel - key_panels) * value_panel, value_panel), floats, l.lk_groups,
+                                   kMr, Qlayout::rows, qk);
         }
     }
     queue.barrier();
@@ -646,50 +737,48 @@ void compute_quantized(const ggml_compute_params * params, const Attention & a) 
         const std::int64_t q0 = block * a.queries;
         const std::int64_t nq = std::min(a.queries, a.lq - q0);
         const std::int64_t qpanels = ceil_div(nq, kNr);
-        const std::uint8_t * keys = head_of(b, hk);
-        const std::uint8_t * values = keys + l.keys_bytes;
+        const Elements<const std::uint8_t> keys = head_of(b, hk);
+        const Elements<const std::uint8_t> values = keys.from(l.keys);
 
         {
             // The queries, a panel of kNr, the scale of the softmax folded into
             // their scales and offsets.
             const Phase_scope scope(Phase::pack_inputs);
-            pack_rows_f32(queries, reinterpret_cast<const float *>(a.q + b * a.qnb3 + h * a.qnb2 + q0 * a.qnb1), a.qnb1,
-                          nq, 0, a.d, kNr);
+            pack_rows_f32(queries, a.q.from(b * a.qnb3 + h * a.qnb2 + q0 * a.qnb1), a.qnb1, nq, 0, a.d, kNr);
             for (std::int64_t qp = 0; qp < qpanels; ++qp) {
-                std::uint8_t * panel = qqueries + qp * query_panel;
-                quantize_panel_inputs(panel, queries + qp * a.d * kNr, a.d, kNr, qd);
-                float meta[2 * kNr];
-                std::memcpy(meta, panel + qd.quads * kNr * 4, sizeof meta);
+                const Elements<std::uint8_t> panel = qqueries.part(qp * query_panel, query_panel);
+                quantize_panel_inputs(panel, queries.part(qp * a.d * kNr, a.d * kNr), a.d, kNr, Qlayout::columns, qd);
+                std::array<float, 2 * kNr> meta{};
+                const Elements<std::uint8_t> where = panel.part(qd.quads * kNr * 4, 2 * kNr * 4);
+                read_floats(where, meta);
                 for (float & m : meta) {
                     m *= a.scale;
                 }
-                std::memcpy(panel + qd.quads * kNr * 4, meta, sizeof meta);
+                write_floats(where, meta);
             }
         }
         {
             // The scores, keys by queries, scaled; and each query's greatest.
             const Phase_scope scope(Phase::product);
             for (std::int64_t qp = 0; qp < qpanels; ++qp) {
-                float * panel = scores + qp * lk_padded * kNr;
+                const Elements<float> panel = scores.part(qp * lk_padded * kNr, lk_padded * kNr);
                 // Each tile's greatest taken while it is in the nearest cache.
-                float top[kNr];
-                for (int lane = 0; lane < kNr; ++lane) {
-                    top[lane] = -INFINITY;
-                }
+                std::array<float, kNr> top{};
+                fill_with(Elements<float>(top), -INFINITY);
                 for (std::int64_t kp = 0; kp < key_panels; ++kp) {
                     const std::int64_t rows = std::min<std::int64_t>(kMr, a.lk - kp * kMr);
-                    float * tile = panel + kp * kMr * kNr;
-                    qtile(kernel, 1, qd.quads, keys + kp * key_panel, qqueries + qp * query_panel, tile,
-                          kNr * static_cast<std::int64_t>(sizeof(float)), false, rows, kNr);
+                    const Elements<float> tile = panel.part(kp * kMr * kNr, kMr * kNr);
+                    qtile(kernel, 1, qd.quads, keys.part(kp * key_panel, key_panel),
+                          qqueries.part(qp * query_panel, query_panel), tile, kNr, false, rows, kNr);
                     for (std::int64_t j = 0; j < rows; ++j) {
-                        for (int lane = 0; lane < kNr; ++lane) {
-                            top[lane] = std::max(top[lane], tile[j * kNr + lane]);
+                        for (std::size_t lane = 0; lane < kNr; ++lane) {
+                            top[lane] = std::max(top[lane], tile[j * kNr + static_cast<std::int64_t>(lane)]);
                         }
                     }
                 }
-                for (int lane = 0; lane < kNr; ++lane) {
-                    maxima[qp * kNr + lane] = top[lane];
-                    sums[qp * kNr + lane] = 0;
+                for (std::size_t lane = 0; lane < kNr; ++lane) {
+                    maxima[qp * kNr + static_cast<std::int64_t>(lane)] = top[lane];
+                    sums[qp * kNr + static_cast<std::int64_t>(lane)] = 0;
                 }
             }
         }
@@ -700,27 +789,27 @@ void compute_quantized(const ggml_compute_params * params, const Attention & a) 
             {
                 const Phase_scope scope(Phase::softmax);
                 for (std::int64_t qp = 0; qp < qpanels; ++qp) {
-                    float * panel = scores + qp * lk_padded * kNr;
-                    exponentials(panel, j0, j1, maxima + qp * kNr, sums + qp * kNr);
-                    quantize_panel_inputs(weights + qp * weight_panel, panel + j0 * kNr, j1 - j0, kNr, qk);
+                    const Elements<float> panel = scores.part(qp * lk_padded * kNr, lk_padded * kNr);
+                    exponentials(panel, j0, j1, maxima.part(qp * kNr, kNr), sums.part(qp * kNr, kNr));
+                    quantize_panel_inputs(weights.part(qp * weight_panel, weight_panel), panel.part(j0 * kNr, (j1 - j0) * kNr),
+                                          j1 - j0, kNr, Qlayout::columns, qk);
                 }
             }
             const Phase_scope scope(Phase::product);
             const std::int64_t groups = ceil_div(j1 - j0, 4 * qk.quads);
-            const std::int64_t ldc = a.queries * static_cast<std::int64_t>(sizeof(float));
             for (std::int64_t dp = 0; dp < value_panels; ++dp) {
-                const std::uint8_t * v = values + dp * value_panel + (j0 / (4 * qk.quads)) * qgroup_bytes(qk.quads, kMr);
+                const Elements<const std::uint8_t> v =
+                    values.from(dp * value_panel + (j0 / (4 * qk.quads)) * qgroup_bytes(qk.quads, kMr));
                 for (std::int64_t qp = 0; qp < qpanels; ++qp) {
-                    qtile(kernel, groups, qk.quads, v, weights + qp * weight_panel, output + dp * kMr * a.queries + qp * kNr, ldc,
-                          j0 > 0, kMr, kNr);
+                    qtile(kernel, groups, qk.quads, v, weights.from(qp * weight_panel), output.from(dp * kMr * a.queries + qp * kNr),
+                          a.queries, j0 > 0, kMr, kNr);
                 }
             }
         }
         const Phase_scope scope(Phase::transform_out);
-        char * dst = a.out + b * a.onb3 + h * a.onb1;
         for (std::int64_t i = 0; i < nq; ++i) {
             const auto reciprocal = static_cast<float>(1.0 / sums[i]);
-            float * row = reinterpret_cast<float *>(dst + (q0 + i) * a.onb2);
+            const Elements<float> row = output_row(a, b, h, q0 + i);
             for (std::int64_t c = 0; c < a.dv; ++c) {
                 row[c] = output[c * a.queries + i] * reciprocal;
             }
@@ -730,41 +819,37 @@ void compute_quantized(const ggml_compute_params * params, const Attention & a) 
 
 }  // namespace
 
-bool attention_supported(const ggml_tensor * node) {
+bool attention_supported(const ggml_tensor * const node) {
     if (node->op != GGML_OP_FLASH_ATTN_EXT) {
         return false;
     }
-    const ggml_tensor * q = node->src[0];
-    const ggml_tensor * k = node->src[1];
-    const ggml_tensor * v = node->src[2];
-    float max_bias = 0;
-    float softcap = 0;
-    std::memcpy(&max_bias, &node->op_params[1], sizeof max_bias);
-    std::memcpy(&softcap, &node->op_params[2], sizeof softcap);
-    const auto kv_type = [](const ggml_tensor * t) { return t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16; };
+    const ggml_tensor * const q = node->src[0];
+    const ggml_tensor * const k = node->src[1];
+    const ggml_tensor * const v = node->src[2];
+    const float max_bias = std::bit_cast<float>(node->op_params[1]);
+    const float softcap = std::bit_cast<float>(node->op_params[2]);
+    const auto kv = [](const ggml_tensor * const t) {
+        return (t->type == GGML_TYPE_F32 && holds<float>(t)) || (t->type == GGML_TYPE_F16 && holds<std::uint16_t>(t));
+    };
     return node->src[3] == nullptr && node->src[4] == nullptr && max_bias == 0.0f && softcap == 0.0f &&
-           q->type == GGML_TYPE_F32 && kv_type(k) && kv_type(v) && q->nb[0] == sizeof(float) &&
-           k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
-           node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) && q->ne[0] == k->ne[0] &&
-           k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] && q->ne[2] % k->ne[2] == 0 && q->ne[3] == k->ne[3] &&
-           q->ne[3] == v->ne[3] && k->ne[1] >= 1;
+           holds<float>(q) && kv(k) && kv(v) && q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) &&
+           v->nb[0] == ggml_type_size(v->type) && holds<float>(node) && ggml_is_contiguous(node) && q->ne[0] == k->ne[0] &&
+           k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] && k->ne[2] > 0 && q->ne[2] % k->ne[2] == 0 &&
+           q->ne[3] == k->ne[3] && q->ne[3] == v->ne[3] && k->ne[1] >= 1;
 }
 
-std::size_t attention_work_size(const ggml_tensor * node, int n_threads) {
+std::size_t attention_work_size(const ggml_tensor * const node, int n_threads) {
     const Attention a = geometry(node);
     if (quantized_attention(a)) {
-        const Quantized_layout l = quantized_layout(a);
-        return kAlign + l.shared_bytes + l.thread_bytes * static_cast<std::size_t>(n_threads);
+        return quantized_layout(a).layout.bytes(n_threads);
     }
     if (on_amx(a)) {
-        const Amx_layout l = amx_layout(a);
-        return kAlign + l.shared_bytes + l.thread_bytes * static_cast<std::size_t>(n_threads);
+        return amx_layout(a).layout.bytes(n_threads);
     }
-    const Layout l = layout(a);
-    return kAlign + l.shared_bytes + l.thread_bytes * static_cast<std::size_t>(n_threads);
+    return layout(a).layout.bytes(n_threads);
 }
 
-void attention_compute(const ggml_compute_params * params, ggml_tensor * node) {
+void attention_compute(const ggml_compute_params * const params, const ggml_tensor * const node) {
     const Attention a = geometry(node);
     if (quantized_attention(a)) {
         compute_quantized(params, a);
@@ -775,22 +860,24 @@ void attention_compute(const ggml_compute_params * params, ggml_tensor * node) {
         return;
     }
     const Layout l = layout(a);
-    char * base = reinterpret_cast<char *>(align_up(reinterpret_cast<std::uintptr_t>(params->wdata)));
-    float * shared = reinterpret_cast<float *>(base);
-    char * mine = base + l.shared_bytes + l.thread_bytes * static_cast<std::size_t>(params->ith);
-    float * queries = reinterpret_cast<float *>(mine);
-    float * scores = reinterpret_cast<float *>(mine + l.queries_bytes);
-    float * output = reinterpret_cast<float *>(mine + l.queries_bytes + l.scores_bytes);
-    float * stretch_sum = reinterpret_cast<float *>(mine + l.queries_bytes + l.scores_bytes + l.output_bytes);
-    float * maxima = reinterpret_cast<float *>(mine + l.queries_bytes + l.scores_bytes + 2 * l.output_bytes);
-    auto * sums = reinterpret_cast<double *>(mine + l.queries_bytes + l.scores_bytes + 2 * l.output_bytes + l.maxima_bytes);
+    Work_buffer buffer(params, l.layout);
     const Microkernel uk = microkernel();
     const Scores_kernel sk = scores_kernel();
-    const auto keys_of = [&](std::int64_t b, std::int64_t hk) {
-        return shared + static_cast<std::size_t>(b * a.hk + hk) * (l.keys_floats + l.values_floats);
-    };
+    // Where the wide micro-kernel is taken (gemm.h), two panels of queries at
+    // a time, in both products: the scores and the sum of the values.
+    const Microkernel_wide wide = microkernel_wide();
+    const Scores_kernel_wide skw = scores_kernel_wide();
 
-    Work_queue queue(params);
+    Work_queue queue(params, buffer);
+    const Elements<float> heads = buffer[l.heads];
+    const Elements<float> queries = buffer[l.queries];
+    const Elements<float> scores = buffer[l.scores];
+    const Elements<float> output = buffer[l.output];
+    const Elements<float> stretch_sum = buffer[l.stretch_sum];
+    const Elements<float> maxima = buffer[l.maxima];
+    const Elements<double> sums = buffer[l.sums];
+    const std::int64_t head_floats = l.keys_floats + l.values_floats;
+    const auto keys_of = [&](std::int64_t b, std::int64_t hk) { return heads.part((b * a.hk + hk) * head_floats, head_floats); };
     // The keys and the values of every head, an item each.
     const std::int64_t pack_items = 2 * a.b * a.hk;
     int item = queue.next();
@@ -798,25 +885,20 @@ void attention_compute(const ggml_compute_params * params, ggml_tensor * node) {
         const std::int64_t head = item / 2;
         const std::int64_t b = head / a.hk;
         const std::int64_t hk = head % a.hk;
-        float * keys = keys_of(b, hk);
+        const Elements<float> keys = keys_of(b, hk);
         const Phase_scope scope(Phase::pack_weights);
         if (item % 2 == 0) {
-            const char * src = a.k + b * a.knb3 + hk * a.knb2;
-            if (a.ktype == GGML_TYPE_F16) {
-                pack_rows_f16(keys, reinterpret_cast<const std::uint16_t *>(src), a.knb1, a.lk, 0, a.d, kMr);
-            }
-            else {
-                pack_rows_f32(keys, reinterpret_cast<const float *>(src), a.knb1, a.lk, 0, a.d, kMr);
-            }
+            pack_keys(keys, a, b, hk, 0, a.lk, kMr);
         }
         else {
-            const char * src = a.v + b * a.vnb3 + hk * a.vnb2;
-            float * values = keys + l.keys_floats;
+            const std::int64_t src = values_at(a, b, hk);
+            const Elements<float> values = keys.from(l.keys_floats);
             if (a.vtype == GGML_TYPE_F16) {
-                pack_values<std::uint16_t>(values, src, a.vnb1, a.lk, a.dv, [](std::uint16_t x) { return _cvtsh_ss(x); });
+                pack_values<std::uint16_t>(values, a.v16.from(src), a.vnb1, a.lk, a.dv,
+                                           [](std::uint16_t x) { return static_cast<float>(std::bit_cast<_Float16>(x)); });
             }
             else {
-                pack_values<float>(values, src, a.vnb1, a.lk, a.dv, [](float x) { return x; });
+                pack_values<float>(values, a.v32.from(src), a.vnb1, a.lk, a.dv, [](float x) { return x; });
             }
         }
     }
@@ -837,13 +919,12 @@ void attention_compute(const ggml_compute_params * params, ggml_tensor * node) {
         const std::int64_t q0 = block * a.queries;
         const std::int64_t nq = std::min(a.queries, a.lq - q0);
         const std::int64_t qpanels = ceil_div(nq, kNr);
-        const float * keys = keys_of(b, hk);
-        const float * values = keys + l.keys_floats;
+        const Elements<const float> keys = keys_of(b, hk);
+        const Elements<const float> values = keys.from(l.keys_floats);
 
         {
             const Phase_scope scope(Phase::pack_inputs);
-            pack_rows_f32(queries, reinterpret_cast<const float *>(a.q + b * a.qnb3 + h * a.qnb2 + q0 * a.qnb1), a.qnb1,
-                          nq, 0, a.d, kNr);
+            pack_rows_f32(queries, a.q.from(b * a.qnb3 + h * a.qnb2 + q0 * a.qnb1), a.qnb1, nq, 0, a.d, kNr);
         }
         // The scores, keys by queries, scaled: a panel [lk][kNr] for each kNr
         // queries; and the largest score of each query.
@@ -860,39 +941,64 @@ void attention_compute(const ggml_compute_params * params, ggml_tensor * node) {
             // product, which sums 32 at a time.
             const std::int64_t stretches = ceil_div(a.d, a.sum_dims);
             const std::int64_t stretch = ceil_div(a.d, stretches);
-            const auto product = [&](const float * ka, const float * qb, float * s, bool scaled, float * top) {
+            const auto product = [&](Elements<const float> ka, Elements<const float> qb, Elements<float> s, bool scaled,
+                                     Elements<float> top) {
                 for (std::int64_t e0 = 0; e0 < a.d; e0 += stretch) {
                     const std::int64_t e = std::min(stretch, a.d - e0);
+                    const Elements<const float> pa = ka.part(e0 * kMr, e * kMr);
+                    const Elements<const float> pb = qb.part(e0 * kNr, e * kNr);
+                    SDASM_CHECK(s.size() >= kMr * kNr);
                     if (scaled && e0 + e == a.d) {
-                        sk(e, ka + e0 * kMr, qb + e0 * kNr, s, kNr * sizeof(float), top, a.scale, e0 > 0 ? 1 : 0);
+                        SDASM_CHECK(top.size() >= kNr);
+                        sk(e, pa.data(), pb.data(), s.data(), bytes_of<float>(kNr), top.data(), a.scale, e0 > 0 ? 1 : 0);
                     }
                     else {
-                        uk(e, ka + e0 * kMr, qb + e0 * kNr, s, kNr * sizeof(float), e0 > 0 ? 1 : 0);
+                        uk(e, pa.data(), pb.data(), s.data(), bytes_of<float>(kNr), e0 > 0 ? 1 : 0);
                     }
                 }
             };
+            // Two panels of queries, their tiles of the scores lk_padded kNr
+            // apart, a stretch of the dimensions at a time as above.
+            const auto product_wide = [&](Elements<const float> ka, Elements<const float> qb, Elements<float> s,
+                                          Elements<float> top) {
+                const std::int64_t q_next = a.d * kNr;
+                const std::int64_t s_next = lk_padded * kNr;
+                SDASM_CHECK(s.size() >= s_next + kMr * kNr && top.size() >= 2 * kNr);
+                for (std::int64_t e0 = 0; e0 < a.d; e0 += stretch) {
+                    const std::int64_t e = std::min(stretch, a.d - e0);
+                    const Elements<const float> pa = ka.part(e0 * kMr, e * kMr);
+                    const Elements<const float> pb = qb.part(e0 * kNr, q_next + e * kNr);
+                    const std::int64_t flags = (e0 > 0 ? 1 : 0) | (e0 + e == a.d ? 2 : 0);
+                    skw(e, pa.data(), pb.data(), bytes_of<float>(q_next), s.data(), bytes_of<float>(s_next),
+                        bytes_of<float>(kNr), top.data(), a.scale, flags);
+                }
+            };
+            const std::int64_t pairs = skw != nullptr ? qpanels / 2 : 0;
             const std::int64_t whole = a.lk / kMr;
             for (std::int64_t kp = 0; kp < whole; ++kp) {
-                const float * ka = keys + kp * kMr * a.d;
-                for (std::int64_t qp = 0; qp < qpanels; ++qp) {
-                    float * s = scores + qp * lk_padded * kNr + kp * kMr * kNr;
-                    product(ka, queries + qp * a.d * kNr, s, true, maxima + qp * kNr);
+                const Elements<const float> ka = keys.part(kp * kMr * a.d, kMr * a.d);
+                for (std::int64_t qp = 0; qp < 2 * pairs; qp += 2) {
+                    product_wide(ka, queries.from(qp * a.d * kNr), scores.from(qp * lk_padded * kNr + kp * kMr * kNr),
+                                 maxima.part(qp * kNr, 2 * kNr));
+                }
+                for (std::int64_t qp = 2 * pairs; qp < qpanels; ++qp) {
+                    const Elements<float> s = scores.part(qp * lk_padded * kNr + kp * kMr * kNr, kMr * kNr);
+                    product(ka, queries.part(qp * a.d * kNr, a.d * kNr), s, true, maxima.part(qp * kNr, kNr));
                 }
             }
             // The keys past the last kMr: their panel by the micro-kernel, and
             // then their scale and their maximum, which the zeros past them in
             // the panel have no part in.
             if (whole < panels_keys) {
-                const float * ka = keys + whole * kMr * a.d;
+                const Elements<const float> ka = keys.part(whole * kMr * a.d, kMr * a.d);
                 const std::int64_t rows = a.lk - whole * kMr;
                 for (std::int64_t qp = 0; qp < qpanels; ++qp) {
-                    float * s = scores + qp * lk_padded * kNr + whole * kMr * kNr;
-                    product(ka, queries + qp * a.d * kNr, s, false, nullptr);
+                    const Elements<float> s = scores.part(qp * lk_padded * kNr + whole * kMr * kNr, kMr * kNr);
+                    product(ka, queries.part(qp * a.d * kNr, a.d * kNr), s, false, Elements<float>());
                     for (std::int64_t i = 0; i < rows; ++i) {
-                        float * p = s + i * kNr;
-                        for (int lane = 0; lane < kNr; ++lane) {
-                            const float x = p[lane] * a.scale;
-                            p[lane] = x;
+                        for (std::int64_t lane = 0; lane < kNr; ++lane) {
+                            const float x = s[i * kNr + lane] * a.scale;
+                            s[i * kNr + lane] = x;
                             maxima[qp * kNr + lane] = std::max(maxima[qp * kNr + lane], x);
                         }
                     }
@@ -906,7 +1012,8 @@ void attention_compute(const ggml_compute_params * params, ggml_tensor * node) {
             {
                 const Phase_scope scope(Phase::softmax);
                 for (std::int64_t qp = 0; qp < qpanels; ++qp) {
-                    exponentials(scores + qp * lk_padded * kNr, j0, j1, maxima + qp * kNr, sums + qp * kNr);
+                    exponentials(scores.part(qp * lk_padded * kNr, lk_padded * kNr), j0, j1, maxima.part(qp * kNr, kNr),
+                                 sums.part(qp * kNr, kNr));
                 }
             }
             // The sum over the keys in three steps: a.sum_keys keys at a time in
@@ -915,15 +1022,17 @@ void attention_compute(const ggml_compute_params * params, ggml_tensor * node) {
             // to round more than ggml's dot product, which sums 32 at a time
             // and then the 32 sums.
             const Phase_scope scope(Phase::product);
-            float * into = j0 == 0 ? output : stretch_sum;
-            const std::int64_t ldc = a.queries * static_cast<std::int64_t>(sizeof(float));
+            const Elements<float> into = j0 == 0 ? output : stretch_sum;
+            const std::int64_t step = panel_step(wide) / kNr;
             for (std::int64_t dp = 0; dp < panels_dims; ++dp) {
-                for (std::int64_t qp = 0; qp < qpanels; ++qp) {
-                    float * o = into + dp * kMr * a.queries + qp * kNr;
+                for (std::int64_t qp = 0; qp < qpanels; qp += step) {
+                    const std::int64_t cols = std::min(step, qpanels - qp) * kNr;
+                    const Elements<float> o = into.from(dp * kMr * a.queries + qp * kNr);
                     for (std::int64_t k0 = j0; k0 < j1; k0 += a.sum_keys) {
-                        const float * va = values + dp * a.lk * kMr + k0 * kMr;
-                        const float * pb = scores + qp * lk_padded * kNr + k0 * kNr;
-                        uk(std::min(a.sum_keys, j1 - k0), va, pb, o, ldc, k0 > j0 ? 1 : 0);
+                        const std::int64_t count = std::min(a.sum_keys, j1 - k0);
+                        const Elements<const float> va = values.part(dp * a.lk * kMr + k0 * kMr, count * kMr);
+                        const Elements<const float> pb = scores.from(qp * lk_padded * kNr + k0 * kNr);
+                        tiles(uk, wide, count, va, pb, lk_padded * kNr, o, a.queries, k0 > j0, kMr, cols);
                     }
                 }
             }
@@ -938,10 +1047,9 @@ void attention_compute(const ggml_compute_params * params, ggml_tensor * node) {
         // reciprocal of the sum, rounded to single precision, as ggml's softmax
         // multiplies the exponentials by it.
         const Phase_scope scope(Phase::transform_out);
-        char * dst = a.out + b * a.onb3 + h * a.onb1;
         for (std::int64_t i = 0; i < nq; ++i) {
             const auto reciprocal = static_cast<float>(1.0 / sums[i]);
-            float * row = reinterpret_cast<float *>(dst + (q0 + i) * a.onb2);
+            const Elements<float> row = output_row(a, b, h, q0 + i);
             for (std::int64_t c = 0; c < a.dv; ++c) {
                 row[c] = output[c * a.queries + i] * reciprocal;
             }

@@ -26,33 +26,38 @@ namespace {
 
 enum class Op { none, conv2d, winograd, mul_mat, attention, group_norm, norm };
 
-Op taken(const ggml_tensor * node) {
+Op taken(const ggml_tensor * const node) {
     if (sdasm::kernels() == sdasm::Kernels::upstream) {
         return Op::none;
     }
-    switch (node->op) {
-    case GGML_OP_CONV_2D:
+    // ggml's operations are many, and this project takes a few of them: the
+    // rest go by.
+    const ggml_op op = node->op;
+    if (op == GGML_OP_CONV_2D) {
         if (sdasm::winograd_supported(node)) {
             return Op::winograd;
         }
         return sdasm::conv2d_supported(node) ? Op::conv2d : Op::none;
-    case GGML_OP_MUL_MAT:
-        return sdasm::mul_mat_supported(node) ? Op::mul_mat : Op::none;
-    case GGML_OP_FLASH_ATTN_EXT:
-        return sdasm::attention_supported(node) ? Op::attention : Op::none;
-    case GGML_OP_GROUP_NORM:
-        return sdasm::group_norm_supported(node) ? Op::group_norm : Op::none;
-    case GGML_OP_NORM:
-        return sdasm::norm_supported(node) ? Op::norm : Op::none;
-    default:
-        return Op::none;
     }
+    if (op == GGML_OP_MUL_MAT) {
+        return sdasm::mul_mat_supported(node) ? Op::mul_mat : Op::none;
+    }
+    if (op == GGML_OP_FLASH_ATTN_EXT) {
+        return sdasm::attention_supported(node) ? Op::attention : Op::none;
+    }
+    if (op == GGML_OP_GROUP_NORM) {
+        return sdasm::group_norm_supported(node) ? Op::group_norm : Op::none;
+    }
+    if (op == GGML_OP_NORM) {
+        return sdasm::norm_supported(node) ? Op::norm : Op::none;
+    }
+    return Op::none;
 }
 
 // Computes the node, and the chain after it when there is one; says how many
 // nodes of the graph that was, or 0 when the node is not taken.
-int compute(const ggml_compute_params * params, ggml_tensor * node, const sdasm::Epilogue & chain, int index,
-            const sdasm::Gated_gelu & gated = {}) {
+int compute(const ggml_compute_params * const params, const ggml_tensor * const node, const sdasm::Epilogue & chain,
+            int index, const sdasm::Gated_gelu & gated = {}) {
     if (gated.out != nullptr) {
         sdasm::mul_mat_compute_gated(params, node, chain, gated.out);
         return gated.last_node - index + 1;
@@ -85,19 +90,20 @@ int compute(const ggml_compute_params * params, ggml_tensor * node, const sdasm:
 
 }  // namespace
 
-extern "C" bool sdasm_compute_forward(const ggml_compute_params * params, ggml_tensor * node) {
+extern "C" bool sdasm_compute_forward(const ggml_compute_params * const params, const ggml_tensor * const node) {
     if (params->use_ref) {
         return false;
     }
     return compute(params, node, sdasm::Epilogue{}, 0) > 0;
 }
 
-extern "C" int sdasm_compute_nodes(const ggml_compute_params * params, const ggml_cgraph * graph, int index) {
-    if (params->use_ref) {
+extern "C" int sdasm_compute_nodes(const ggml_compute_params * const params, ggml_tensor * const * const nodes,
+                                   int n_nodes, int index) {
+    if (params->use_ref || nodes == nullptr || n_nodes <= 0 || index < 0 || index >= n_nodes) {
         return 0;
     }
-    auto * g = const_cast<ggml_cgraph *>(graph);
-    ggml_tensor * node = ggml_graph_node(g, index);
+    const sdasm::Graph_nodes graph = sdasm::graph_nodes(nodes, n_nodes);
+    const ggml_tensor * const node = sdasm::node_at(graph, index);
     // What the node writes was packed from nothing that is kept, or is not to
     // be kept any more (store.h).
     if (params->ith == 0 && node->data != nullptr) {
@@ -107,7 +113,7 @@ extern "C" int sdasm_compute_nodes(const ggml_compute_params * params, const ggm
     sdasm::Gated_gelu gated;
     // What a fused node writes in place of the node's own tensor, too.
     const auto forget_written = [&]() {
-        for (const ggml_tensor * t : {static_cast<const ggml_tensor *>(chain.redirect),
+        for (const ggml_tensor * const t : {static_cast<const ggml_tensor *>(chain.redirect),
                                       static_cast<const ggml_tensor *>(gated.out)}) {
             if (params->ith == 0 && t != nullptr && t->data != nullptr) {
                 sdasm::forget(t->data, ggml_nbytes(t));
@@ -151,12 +157,21 @@ extern "C" int sdasm_compute_nodes(const ggml_compute_params * params, const ggm
     const std::uint64_t start = sdasm_profile_now();
     const int count = compute(params, node, chain, index, gated);
     if (count > 0) {
-        sdasm::profile_busy(graph, node, count - 1, params->nth, static_cast<double>(sdasm_profile_now() - start) * 1e-9);
+        sdasm::profile_busy(n_nodes, node, count - 1, params->nth,
+                            static_cast<double>(sdasm_profile_now() - start) * 1e-9);
     }
     return count;
 }
 
-extern "C" bool sdasm_work_size(const ggml_tensor * node, int n_threads, size_t * size) {
+extern "C" int sdasm_token_downsampling(std::int64_t width, std::int64_t height) {
+    const sdasm::Tuning & t = sdasm::tuning();
+    if (t.todo < 2 || width <= 0 || height <= 0 || width * height < t.todo_tokens) {
+        return 1;
+    }
+    return t.todo;
+}
+
+extern "C" bool sdasm_work_size(const ggml_tensor * const node, int n_threads, size_t * const size) {
     switch (taken(node)) {
     case Op::conv2d:
         *size = sdasm::conv2d_work_size(node, n_threads);

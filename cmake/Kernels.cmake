@@ -28,6 +28,7 @@ add_library(sdasm STATIC
   "${PROJECT_SOURCE_DIR}/sources/fusion.cc"
   "${PROJECT_SOURCE_DIR}/sources/gemm.cc"
   "${PROJECT_SOURCE_DIR}/sources/hooks.cc"
+  "${PROJECT_SOURCE_DIR}/sources/memory.cc"
   "${PROJECT_SOURCE_DIR}/sources/microkernel.cc"
   "${PROJECT_SOURCE_DIR}/sources/mul_mat.cc"
   "${PROJECT_SOURCE_DIR}/sources/norm.cc"
@@ -40,14 +41,17 @@ if(SDASM_X86_64)
     "${PROJECT_SOURCE_DIR}/sources/x86_64/activation_avx2.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/activation_avx512.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/amx.S"
+    "${PROJECT_SOURCE_DIR}/sources/x86_64/amx_int8.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/amx_fp16.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/amx_single.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/amx_winograd.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/bf16_avx512.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/gemm_avx2.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/gemm_avx512.S"
+    "${PROJECT_SOURCE_DIR}/sources/x86_64/half.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/pack_avx2.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/quant_avx2.S"
+    "${PROJECT_SOURCE_DIR}/sources/x86_64/quant_maddubs.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/quant_avx512.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/quantize_avx2.S"
     "${PROJECT_SOURCE_DIR}/sources/x86_64/softmax_avx2.S"
@@ -77,3 +81,6 @@ set_property(TARGET sdasm PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 target_link_libraries(ggml-cpu PRIVATE sdasm)
 target_compile_definitions(stable-diffusion PRIVATE SD_USE_SDASM)
+# The library's blocks of attention include the kernels' header, sdasm.h
+# (patches/stable-diffusion.cpp/0004-...), which declares what they call.
+target_include_directories(stable-diffusion PRIVATE "${PROJECT_SOURCE_DIR}/sources")

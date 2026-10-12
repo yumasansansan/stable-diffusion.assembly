@@ -17,17 +17,22 @@
 // too, for the rate they run at.
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <map>
 #include <mutex>
+#include <print>
+#include <span>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "fusion.h"
 #include "kernels.h"
 #include "phases.h"
 #include "sdasm.h"
@@ -42,94 +47,89 @@ struct Entry {
     std::uint64_t count = 0;
     double busy = 0;  // the time threads spent in the kernels of this project, summed
     int threads = 0;
-    double phases[static_cast<int>(sdasm::Phase::count)] = {};  // nanoseconds, summed over threads
+    std::array<double, static_cast<std::size_t>(sdasm::Phase::count)> phases{};  // nanoseconds, summed over threads
 };
 
-thread_local std::uint64_t phase_cycles[static_cast<int>(sdasm::Phase::count)] = {};
+thread_local sdasm::Phase_times phase_cycles{};
 
-std::string shape(const ggml_tensor * t) {
+std::string shape(const ggml_tensor * const t) {
     if (t == nullptr) {
         return "-";
     }
-    char buffer[128];
-    std::snprintf(buffer, sizeof buffer, "%s[%lld,%lld,%lld,%lld]%s", ggml_type_name(t->type),
-                  static_cast<long long>(t->ne[0]), static_cast<long long>(t->ne[1]),
-                  static_cast<long long>(t->ne[2]), static_cast<long long>(t->ne[3]),
-                  ggml_is_contiguous(t) ? "" : "nc");
-    return buffer;
+    return std::format("{}[{},{},{},{}]{}", ggml_type_name(t->type), sdasm::extent(t, 0), sdasm::extent(t, 1),
+                       sdasm::extent(t, 2), sdasm::extent(t, 3), ggml_is_contiguous(t) ? "" : "nc");
 }
 
-double flops_of(const ggml_tensor * t) {
-    switch (t->op) {
-    case GGML_OP_MUL_MAT: {
-        const ggml_tensor * a = t->src[0];
-        const ggml_tensor * b = t->src[1];
+// The floating-point operations of the products; of the other operations,
+// none counted.
+double flops_of(const ggml_tensor * const t) {
+    if (t->op == GGML_OP_MUL_MAT) {
+        const ggml_tensor * const a = t->src[0];
+        const ggml_tensor * const b = t->src[1];
         return 2.0 * static_cast<double>(a->ne[0] * a->ne[1] * b->ne[1] * b->ne[2] * b->ne[3]);
     }
-    case GGML_OP_CONV_2D: {
-        const ggml_tensor * k = t->src[0];
+    if (t->op == GGML_OP_CONV_2D) {
+        const ggml_tensor * const k = t->src[0];
         return 2.0 * static_cast<double>(k->ne[0] * k->ne[1] * k->ne[2] * k->ne[3] * t->ne[0] * t->ne[1] * t->ne[3]);
     }
-    case GGML_OP_FLASH_ATTN_EXT: {
-        const ggml_tensor * q = t->src[0];
-        const ggml_tensor * k = t->src[1];
-        const ggml_tensor * v = t->src[2];
+    if (t->op == GGML_OP_FLASH_ATTN_EXT) {
+        const ggml_tensor * const q = t->src[0];
+        const ggml_tensor * const k = t->src[1];
+        const ggml_tensor * const v = t->src[2];
         return 2.0 * static_cast<double>(q->ne[1] * k->ne[1] * q->ne[2] * q->ne[3] * (q->ne[0] + v->ne[0]));
     }
-    default:
-        return 0;
-    }
+    return 0;
 }
+
+void write_profile();
 
 class Profile {
 public:
     Profile() {
-        const char * value = std::getenv("SDASM_PROFILE");
+        const char * const value = std::getenv("SDASM_PROFILE");
         enabled_ = value != nullptr && *value != '\0' && *value != '0';
+        if (enabled_ && std::atexit(write_profile) != 0) {
+            std::print(stderr, "stable-diffusion.assembly: SDASM_PROFILE is set, and the profile cannot be written at the end\n");
+        }
     }
     Profile(const Profile &) = delete;
     Profile & operator=(const Profile &) = delete;
-    ~Profile() {
-        if (enabled_) {
-            write();
-        }
-    }
 
     bool enabled() const { return enabled_; }
 
-    void node(int graph_nodes, const ggml_tensor * node, int fused, double seconds) {
+    void node(int graph_nodes, const ggml_tensor * const node, int fused, double seconds) {
         const std::string op = op_of(graph_nodes, node, fused);
         const std::string key = shape_of(graph_nodes, node, fused);
         const double f = flops_of(node);
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> const lock(mutex_);
         add(by_shape_[key], seconds, f);
         add(by_op_[op], seconds, f);
     }
 
     // A thread's time in the kernels of this project for a node, which against
     // the node's time on every thread says how long they waited for each other.
-    void busy(int graph_nodes, const ggml_tensor * node, int fused, int threads, double seconds) {
-        std::uint64_t cycles[static_cast<int>(sdasm::Phase::count)];
+    void busy(int graph_nodes, const ggml_tensor * const node, int fused, int threads, double seconds) {
+        sdasm::Phase_times cycles{};
         sdasm::phases_take(cycles);
         const std::string op = op_of(graph_nodes, node, fused);
         const std::string key = shape_of(graph_nodes, node, fused);
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (Entry * e : {&by_op_[op], &by_shape_[key]}) {
+        std::lock_guard<std::mutex> const lock(mutex_);
+        for (Entry * const e : {&by_op_[op], &by_shape_[key]}) {
             e->busy += seconds;
             e->threads = threads;
-            for (int i = 0; i < static_cast<int>(sdasm::Phase::count); ++i) {
+            for (std::size_t i = 0; i < cycles.size(); ++i) {
                 e->phases[i] += static_cast<double>(cycles[i]);
             }
         }
     }
 
     void graph(int graph_nodes, double seconds) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> const lock(mutex_);
         add(by_graph_[graph_nodes], seconds, 0);
     }
 
 private:
-    static std::string op_of(int graph_nodes, const ggml_tensor * node, int fused) {
+    static std::string op_of(int graph_nodes, const ggml_tensor * const node, int fused) {
         std::string op = std::to_string(graph_nodes) + "|" + ggml_op_desc(node);
         if (fused > 0) {
             op += "+" + std::to_string(fused);
@@ -137,7 +137,7 @@ private:
         return op;
     }
 
-    static std::string shape_of(int graph_nodes, const ggml_tensor * node, int fused) {
+    static std::string shape_of(int graph_nodes, const ggml_tensor * const node, int fused) {
         std::string key = op_of(graph_nodes, node, fused) + " " + shape(node) + " <- " + shape(node->src[0]) + " , " +
                           shape(node->src[1]);
         if (node->src[2] != nullptr) {
@@ -150,18 +150,18 @@ private:
     void write_phases(const Entry & e, int indent) const {
         const double busy_cycles = e.busy * 1e9;
         double timed = 0;
-        for (double c : e.phases) {
+        for (const double c : e.phases) {
             timed += c;
         }
         if (timed > 0 && busy_cycles > 0) {
-            std::fprintf(stderr, "  %*s", indent, "");
-            for (int i = 0; i < static_cast<int>(sdasm::Phase::count); ++i) {
+            std::print(stderr, "  {}", std::string(static_cast<std::size_t>(indent), ' '));
+            for (std::size_t i = 0; i < e.phases.size(); ++i) {
                 if (e.phases[i] > 0) {
-                    std::fprintf(stderr, " %s %.1f%%", sdasm::phase_name(static_cast<sdasm::Phase>(i)),
-                                 100.0 * e.phases[i] / busy_cycles);
+                    std::print(stderr, " {} {:.1f}%", sdasm::phase_name(static_cast<sdasm::Phase>(i)),
+                               100.0 * e.phases[i] / busy_cycles);
                 }
             }
-            std::fprintf(stderr, " untimed %.1f%%\n", 100.0 * (busy_cycles - timed) / busy_cycles);
+            std::print(stderr, " untimed {:.1f}%\n", 100.0 * (busy_cycles - timed) / busy_cycles);
         }
     }
 
@@ -183,44 +183,45 @@ private:
         return list;
     }
 
+public:
     void write() {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> const lock(mutex_);
         double total = 0;
         for (const auto & [nodes, entry] : by_graph_) {
             total += entry.seconds;
         }
-        std::fprintf(stderr, "\n==== SDASM_PROFILE: %.3f s computing graphs ====\n", total);
+        std::print(stderr, "\n==== SDASM_PROFILE: {:.3f} s computing graphs ====\n", total);
         for (const auto & [nodes, entry] : by_graph_) {
-            std::fprintf(stderr, "\n-- graph of %d nodes: %.3f s in %llu runs --\n", nodes, entry.seconds,
-                         static_cast<unsigned long long>(entry.count));
+            std::print(stderr, "\n-- graph of {} nodes: {:.3f} s in {} runs --\n", nodes, entry.seconds, entry.count);
             const std::string prefix = std::to_string(nodes) + "|";
             for (const auto & [op, e] : of_graph(by_op_, prefix)) {
-                std::fprintf(stderr, "  %-24s %9.3f s %5.1f%% %8llu calls", op.c_str(), e.seconds,
-                             100.0 * e.seconds / entry.seconds, static_cast<unsigned long long>(e.count));
+                std::print(stderr, "  {:<24} {:9.3f} s {:5.1f}% {:8} calls", op, e.seconds, 100.0 * e.seconds / entry.seconds,
+                           e.count);
                 if (e.flops > 0) {
-                    std::fprintf(stderr, "  %7.1f GFLOP/s", e.flops / e.seconds * 1e-9);
+                    std::print(stderr, "  {:7.1f} GFLOP/s", e.flops / e.seconds * 1e-9);
                 }
                 if (e.threads > 0) {
-                    std::fprintf(stderr, "  threads busy %5.1f%%", 100.0 * e.busy / (e.seconds * e.threads));
+                    std::print(stderr, "  threads busy {:5.1f}%", 100.0 * e.busy / (e.seconds * e.threads));
                 }
-                std::fprintf(stderr, "\n");
+                std::print(stderr, "\n");
                 write_phases(e, 24);
             }
-            std::fprintf(stderr, "  by operands:\n");
+            std::print(stderr, "  by operands:\n");
             const auto shapes = of_graph(by_shape_, prefix);
             for (std::size_t i = 0; i < shapes.size() && i < 40; ++i) {
                 const auto & [what, e] = shapes[i];
-                std::fprintf(stderr, "  %8.3f s %5.1f%% %6llu x  %s", e.seconds, 100.0 * e.seconds / entry.seconds,
-                             static_cast<unsigned long long>(e.count), what.c_str());
+                std::print(stderr, "  {:8.3f} s {:5.1f}% {:6} x  {}", e.seconds, 100.0 * e.seconds / entry.seconds, e.count,
+                           what);
                 if (e.flops > 0) {
-                    std::fprintf(stderr, "  %.1f GFLOP/s", e.flops / e.seconds * 1e-9);
+                    std::print(stderr, "  {:.1f} GFLOP/s", e.flops / e.seconds * 1e-9);
                 }
-                std::fprintf(stderr, "\n");
+                std::print(stderr, "\n");
                 write_phases(e, 30);
             }
         }
     }
 
+private:
     bool enabled_ = false;
     std::mutex mutex_;
     std::map<std::string, Entry> by_shape_;
@@ -228,9 +229,17 @@ private:
     std::map<int, Entry> by_graph_;
 };
 
+// The profile is never destroyed -- the threads of a pool may still be about
+// when the program ends -- and what it has summed is written out when the
+// program ends, by write_profile(), which its constructor has std::atexit()
+// call.
 Profile & profile() {
-    static Profile p;
+    [[clang::no_destroy]] static Profile p;
     return p;
+}
+
+void write_profile() {
+    profile().write();
 }
 
 }  // namespace
@@ -247,9 +256,8 @@ std::uint64_t sdasm_profile_now(void) {
                                           .count());
 }
 
-void sdasm_profile_node(const ggml_cgraph * graph, const ggml_tensor * node, int fused, std::uint64_t nanoseconds) {
-    profile().node(ggml_graph_n_nodes(const_cast<ggml_cgraph *>(graph)), node, fused,
-                   static_cast<double>(nanoseconds) * 1e-9);
+void sdasm_profile_node(int n_nodes, const ggml_tensor * const node, int fused, std::uint64_t nanoseconds) {
+    profile().node(n_nodes, node, fused, static_cast<double>(nanoseconds) * 1e-9);
 }
 
 }  // extern "C"
@@ -284,55 +292,59 @@ bool phases_enabled() {
 }
 
 void phase_add(Phase p, std::uint64_t cycles) {
-    phase_cycles[static_cast<int>(p)] += cycles;
+    phase_cycles.at(static_cast<std::size_t>(p)) += cycles;
 }
 
-void phases_take(std::uint64_t (&cycles)[static_cast<int>(Phase::count)]) {
-    for (int i = 0; i < static_cast<int>(Phase::count); ++i) {
-        cycles[i] = phase_cycles[i];
-        phase_cycles[i] = 0;
-    }
+void phases_take(Phase_times & cycles) {
+    cycles = phase_cycles;
+    phase_cycles = {};
 }
 
-void profile_busy(const ggml_cgraph * graph, const ggml_tensor * node, int fused, int threads, double seconds) {
-    profile().busy(ggml_graph_n_nodes(const_cast<ggml_cgraph *>(graph)), node, fused, threads, seconds);
+void profile_busy(int n_nodes, const ggml_tensor * const node, int fused, int threads, double seconds) {
+    profile().busy(n_nodes, node, fused, threads, seconds);
 }
 
 }  // namespace sdasm
 
 extern "C" {
 
-void sdasm_profile_graph(const ggml_cgraph * graph, std::uint64_t nanoseconds) {
-    auto * g = const_cast<ggml_cgraph *>(graph);
-    const int n = ggml_graph_n_nodes(g);
+void sdasm_profile_graph(ggml_tensor * const * const nodes, int n_nodes, std::uint64_t nanoseconds) {
+    if (nodes == nullptr || n_nodes <= 0) {
+        return;
+    }
+    const sdasm::Graph_nodes graph = sdasm::graph_nodes(nodes, n_nodes);
+    const int n = n_nodes;
     // SDASM_PROFILE=graph writes out the nodes of each graph the first time a
     // graph of its size is computed, with the nodes each takes its operands
     // from, for the fusions to be read off.
-    static std::mutex mutex;
-    static std::map<int, bool> written;
-    const char * value = std::getenv("SDASM_PROFILE");
+    [[clang::no_destroy]] static std::mutex mutex;
+    [[clang::no_destroy]] static std::map<int, bool> written;
+    const char * const value = std::getenv("SDASM_PROFILE");
     if (value != nullptr && std::string(value) == "graph") {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::lock_guard<std::mutex> const lock(mutex);
         if (!written[n]) {
             written[n] = true;
             std::map<const ggml_tensor *, int> index;
             for (int i = 0; i < n; ++i) {
-                index[ggml_graph_node(g, i)] = i;
+                index[sdasm::node_at(graph, i)] = i;
             }
-            std::fprintf(stderr, "== graph of %d nodes\n", n);
+            std::print(stderr, "== graph of {} nodes\n", n);
             for (int i = 0; i < n; ++i) {
-                const ggml_tensor * t = ggml_graph_node(g, i);
-                std::fprintf(stderr, "%5d %-16s %s", i, ggml_op_desc(t), shape(t).c_str());
-                for (int s = 0; s < 4 && t->src[s] != nullptr; ++s) {
-                    const auto it = index.find(t->src[s]);
+                const ggml_tensor * const t = sdasm::node_at(graph, i);
+                std::print(stderr, "{:5} {:<16} {}", i, ggml_op_desc(t), shape(t));
+                for (const ggml_tensor * const source : std::span(t->src).first(4)) {
+                    if (source == nullptr) {
+                        break;
+                    }
+                    const auto it = index.find(source);
                     if (it != index.end()) {
-                        std::fprintf(stderr, " <%d>", it->second);
+                        std::print(stderr, " <{}>", it->second);
                     }
                     else {
-                        std::fprintf(stderr, " %s", shape(t->src[s]).c_str());
+                        std::print(stderr, " {}", shape(source));
                     }
                 }
-                std::fprintf(stderr, "%s\n", t->view_src != nullptr ? " (view)" : "");
+                std::print(stderr, "{}\n", t->view_src != nullptr ? " (view)" : "");
             }
         }
     }

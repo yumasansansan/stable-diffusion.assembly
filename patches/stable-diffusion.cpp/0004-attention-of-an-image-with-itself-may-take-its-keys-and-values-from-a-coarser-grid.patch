@@ -1,0 +1,97 @@
+SPDX-FileCopyrightText: 2023-2026 leejet and the stable-diffusion.cpp contributors
+SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+SPDX-License-Identifier: MIT AND GPL-3.0-or-later
+
+Attention of an image with itself may take its keys and values from a coarser grid
+
+A SpatialTransformer lays its image of w by h out as w h tokens, row after row, and its blocks run with the grid recorded in the runner's context (token_width, token_height). With SD_USE_SDASM defined, as stable-diffusion.assembly defines it for the library, a CrossAttention of the tokens with themselves asks stable-diffusion.assembly by how much to coarsen the grid (sdasm_token_downsampling(), which the run's SDASM_TUNE=todo=2 or 3 sets, for grids of todo_tokens tokens or more): by more than 1, its keys and values are those of the tokens at every factor-th column of every factor-th row, the token nearest each point of the coarser grid, and its queries every token -- ToDo (Smith, Saxena and Saha, Token Downsampling for Efficient Generation of High-Resolution Images, IJCAI 2024), which takes the keys and values by nearest-neighbour downsampling. The coarse tokens are taken before the keys' and the values' projections, which then project a factor squared fewer of them. Without SD_USE_SDASM, or by 1, attention is as it was.
+
+The block includes stable-diffusion.assembly's header (sources/sdasm.h), which the project gives the library, so that the compiler holds the call to the function's declaration.
+
+This is stable-diffusion.assembly's own patch, applied to the submodule by cmake/Patches.cmake when CMake configures, after patch 0003; it is not for upstream. stable-diffusion.cpp's part is under the MIT License, and the patch's under the GNU General Public License, version 3 or any later version.
+
+diff --git a/src/core/ggml_runner.h b/src/core/ggml_runner.h
+--- a/src/core/ggml_runner.h
++++ b/src/core/ggml_runner.h
+@@ -78,6 +78,12 @@
+     bool circular_y_enabled                                          = false;
+     ggml_tensor* ip_context                                          = nullptr;
+     float ip_scale                                                   = 1.0f;
++    // The grid of the image's tokens, width by height, where a block that
++    // lays them out from an image is running (SpatialTransformer), 0 by 0
++    // elsewhere: for attention of the tokens with themselves, whose keys and
++    // values stable-diffusion.assembly may take from a coarser grid.
++    int64_t token_width                                              = 0;
++    int64_t token_height                                             = 0;
+     std::shared_ptr<WeightAdapter> weight_adapter                    = nullptr;
+     std::vector<std::pair<ggml_tensor*, std::string>>* debug_tensors = nullptr;
+     std::function<ggml_tensor*(const std::string&)> get_cache_tensor;
+diff --git a/src/model/common/block.hpp b/src/model/common/block.hpp
+--- a/src/model/common/block.hpp
++++ b/src/model/common/block.hpp
+@@ -7,6 +7,23 @@
+ #include "ggml-backend.h"
+ #include "model/common/ggml_block.hpp"
+ 
++#ifdef SD_USE_SDASM
++#include "sdasm.h"
++
++// The tokens of a grid of w by h, x [N, w * h, C], at every factor-th column
++// of every factor-th row from the first: [N, ceil(w / factor) * ceil(h /
++// factor), C], the token nearest each point of the coarser grid.
++static inline ggml_tensor* sdasm_coarser_tokens(ggml_context* ctx, ggml_tensor* x, int64_t w, int64_t h, int factor) {
++    const int64_t c     = x->ne[0];
++    const int64_t n     = x->ne[2];
++    const int64_t w2    = (w + factor - 1) / factor;
++    const int64_t h2    = (h + factor - 1) / factor;
++    ggml_tensor* grid   = ggml_reshape_4d(ctx, x, c, w, h, n);
++    ggml_tensor* coarse = ggml_view_4d(ctx, grid, c, w2, h2, n, factor * grid->nb[1], factor * grid->nb[2], grid->nb[3], 0);
++    return ggml_reshape_3d(ctx, ggml_cont(ctx, coarse), c, w2 * h2, n);
++}
++#endif
++
+ class DownSampleBlock : public GGMLBlock {
+ protected:
+     int channels;
+@@ -375,8 +392,24 @@
+             // LOG_VERBOSE("CrossAttention: temp set dim to 1024 for sdxs_09");
+             context->ne[0] = 1024;  // patch dim
+         }
++#ifdef SD_USE_SDASM
++        // Attention of an image's tokens with themselves takes its keys and
++        // values from a coarser grid of the tokens when the run asks for it
++        // (stable-diffusion.assembly's sdasm_token_downsampling(): ToDo, Smith
++        // et al., 2024); the queries stay every token.
++        ggml_tensor* source = context;
++        if (context == x && !xtra_dim && ctx->token_width * ctx->token_height == n_token) {
++            const int factor = sdasm_token_downsampling(ctx->token_width, ctx->token_height);
++            if (factor > 1) {
++                source = sdasm_coarser_tokens(ctx->ggml_ctx, x, ctx->token_width, ctx->token_height, factor);
++            }
++        }
++        auto k = to_k->forward(ctx, source);  // [N, n_context, inner_dim]
++        auto v = to_v->forward(ctx, source);  // [N, n_context, inner_dim]
++#else
+         auto k = to_k->forward(ctx, context);  // [N, n_context, inner_dim]
+         auto v = to_v->forward(ctx, context);  // [N, n_context, inner_dim]
++#endif
+         if (xtra_dim) {
+             context->ne[0] = 320;  // reset dim to orig
+         }
+@@ -554,12 +587,16 @@
+             x = ggml_reshape_3d(ctx->ggml_ctx, x, inner_dim, w * h, n);                // [N, h * w, inner_dim]
+         }
+ 
++        ctx->token_width  = w;
++        ctx->token_height = h;
+         for (int i = 0; i < depth; i++) {
+             std::string name       = "transformer_blocks." + std::to_string(i);
+             auto transformer_block = std::dynamic_pointer_cast<BasicTransformerBlock>(blocks[name]);
+ 
+             x = transformer_block->forward(ctx, x, context);
+         }
++        ctx->token_width  = 0;
++        ctx->token_height = 0;
+ 
+         if (use_linear) {
+             // proj_out

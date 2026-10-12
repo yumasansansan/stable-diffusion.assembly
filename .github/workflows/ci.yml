@@ -19,6 +19,11 @@
 # are built for the processor of the runner, native, since they are made, tested
 # and thrown away in one job.
 #
+# The tidy job checks this project's sources with clang-tidy (.clang-tidy,
+# ci/tidy.sh): no pointer cast to another type, no const cast away, no cast of
+# C's, no pointer arithmetic, no pointer made from an integer, and the bugs
+# clang-tidy knows of.
+#
 # The reuse job checks with reuse lint, from Ubuntu's reuse package, that every
 # file names its copyright holders and license (see REUSE.toml and LICENSES/).
 
@@ -108,6 +113,33 @@ jobs:
 
       - name: Test
         run: bash ci/test.sh "${{ matrix.preset }}"
+
+  tidy:
+    name: clang-tidy (ubuntu-26.04)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out
+        run: |
+          git config --global core.autocrlf false
+          git -c init.defaultBranch=main init --quiet
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --quiet origin "$GITHUB_SHA"
+          git checkout --quiet --detach "$GITHUB_SHA"
+          git submodule update --init --depth 1 --jobs 4
+          git -C thirdparty/stable-diffusion.cpp submodule update --init --depth 1 --jobs 4 \
+            ggml thirdparty/libwebp thirdparty/libwebm
+          git log -1 --format='%H %s'
+
+      - name: Set up the toolchain
+        run: bash ci/setup.sh
+
+      - name: Configure
+        run: cmake --preset debug -DSDASM_BUILD_TESTS=ON -DSDASM_BUILD_TOOLS=ON
+
+      - name: Check the sources
+        run: bash ci/tidy.sh build/debug
 
   reuse:
     name: REUSE compliance

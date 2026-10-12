@@ -97,11 +97,11 @@ set(SDASM_SANITIZERS "" CACHE STRING "Sanitizers to build with, comma-separated 
 function(sdasm_set_language_standard target)
   set_target_properties("${target}" PROPERTIES
     C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
-    CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+    CXX_STANDARD 26 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 endfunction()
 
 # No file of this project is a C++ module, and none imports one. Left alone,
-# CMake scans every C++23 source for modules: work for a build to do and nothing
+# CMake scans every C++26 source for modules: work for a build to do and nothing
 # for it to find.
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
@@ -247,6 +247,10 @@ if(SDASM_SANITIZERS)
       "SDASM_SANITIZERS names both address and thread, which cannot be built together.")
   endif()
   message(STATUS "Sanitizers: ${SDASM_SANITIZERS}")
+  # The C++ library's checks, too: of every index into its containers and its
+  # spans -- this project's own (memory.h) among them -- of every precondition
+  # it can check cheaply.
+  add_compile_definitions("$<$<COMPILE_LANGUAGE:CXX>:_GLIBCXX_ASSERTIONS>")
   add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fsanitize=${SDASM_SANITIZERS}>"
     "$<$<COMPILE_LANGUAGE:C,CXX>:-fno-sanitize-recover=all>"
     "$<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>")
@@ -260,22 +264,33 @@ endif()
 # --------------------------------------------------------------------------
 # Warnings, for this project's own sources
 #
+# Every warning Clang has (-Weverything), new ones as Clang adds them, but for
+# those that are not about the code at all:
+#
+#  - that it would not compile as an older C or C++ -- the standards are C23
+#    and C++26 (-Wc++98-compat and the -Wpre-c++NN-compat, -Wpre-cNN-compat);
+#  - where a structure has padding (-Wpadded), which says where the compiler
+#    inserts it, not that anything is wrong;
+#  - -Wswitch-default, which wants a default label in every switch: a switch
+#    over an enumeration of this project's names every value and has none, so
+#    that -Wswitch tells of a value added and not handled, and
+#    -Wcovered-switch-default, which stays, holds it to that.
+#
+# -Wunsafe-buffer-usage among the rest: no pointer arithmetic, no index into an
+# array of C's, no call of a function of the C library that writes or reads
+# through a pointer and a length, in the sources. Memory is reached through
+# spans (memory.h), and the few places that are handed a pointer by another's
+# code -- ggml's, the C library's, the C++ kernels', which take the pointers of
+# the kernels written by hand -- say so, each in a block of its own
+# (#pragma clang unsafe_buffer_usage).
+#
 # stable-diffusion.cpp and ggml keep their own warnings; the headers of theirs
 # that this project includes are system headers to it.
-set(SDASM_WARNING_FLAGS -Wall -Wextra -Wpedantic
-  -Wconversion -Wdouble-promotion -Wshadow-all -Wcast-qual -Wcast-align
-  -Wformat=2 -Wformat-signedness -Wimplicit-fallthrough -Wundef
-  -Wunreachable-code -Wcomma -Wmissing-prototypes
-  -Wmissing-variable-declarations -Wdeprecated -Wmultichar
-  -Wfour-char-constants -Wextra-semi -Wextra-semi-stmt -Wnewline-eof
-  -Wzero-as-null-pointer-constant
-  $<$<COMPILE_LANGUAGE:CXX>:-Wold-style-cast>
-  $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>
-  $<$<COMPILE_LANGUAGE:CXX>:-Woverloaded-virtual>
-  $<$<COMPILE_LANGUAGE:CXX>:-Wsuggest-override>
-  $<$<COMPILE_LANGUAGE:CXX>:-Wundefined-func-template>
-  $<$<COMPILE_LANGUAGE:CXX>:-Wunused-member-function>
-  $<$<COMPILE_LANGUAGE:CXX>:-Wunused-template>)
+set(SDASM_WARNING_FLAGS -Weverything
+  -Wno-c++98-compat-pedantic -Wno-pre-c++14-compat-pedantic -Wno-pre-c++17-compat-pedantic
+  -Wno-pre-c++20-compat-pedantic -Wno-pre-c++23-compat-pedantic -Wno-pre-c++26-compat-pedantic
+  -Wno-pre-c11-compat -Wno-pre-c23-compat -Wno-pre-c2y-compat
+  -Wno-padded -Wno-switch-default)
 if(SDASM_WERROR)
   list(APPEND SDASM_WARNING_FLAGS -Werror)
 else()
@@ -296,8 +311,15 @@ endfunction()
 # which needs pnpm, for the CPU alone; ggml's choice of instructions follows
 # SDASM_ARCH. ggml's own fast paths for matrix products of other libraries
 # (llamafile's sgemm, BLAS) stay off, as stable-diffusion.cpp has them: the
-# kernels of this project take the products in their place. OpenMP runs ggml's
-# threads, as it does by default where the compiler has it.
+# kernels of this project take the products in their place.
+#
+# ggml's threads run on ggml's own pool, not on OpenMP, which it would take by
+# default where the compiler has it: one library fewer to depend on, for
+# nothing -- an image of SD 1.5 samples and decodes as fast on either (on the
+# i7-1360P, 31.09 s against 30.88 s for eight steps and 3.37 s against 3.48 s
+# for the decoder, the mean of six runs each, the same image) -- and a pool
+# whose synchronisation the sanitizers see, as they cannot see the OpenMP
+# runtime's, which they do not instrument.
 include(Patches)
 
 set(SD_BUILD_EXAMPLES ON CACHE BOOL "" FORCE)
@@ -306,12 +328,7 @@ set(SD_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(GGML_LLAMAFILE OFF CACHE BOOL "" FORCE)
 set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
-# The thread sanitizer sees only the synchronisation of what it instruments, and
-# OpenMP's runtime is not instrumented: a build with it runs ggml's threads on
-# ggml's own pool, whose barrier is atomics the sanitizer reads.
-if("thread" IN_LIST SDASM_SANITIZER_LIST)
-  set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
-endif()
+set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 if(SDASM_ARCH STREQUAL "native")
   set(GGML_NATIVE ON CACHE BOOL "" FORCE)
 else()

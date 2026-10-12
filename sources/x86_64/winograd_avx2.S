@@ -64,6 +64,8 @@
 .set J_CHANNELS, 48
 .set J_MASKS, 56
 .set J_SUBTRACT, 64
+.set J_A_OFFSET, 80               // bytes from row A to the tiles' first input
+.set J_B_OFFSET, 88
 
 // Eight numbers of a row at [\row + 4 * \offset] into ymm\v, masked by the
 // mask of the load, the \index-th of eight at [r11], or not masked.
@@ -122,8 +124,13 @@ sdasm_winograd_inputs_avx2:
         mov rax, [rdi + J_DST]
         mov rdx, [rdi + J_STRIDE]
         lea r10, [rdx + 2*rdx]
+        // The rows at the tiles' first inputs, which may lie before the
+        // rows: the addresses are formed here, and nothing outside the
+        // image is read (the masks).
         mov rsi, [rdi + J_A]
+        add rsi, [rdi + J_A_OFFSET]
         mov rcx, [rdi + J_B]
+        add rcx, [rdi + J_B_OFFSET]
         mov r8, [rdi + J_CHANNELS]
         mov r11, [rdi + J_MASKS]
         vxorps xmm14, xmm14, xmm14

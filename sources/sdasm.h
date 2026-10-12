@@ -10,9 +10,11 @@
  * What ggml's CPU backend calls, with this project's patch
  * (patches/ggml/0001-...): before it computes an operation itself, it offers
  * the operation here, and when it plans a graph, it asks how much of its work
- * buffer the operations taken here need. The patch declares these two functions
- * itself, so that ggml needs no include path of this project's; this header is
- * for the project's own sources, and says the same.
+ * buffer the operations taken here need. The backend includes this header --
+ * the project builds its code into the backend, and gives it this directory --
+ * so that the compiler holds ggml's calls and the definitions here to the same
+ * declarations. ggml.c and ggml-backend.cpp, which build without the project,
+ * declare sdasm_forget() themselves (patch 0004), as it is declared here.
  */
 
 #ifndef SDASM_SDASM_H
@@ -26,7 +28,6 @@
 extern "C" {
 #endif
 
-struct ggml_cgraph;
 struct ggml_compute_params;
 struct ggml_tensor;
 
@@ -34,35 +35,47 @@ struct ggml_tensor;
  * returns false, on every thread alike, when the node is not one this project
  * takes; ggml then computes it as it would have. Every thread of the pool calls
  * it for every node, as ggml's own kernels are called. */
-bool sdasm_compute_forward(const struct ggml_compute_params * params, struct ggml_tensor * node);
+bool sdasm_compute_forward(const struct ggml_compute_params * const params, const struct ggml_tensor * const node);
 
-/* Computes node <index> of <graph> on the thread params->ith of params->nth,
- * with the nodes after it that change its output in place (fusion.h), and
- * returns how many nodes of the graph that was, or returns 0, on every thread
- * alike, when the node is not one this project takes. The graph's own loop over
- * its nodes calls it, in place of sdasm_compute_forward(). */
-int sdasm_compute_nodes(const struct ggml_compute_params * params, const struct ggml_cgraph * graph, int index);
+/* Computes node <index> of a graph, whose <n_nodes> nodes are nodes[0] to
+ * nodes[n_nodes - 1], on the thread params->ith of params->nth, with the nodes
+ * after it that change its output in place (fusion.h), and returns how many
+ * nodes of the graph that was, or returns 0, on every thread alike, when the
+ * node is not one this project takes -- or the arguments name no node. The
+ * graph's own loop over its nodes calls it, in place of
+ * sdasm_compute_forward(). The nodes are handed over as the graph holds them,
+ * and nothing here changes which they are. */
+int sdasm_compute_nodes(const struct ggml_compute_params * const params, struct ggml_tensor * const * const nodes,
+                        int n_nodes, int index);
 
 /* Sets *size to the bytes of the work buffer that <node> needs when it is
  * computed here by <n_threads> threads and returns true, or returns false when
  * the node is not one this project takes. */
-bool sdasm_work_size(const struct ggml_tensor * node, int n_threads, size_t * size);
+bool sdasm_work_size(const struct ggml_tensor * const node, int n_threads, size_t * const size);
 
 /* Forgets what the kernels keep packed from memory in [begin, begin + size),
  * which is about to change (store.h); ggml calls it when it sets the data of a
  * tensor, or clears or frees a buffer. */
-void sdasm_forget(const void * begin, size_t size);
+void sdasm_forget(const void * const begin, size_t size);
+
+/* The factor by which attention of the tokens of an image's grid of <width>
+ * by <height> with themselves takes its keys and values from a coarser grid,
+ * every factor-th row and column of it (Tuning::todo; ToDo, Smith et al.,
+ * 2024): 1, none, unless the run asks for it and the grid has todo_tokens
+ * tokens or more. stable-diffusion.cpp's blocks of attention ask it
+ * (patches/stable-diffusion.cpp/0004-...). */
+int sdasm_token_downsampling(int64_t width, int64_t height);
 
 /* The profile of the graphs, with SDASM_PROFILE in the environment
  * (profile.cc): the first thread of the pool times each node and each graph
  * with sdasm_profile_now(), when sdasm_profile_enabled() says so, and hands the
- * times in nanoseconds here. A node computed together with the <fused> nodes
- * after it is one time. */
+ * times in nanoseconds here, with the graph's nodes, or their number, which
+ * tells the graphs apart. A node computed together with the <fused> nodes after
+ * it is one time. */
 bool sdasm_profile_enabled(void);
 uint64_t sdasm_profile_now(void);
-void sdasm_profile_node(const struct ggml_cgraph * graph, const struct ggml_tensor * node, int fused,
-                        uint64_t nanoseconds);
-void sdasm_profile_graph(const struct ggml_cgraph * graph, uint64_t nanoseconds);
+void sdasm_profile_node(int n_nodes, const struct ggml_tensor * const node, int fused, uint64_t nanoseconds);
+void sdasm_profile_graph(struct ggml_tensor * const * const nodes, int n_nodes, uint64_t nanoseconds);
 
 #ifdef __cplusplus
 }

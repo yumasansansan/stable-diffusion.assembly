@@ -35,6 +35,16 @@ SD 1.5 at 512 by 512, 20 steps, on an Intel Core i7-1360P (4 Golden Cove and 8 G
 
 The UNet's time goes to the convolutions (about 37%), the linear layers (37%) and attention (22%). The linear layers reach about 70% of the most FMAs the processor makes at its power limit, and attention 60%; the convolutions, through Winograd's transforms, 1.2 to 2.5 times it, counted in the operations of the direct convolution. The profile (`SDASM_PROFILE=1`) breaks each operation down by shape and phase.
 
+SDXL (Hassaku XL, at 832 by 1216, CFG 6, Euler A) on the same processor, with other work running beside it -- the steps of two runs differ by up to 8% -- a step past the first two, the mean of two runs that took turns, and the VAE's decoder:
+
+| | A step | VAE decoder | |
+| --- | ---: | ---: | --- |
+| stable-diffusion.cpp, as above (8 threads, two steps) | 131 s | 136 s | |
+| stable-diffusion.assembly, 12 threads | 39.3 s | 15.1 s | 3.3 and 9.0 times as fast |
+| `bits=8` (below) | 16.2 s | 11.6 s | 8.1 and 11.7 times |
+
+The linear layers of SDXL's transformers, ten deep on the grid of 26 by 38, take two thirds of its UNet's time (66%; attention 17%, the convolutions 16%), and ggml computes them better than its convolutions. `bits=8`'s image is the same picture, 24.3 dB of PSNR off the exact one (SSIM 0.90). Each takes 9 to 12 GB of memory at its most, the model's file mapped.
+
 Processors other than this one are measured on GitHub's runners (see [Measuring on GitHub's runners](#measuring-on-githubs-runners)).
 
 ## Precision
@@ -48,9 +58,11 @@ The kernels never compute less precisely than stable-diffusion.cpp does. ggml ro
 | Convolutions, F(4x4, 3x3) (FP16 weights, 16 by 16 and more) | 5 to 11 × 10⁻⁷ | (F(2x2, 3x3) on AMX) | 4.1 to 13 × 10⁻⁵ |
 | Attention (single precision) | 1.4 to 19 × 10⁻⁸, as close as ggml's graph, or closer | 1.3 to 7.1 × 10⁻⁸ | 2.0 to 16 × 10⁻⁸ (its graph) |
 
-**On AMX's tiles**, which multiply bfloat16 (8 bits of significand, against FP16's 11), each number is split in two parts, x = x1 + x2 and w = w1 + w2, each rounded to the nearest, and a product taken as x1 w1 + x1 w2 + x2 w1: within 2⁻¹⁵ of the exact one, sixteen times as close as ggml's rounding to FP16 (2⁻¹¹). Where the processor has AMX-FP16 (Granite Rapids), the FP16 weights go to the tiles as they are and the other operand in two parts of FP16, x1 being ggml's own rounding and x2 what it leaves: two products for each one, w x1 + w x2, each exact, within 2⁻²² of the exact product and never further from it than ggml's -- as close as single precision, and a third fewer products. Winograd's products, of two operands of single precision, keep the two parts of bfloat16. Attention, which ggml computes in single precision, is computed in single precision on the tiles too: three parts of bfloat16 hold a number of single precision exactly, and a product is taken as six products, x1 y1 + x1 y2 + x2 y1 + x1 y3 + x2 y2 + x3 y1, the five small ones summed first, while the sums are small, and x1 y1 after; so summed, the outputs are as close to the exact ones as ggml's or closer, where summed block by block they were up to four times further. The GELU of GEGLU is computed in single precision, where ggml reads it from a table of FP16.
+**On AMX's tiles**, which multiply bfloat16 (8 bits of significand, against FP16's 11), each number is split in two parts, x = x1 + x2 and w = w1 + w2, each rounded to the nearest, and a product taken as x1 w1 + x1 w2 + x2 w1: within 2⁻¹⁵ of the exact one, sixteen times as close as ggml's rounding to FP16 (2⁻¹¹). Where the processor has AMX-FP16 (Granite Rapids), the FP16 weights go to the tiles as they are and the other operand in two parts of FP16, x1 being ggml's own rounding and x2 what it leaves: two products for each one, w x1 + w x2, each exact, within 2⁻²² of the exact product and never further from it than ggml's -- as close as single precision, and a third fewer products. Winograd's products, of two operands of single precision, keep the two parts of bfloat16. Attention, which ggml computes in single precision, is computed in single precision on the tiles too, when `amx_attention=1` asks for it: three parts of bfloat16 hold a number of single precision exactly, and a product is taken as six products, x1 y1 + x1 y2 + x2 y1 + x1 y3 + x2 y2 + x3 y1, the five small ones summed first, while the sums are small, and x1 y1 after; so summed, the outputs are as close to the exact ones as ggml's or closer, where summed block by block they were up to four times further. Six products for each one and the heads of 40 and 80 dimensions of SD 1.5, padded to 64 and 96, made it 1.4 to 2.1 times slower than AVX-512's on Emerald Rapids, though 7% faster for the VAE's one head of 512, and by default attention stays on the vector units. The GELU of GEGLU is computed in single precision, where ggml reads it from a table of FP16.
 
-## Quantized products: less precision, more speed
+## Less precision, more speed
+
+### Products quantized to integers
 
 With `SDASM_TUNE=bits=8` the products are computed in integers instead -- stable-diffusion.cpp's image no longer, but an image of the same model, in less time. Every number of a product's two operands is rounded to an integer of a few bits times a scale, the products of the integers are summed exactly in 32 bits, as VNNI's `vpdpbusd` sums them, four products of a byte by a byte to a lane, and the sum is scaled back:
 
@@ -60,7 +72,9 @@ With `SDASM_TUNE=bits=8` the products are computed in integers instead -- stable
 - **self-attention**'s scores of queries and keys, each over the head's dimensions, and the sum of the values by the exponentials, both in groups of keys, the exponentials each query's: of one scale for all the keys, an exponential of 8 bits rounds the small ones away. **Cross-attention**, over the prompt's 77 tokens, stays in single precision: a fiftieth of the work, and ten times the rounding;
 - the linear layers with the gated GELU of GEGLU after them, fused; those of fewer than 256 rows -- the text encoder's, the projections of the prompt to cross-attention's keys and values, the time embedding's -- stay in single precision, a few hundredths of the work that steer the whole picture.
 
-The micro-kernels are those of single precision in integers: 6 by 16 for AVX-VNNI (`x86_64/quant_avx2.S`, the VEX `vpdpbusd` of Alder Lake's cores and those after), 6 by 16 and 6 by 32 for AVX512-VNNI (`quant_avx512.S`), and the C++ form, whose integers the compiler vectorizes; the quantization of a panel of sixteen columns by AVX2 (`quantize_avx2.S`). All of them give the same integers, and the same outputs to the bit, but for attention's exponentials (`tests/ops_test.cc quantized`).
+The micro-kernels are those of single precision in integers: 6 by 16 for AVX-VNNI (`x86_64/quant_avx2.S`, the VEX `vpdpbusd` of Alder Lake's cores and those after), 6 by 16 and 6 by 32 for AVX512-VNNI (`quant_avx512.S`), and the C++ form, whose integers the compiler vectorizes; the quantization of a panel of sixteen columns by AVX2 (`quantize_avx2.S`). On AMX-INT8's tiles (Sapphire Rapids and after), the linear layers' products, in blocks of 32 by 32 (`amx_int8.S`): a group's products summed by `tdpbusd`, sixteen rows by sixteen columns by 64 numbers of k to an instruction, and scaled by AVX-512 while the tiles sum the next group's, for groups of a multiple of 64 numbers of k. The scaling takes about twice the time of the products with groups of 64, as long with groups of 128, so that the tiles' integers are about as fast as `bits=16`'s products of bfloat16 with groups of 64 and twice as fast with groups of 128 or more -- what the workflow `Measure` is to tell (the variants `int8`, `int8-g128`, `int8-g256` and `int8-avx512`). All of them give the same integers, and the same outputs to the bit, but for attention's exponentials (`tests/ops_test.cc quantized`).
+
+On AVX2 without VNNI -- Haswell to Coffee Lake, Zen to Zen 3 -- the kernel of 6 by 16 multiplies by `vpmaddubsw` instead (`quant_maddubs.S`): 32 unsigned bytes by signed ones, each two products summed into a word, which `vpmaddwd` by ones sums in pairs into the lanes of 32 bits that `vpdpbusd` sums four products into, and `vpaddd` adds to the sums. The integers are the same as long as two products cannot pass a word's 32767: with weights of 7 bits and inputs of 8 (`bits=7`), or weights of 8 and inputs of 7 (`input_bits=7`); with both of 8, those processors stay in single precision. Its two multiplications for VNNI's one make twice the products of the FMAs where the processor has two multipliers of vector integers -- Skylake's cores and those after, Zen 3 -- and as many where it has one: Haswell, Broadwell and Zen 2 gain nothing. On the i7-1360P with AVX-VNNI taken for absent, a P-core's kernel makes 1.55 times the products of its FMAs (AVX-VNNI's 3.0 times) and an E-core's as many (1.8 times); on one P-core the linear layers are 1.45 to 1.7 times as fast as in single precision and self-attention 1.3 times, but the convolutions of three by three only 1.0 to 1.25 times, and the VAE's largest 0.9 times, for the integers' F(2x2, 3x3) takes 1.8 times the products of single precision's F(4x4, 3x3). SD 1.5 samples 1.18 times as fast with `bits=7`, and as fast with `quantize=5`, which keeps the convolutions in single precision, the VAE as fast as without, and the images closer to the exact ones: of the eight prompts above, 26.0 dB of PSNR off them in the median (17.7 to 35.9) and an SSIM of 0.90, against 23.2 dB and 0.84 with `bits=7` alone, 23.2 dB and 0.83 with `input_bits=7`, and `bits=8`'s 25.4 dB and 0.89. How fast on Zen 3, the workflow `Measure` is to tell (the variants `int7-avx2` and `int8a7-avx2`).
 
 On the i7-1360P, a P-core makes four times the products of its FMAs with `vpdpbusd`, an E-core twice as many. SD 1.5 at 512 by 512, 20 steps:
 
@@ -69,25 +83,50 @@ On the i7-1360P, a P-core makes four times the products of its FMAs with `vpdpbu
 | single precision (the default) | 71.3 s | 3.18 s |
 | `bits=8` | 38.7 s | 2.31 s |
 
-Measured on SD 1.5's own activations, each operation's output is within 5 × 10⁻³ of the exact one in the L2 norm for the linear layers, 6 to 7 × 10⁻³ for the convolutions and 1 to 4 × 10⁻³ for self-attention. The images are of the same quality, but the sampler -- Euler A by default, which adds noise at each step -- carries the difference through its twenty steps: of eight prompts, seven give the same picture, its details moved, and one another picture; their PSNR off the exact images is 25.8 dB in the median (17.9 to 34.2), their SSIM 0.90 (0.77 to 0.98), and with `group=32` 27.5 dB and 0.92. stable-diffusion.cpp's own models quantized to 8 bits (`--type q8_0`, W8A8 in groups of 32 on the linear layers alone) move them too: 34 dB off on the first prompt, where `bits=8` is 34 dB off, and 23 dB on the one that `bits=8` takes to another picture.
+Measured on SD 1.5's own activations, each operation's output is within 5 × 10⁻³ of the exact one in the L2 norm for the linear layers, 6 to 7 × 10⁻³ for the convolutions and 1 to 4 × 10⁻³ for self-attention. The images are of the same quality, but the sampler -- Euler A by default, which adds noise at each step -- carries the difference through its twenty steps: of eight prompts, seven give the same picture, its details moved, and one another picture; their PSNR off the exact images is 25.4 dB in the median (17.9 to 34.2), their SSIM 0.89 (0.77 to 0.98), and with `group=32` 26.5 dB and 0.89. stable-diffusion.cpp's own models quantized to 8 bits (`--type q8_0`, W8A8 in groups of 32 on the linear layers alone) move them too: 34 dB off on the first prompt, where `bits=8` is 34 dB off, and 23 dB on the one that `bits=8` takes to another picture.
 
 | Tuning | |
 | --- | --- |
-| `bits=8\|6\|4` | the weights' bits; the inputs keep `input_bits` (8) |
+| `bits=8\|7\|6\|4` | the weights' bits; the inputs keep `input_bits` (8). 7, or `input_bits=7`, for AVX2 without VNNI |
 | `input_bits=2..8` | the inputs' |
 | `group=32\|64\|128` | the numbers of K that share a scale: 32 closer to the exact image, 128 no faster than 64 here |
 | `weight_group=0` | the weights' scale for the whole of K rather than each group |
-| `quantize=1..7` | the operations quantized: 1 the linear layers, 2 the convolutions, 4 attention, added (7, all, by default) |
+| `quantize=1..7` | the operations quantized: 1 the linear layers, 2 the convolutions, 4 attention, added (7, all, by default); 5 for AVX2 without VNNI |
 
-Of the 4-bit weights, as of 6, the image suffers more than the time gains: the integers are bytes either way, and the products the same.
+Of the 4-bit weights, as of 6, the image suffers more than the time gains: the integers are bytes either way, and the products the same. Without VNNI, 7 bits on one side are what lets the products be of integers at all.
+
+### Products of 16 bits
+
+With `SDASM_TUNE=bits=16`, on a processor that has them, the products are of numbers of 16 bits, one product for each one: where the exact path splits each number in two or three parts on AMX's tiles, this takes the first parts alone (`x86_64/half.S`).
+
+- On AMX's tiles, bfloat16, x1 w1, each product within 2⁻⁸ of the exact one; with AMX-FP16 (Granite Rapids), the FP16 weights as they are and the other operand rounded to FP16, w x1, each product exact -- ggml's own product, as precise as stable-diffusion.cpp; attention's x1 y1 of bfloat16.
+- On the vector units of a processor with AVX-512 and no AMX: AVX10.2's `vdpphps`, pairs of FP16 summed in single precision, AMX-FP16's products; without AVX10.2, AVX512-BF16's `vdpbf16ps` (Zen 4 and 5), or, on a processor with AVX512-FP16 and no AVX512-BF16, AVX512-FP16's `vfmadd231ph`, which sums in FP16, each sum moved into single precision after 32 products. `half_format=1` takes bfloat16 and `half_format=2` AVX512-FP16 wherever they are.
+- Winograd's products, of two operands of single precision, are of bfloat16 on the tiles and stay in single precision on the vector units; attention's are of bfloat16 on AVX512-BF16.
+
+Elsewhere -- AVX2 alone, as on the i7-1360P -- the products stay in single precision. `tests/ops_test.cc half` holds each form to 8 × 10⁻³ of the magnitudes summed, under SDE as Cooper Lake, Sapphire Rapids, Granite Rapids, Nova Lake (AVX10.2) and Diamond Rapids; how fast they are, the workflow `Measure` times on GitHub's runners (the variants `half`, `half-avx512`, `half-bf16` and `half-fp16`).
+
+### Attention's keys and values from a coarser grid
+
+`SDASM_TUNE=todo=2` takes the keys and values of attention of an image's tokens with themselves from every second row and column of the grid of tokens -- the token nearest each point of a grid of a quarter of the tokens -- and the queries from every token: ToDo's downsampling of the keys and values by their nearest neighbours ([Smith, Saxena and Saha, 2024](https://arxiv.org/abs/2402.13573)). `todo=3` takes every third row and column; `todo_tokens` (2048) is the least tokens of a grid it is taken for -- in SD 1.5 at 512 by 512, the grid of 64 by 64 and not that of 32 by 32. stable-diffusion.cpp's blocks of attention ask for the factor (`patches/stable-diffusion.cpp/0004-...`) and take the coarse tokens before their projections to keys and values, which project a quarter of them.
+
+SD 1.5 at 512 by 512 on the i7-1360P, sixteen threads, the steps past the processor's first boost:
+
+| | A step | |
+| --- | ---: | ---: |
+| single precision | 4.31 s | |
+| `todo=2` | 3.46 s | 1.25 times as fast |
+| `bits=8` | 2.29 s | 1.89 times |
+| `bits=8,todo=2` | 1.91 s | 2.26 times |
+
+Of the eight prompts of the quantized products, at 20 steps, the images of `todo=2` are 20.5 dB of PSNR off the exact ones in the median (16.8 to 27.8), their SSIM 0.74 (0.64 to 0.91): the same pictures for most, their details moved more than by `bits=8`, and the lighthouse's composition changed. `todo=3` is 18.6 dB off. The paper measured its method at 1536 by 1536 and more, where neighbouring tokens are nearer alike than at 512. On SDXL at 832 by 1216, whose first grid, of 104 by 152, has no attention, ToDo takes the grid of 52 by 76 alone, and a step is 1.06 times as fast (1.16 and 0.98 in two rounds; with `bits=8`, 1.02), its image 20.5 dB off the exact one (SSIM 0.83): that grid's self-attention is about half of SDXL's attention, which is 17% of its UNet's time.
 
 ## The levels of the instruction set
 
 | Level | Extensions | What the kernels written by hand use it for |
 | --- | --- | --- |
-| `avx2` | AVX2, FMA, F16C (x86-64-v3) | the micro-kernels (6 by 16), the softmax's exponentials, the packing, the transforms of F(2x2, 3x3) and F(4x4, 3x3), the gated GELU |
-| `avx512` | AVX-512 F, VL, BW, DQ (AVX10.1) | the same, sixteen lanes wide; masked loads at the edges of an image; on Intel's processors a micro-kernel of 6 by 32, whose loads keep up with two FMAs of sixteen a cycle |
-| `amx` | AMX-TILE, AMX-BF16, AVX512-BF16; AMX-FP16 where there is | the products of the linear layers and of the convolutions (Winograd's included) on the tiles, in bfloat16 split in two parts, or with AMX-FP16 the weights as they are and the other operand in two parts of FP16; attention's in three parts of bfloat16; Winograd's transform of the weights for them by AVX-512; all else as `avx512` |
+| `avx2` | AVX2, FMA, F16C (x86-64-v3) | the micro-kernels (6 by 16), those of integers by AVX-VNNI where there is, or else by `vpmaddubsw`, the softmax's exponentials, the packing, the transforms of F(2x2, 3x3) and F(4x4, 3x3), the gated GELU |
+| `avx512` | AVX-512 F, VL, BW, DQ (AVX10.1) | the same, sixteen lanes wide; masked loads at the edges of an image; a micro-kernel of 6 by 32, whose loads keep up with two FMAs of sixteen a cycle: on GitHub's runners, the linear layers and the convolutions 18 to 60% faster than with 6 by 16 on Ice Lake-SP, 8 to 21% on Zen 5, and on Zen 4, whose units take 512 bits in two halves, as fast; attention's two products take two panels of queries at a time with it |
+| `amx` | AMX-TILE, AMX-BF16, AVX512-BF16; AMX-FP16 and AMX-INT8 where there are | the products of the linear layers and of the convolutions (Winograd's included) on the tiles, in bfloat16 split in two parts, or with AMX-FP16 the weights as they are and the other operand in two parts of FP16; with `amx_attention=1`, attention's in three parts of bfloat16; with `bits=8`, the linear layers' integers by AMX-INT8; Winograd's transform of the weights for them by AVX-512; all else as `avx512` |
 
 The level in effect is the richest the processor has; `SDASM_ISA=avx2|avx512|amx` holds it to a level below, and the tests compute every operation at every level the processor has. A build for x86-64-v3 (`SDASM_ARCH=avx2`, the one that is shipped) runs every level; the C++ is then compiled for AVX2.
 
@@ -123,7 +162,7 @@ build/release/bin/sd-cli -m v1-5-pruned-emaonly.safetensors -p "a lovely cat" --
 | --- | --- |
 | `SDASM_KERNELS=assembly\|cxx\|upstream` | the form of the kernels (assembly by default) |
 | `SDASM_ISA=avx2\|avx512\|amx` | the richest level the kernels written by hand take |
-| `SDASM_TUNE=name=value,...` | the sizes of the blocks and the choices of the kernels (`Tuning` in `sources/kernels.h`): `bits=8` the quantized products, `wide=0\|1` the micro-kernel of 6 by 32 on AVX-512, `bf16=1` the products of AVX512-BF16, `amx_fp16=0` AMX-BF16's form on a processor with AMX-FP16, `amx_attention=0` attention on the vector units |
+| `SDASM_TUNE=name=value,...` | the sizes of the blocks and the choices of the kernels (`Tuning` in `sources/kernels.h`): `bits=8` the quantized products, `bits=16` the products of 16 bits, `todo=2` attention's keys and values from a coarser grid, `wide=0` the micro-kernel of 6 by 16 on AVX-512 rather than 6 by 32, `bf16=1` the products of AVX512-BF16, `amx_fp16=0` AMX-BF16's form on a processor with AMX-FP16, `amx_attention=1` attention on the tiles rather than the vector units |
 | `SDASM_PROFILE=1` | each operation's time, by shape and by phase, at the end |
 | `SDASM_STORE_MB=n` | keep up to n MiB of packed weights from one step to the next; the quantized ones are kept unless it is given (up to 8 GiB) |
 
@@ -143,9 +182,17 @@ cmake --build --preset release
 ctest --preset release
 ```
 
-`sdasm_ops_test <operation> [threads]` computes each operation in every form and at every level against double precision, and prints how close each came; `ci/test.sh` runs them all. `ci/emulated.sh <sde64>` runs the tests of the `emulated` preset under [Intel SDE](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html) as Haswell, Skylake-SP, Ice Lake-SP, Sapphire Rapids, Arrow Lake and Granite Rapids, AMX's tiles included.
+`sdasm_ops_test <operation> [threads]` computes each operation in every form and at every level against double precision, and prints how close each came; `ci/test.sh` runs them all. `ci/emulated.sh <sde64>` runs the tests of the `emulated` preset under [Intel SDE](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html) as Haswell, Skylake-SP, Cooper Lake, Ice Lake-SP, Sapphire Rapids, Arrow Lake, Granite Rapids, Nova Lake and Diamond Rapids, AMX's tiles and AVX10.2 included.
 
 `sdasm_bench` times the operations of SD 1.5 at their shapes in every form (`--forms assembly,avx2,avx512,amx,cxx,upstream`) and variant (`--variant label:isa=avx512,wide=0`), and `--peak` the most FMAs the processor makes at each width.
+
+## The code
+
+The sources are C++26, built with Clang and warned of everything Clang warns of (`-Weverything`), but for what is not about the code -- that it would not compile as an older C or C++, where a structure has padding, and `-Wswitch-default`, which `-Wcovered-switch-default` contradicts -- and every warning stops the build (`SDASM_WERROR`, on in every preset).
+
+Memory is reached through spans (`sources/memory.h`), never through a pointer cast to another type, made from an integer or made into one: the data of ggml's tensors, behind `void *`, is taken as the elements their type says they are, once, after checking the type, the alignment and the strides, which an operation checks before it takes a node; the work buffer ggml hands an operation is laid out into arrays of the types it needs, which begin their lifetimes as those types (`std::start_lifetime_as_array`) before its threads first meet; the store's buffers are allocated as what they hold. With `-Wunsafe-buffer-usage` there is no pointer arithmetic, no index into an array of C's and no call of the C library that reads or writes through a pointer and a length in the sources; the few places that are handed a pointer by another's code -- ggml's arrays, `argv`, the C++ kernels, which take the pointers the kernels written by hand take -- say so, each in a `#pragma clang unsafe_buffer_usage` block of its own. Every index is checked against the bounds of its span in the Debug build and in the sanitizers' (`_GLIBCXX_ASSERTIONS`); a Release build checks what it is handed once, where it takes it, and computes as fast as before.
+
+The sanitizers' builds (`sanitize`, `tsan`) run every test, ggml's own kernels included, with nothing turned off or suppressed: AddressSanitizer with its leak checker, UndefinedBehaviorSanitizer with all its checks -- the patches have ggml call the functions of its tables of types through pointers of their own types, which `-fsanitize=function` checks -- and ThreadSanitizer. ggml's threads run on ggml's own pool rather than on OpenMP: one dependency fewer, as fast, and a pool whose synchronisation the sanitizers see.
 
 ## Measuring on GitHub's runners
 

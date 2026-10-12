@@ -22,8 +22,7 @@
 #
 #  - The build job builds the Release configuration for AVX2 (x86-64-v3), the
 #    build that is shipped, which chooses its kernels by what the processor it
-#    runs on has, and keeps sdasm_bench, sdasm_ops_test and the OpenMP runtime
-#    they are linked with.
+#    runs on has, and keeps sdasm_bench and sdasm_ops_test.
 #  - Each measure job runs ci/measure.sh with them: the tests of every
 #    operation in every form, at every level its processor has -- on a runner
 #    with AVX-512, the kernels for AVX2 are tested there as well, as a
@@ -56,11 +55,15 @@ on:
         description: Variants of the kernels to time as well, separated by spaces (sdasm_bench --variant)
         default: >-
           f2x2:winograd=1 avx512-wide:isa=avx512,wide=1 avx512-narrow:isa=avx512,wide=0 avx512-bf16:isa=avx512,bf16=1
-          amx-attention-off:isa=amx,amx_attention=0 amx-queries128:isa=amx,amx_queries=128
+          amx-queries128:isa=amx,amx_attention=1,amx_queries=128
           amx-kc512:isa=amx,amx_kc=512 amx-mc64:isa=amx,amx_mc=64
           amx-small-direct:isa=amx,winograd_small_tiles=0 amx-direct:isa=amx,winograd=0
           amx-bf16-form:isa=amx,amx_fp16=0
-          int8:bits=8 int8-g32:bits=8,group=32 int8-g128:bits=8,group=128 int8-avx2:isa=avx2,bits=8
+          int8:bits=8 int8-g32:bits=8,group=32 int8-g128:bits=8,group=128 int8-g256:bits=8,group=256
+          int8-avx2:isa=avx2,bits=8 int8-avx512:isa=avx512,bits=8
+          int7-avx2:isa=avx2,bits=7 int8a7-avx2:isa=avx2,bits=8,input_bits=7
+          half:bits=16 half-avx512:isa=avx512,bits=16 half-bf16:isa=avx512,bits=16,half_format=1
+          half-fp16:isa=avx512,bits=16,half_format=2 amx-attention-on:isa=amx,amx_attention=1
 
 permissions:
   contents: read
@@ -98,13 +101,9 @@ jobs:
 
       - name: Pack the programs
         run: |
-          # In a tar archive, which keeps them executable; with the OpenMP
-          # runtime they were linked with, which the runners that run them
-          # have not installed.
+          # In a tar archive, which keeps them executable.
           mkdir measure-tools
           cp build/release/tools/sdasm_bench build/release/tests/sdasm_ops_test measure-tools/
-          runtime=$(ldd build/release/tools/sdasm_bench | awk '/libomp/ { print $3 }')
-          cp -L "$runtime" measure-tools/
           tar -czf measure-tools.tar.gz measure-tools
           ls -l measure-tools
 

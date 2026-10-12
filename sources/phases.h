@@ -19,7 +19,9 @@
 #ifndef SDASM_PHASES_H
 #define SDASM_PHASES_H
 
+#include <array>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 
 namespace sdasm {
@@ -32,7 +34,8 @@ bool phases_enabled();
 
 // The nanoseconds of this thread in each phase since the last take, which it
 // zeroes.
-void phases_take(std::uint64_t (&nanoseconds)[static_cast<int>(Phase::count)]);
+using Phase_times = std::array<std::uint64_t, static_cast<std::size_t>(Phase::count)>;
+void phases_take(Phase_times & nanoseconds);
 void phase_add(Phase p, std::uint64_t nanoseconds);
 
 inline std::uint64_t phase_clock() {

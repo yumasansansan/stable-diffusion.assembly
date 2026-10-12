@@ -10,9 +10,8 @@
 #   ci/measure.sh <tools> <out> <forms> <seconds> [<only> [<variant>...]]
 #
 # Measures the kernels on the processor of this machine, with the programs a
-# Release build made (<tools>: sdasm_bench, sdasm_ops_test and the OpenMP runtime
-# they were linked with, as .github/workflows/measure.yml packs them), and
-# writes what it found to <out>:
+# Release build made (<tools>: sdasm_bench and sdasm_ops_test, as
+# .github/workflows/measure.yml packs them), and writes what it found to <out>:
 #
 #   runner.txt  the processor -- its name, its extensions, its caches, its
 #               threads -- and the levels of the kernels it has
@@ -39,7 +38,6 @@ only=${5:-}
 variants=("${@:6}")
 
 mkdir -p "$out"
-export LD_LIBRARY_PATH="$tools${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 threads=$(nproc)
 
 {
@@ -66,8 +64,15 @@ echo "== the tests, on $threads threads"
 status=0
 : > "$out/tests.tsv"
 : > "$out/tests.log"
-for op in conv2d mul_mat attention gated fusion store; do
-  if "$tools/sdasm_ops_test" "$op" "$threads" >> "$out/tests.log" 2>&1; then
+# The convolutions by F(2x2, 3x3) alone and directly too, as ci/emulated.sh
+# tests them, and the products quantized to integers and of 16 bits.
+for op in conv2d f2x2 direct mul_mat attention gated fusion store quantized half; do
+  case $op in
+    f2x2) run=(env SDASM_TUNE=winograd=1 "$tools/sdasm_ops_test" conv2d "$threads") ;;
+    direct) run=(env SDASM_TUNE=winograd=0 "$tools/sdasm_ops_test" conv2d "$threads") ;;
+    *) run=("$tools/sdasm_ops_test" "$op" "$threads") ;;
+  esac
+  if "${run[@]}" >> "$out/tests.log" 2>&1; then
     printf '%s\tok\n' "$op" >> "$out/tests.tsv"
   else
     printf '%s\tfailed\n' "$op" >> "$out/tests.tsv"

@@ -42,6 +42,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "memory.h"
+
 struct ggml_tensor;
 
 namespace sdasm {
@@ -67,27 +69,55 @@ enum class Layout {
     quantized_conv,
 };
 
-struct Packed {
-    float * data = nullptr;
-    std::size_t bytes = 0;
-    std::atomic<int> state{0};
+// What a layout's elements are: single precision for the micro-kernel's panels
+// and Winograd's, halves -- bfloat16 or FP16 -- for AMX's tiles, and the bytes
+// of the quantized panels, whose scales are bytes among them (quant.h).
+enum class Element { single, half, byte };
+Element element_of(Layout layout);
+
+// A packed form, allocated as an array of the elements of its layout and
+// aligned to kWorkAlign.
+class Packed {
+public:
+    Packed(Element element, std::int64_t count);
+    ~Packed();
+    Packed(const Packed &) = delete;
+    Packed & operator=(const Packed &) = delete;
+
+    // Whether the memory was had: none is, when the system has no more.
+    bool allocated() const { return memory_ != nullptr; }
+    std::size_t bytes() const { return bytes_; }
+
+    // The elements, of the type its layout has.
+    Elements<float> singles() const;
+    Elements<std::uint16_t> halves() const;
+    Elements<std::uint8_t> octets() const;
 
     // Ready to read: filled by the operation that first needed it.
     bool ready() const;
+    std::atomic<int> state{0};
+
+private:
+    Element element_;
+    std::int64_t count_;
+    std::size_t bytes_;
+    void * memory_ = nullptr;  // as ::operator new gave it
+    void * array_ = nullptr;   // the array of elements in it, which began its lifetime as their type
 };
 
-// The packed form of `tensor` in `layout`, of `bytes`, for every thread of an
-// operation alike: one that is ready to read, one to fill, or none, when the
-// budget has no room for it. The first thread to ask for one that is not kept
-// makes it, and the others get the same; the operation marks it ready with
-// publish() once all its threads have filled it. `variant` tells apart the
-// forms of a layout that the tuning chooses among, the bits and the groups of
-// the quantized ones.
-std::shared_ptr<Packed> packed(const ggml_tensor * tensor, Layout layout, std::size_t bytes, std::uint64_t variant = 0);
+// The packed form of `tensor` in `layout`, of `count` elements of the layout's,
+// for every thread of an operation alike: one that is ready to read, one to
+// fill, or none, when the budget has no room for it. The first thread to ask
+// for one that is not kept makes it, and the others get the same; the
+// operation marks it ready with publish() once all its threads have filled it.
+// `variant` tells apart the forms of a layout that the tuning chooses among,
+// the bits and the groups of the quantized ones.
+std::shared_ptr<Packed> packed(const ggml_tensor * const tensor, Layout layout, std::int64_t count,
+                               std::uint64_t variant = 0);
 void publish(const std::shared_ptr<Packed> & p);
 
 // Forgets what was packed from memory in [begin, begin + size).
-void forget(const void * begin, std::size_t size);
+void forget(const void * const begin, std::size_t size);
 
 }  // namespace sdasm
 

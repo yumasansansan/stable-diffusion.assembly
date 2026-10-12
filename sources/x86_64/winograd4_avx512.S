@@ -65,6 +65,7 @@
 .set J4_COEFFICIENT, 88
 .set J4_LANES, 112
 .set J4_MASKS, 128
+.set J4_OFFSET, 136               // bytes from each row to the tiles' first input
 
         .globl sdasm_winograd4_inputs_avx512
         .type sdasm_winograd4_inputs_avx512, @function
@@ -87,7 +88,10 @@ sdasm_winograd4_inputs_avx512:
         vmovdqu32 zmm21, [rip + .Lgather + 64]
         vmovdqu32 zmm22, [rip + .Lgather + 128]
         vmovdqu32 zmm23, [rip + .Lgather + 192]
-        xor rcx, rcx                            // the channel's offset in bytes
+        // The channel's offset in bytes, from each row's first input of the
+        // tiles, which may lie before the row: the addresses are formed
+        // here, and nothing outside the image is read (the masks).
+        mov rcx, [rdi + J4_OFFSET]
         test r8, r8
         jz 9f
 1:

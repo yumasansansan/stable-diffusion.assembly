@@ -24,29 +24,45 @@
 #ifndef SDASM_FUSION_H
 #define SDASM_FUSION_H
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
-struct ggml_cgraph;
+#include "memory.h"
+
 struct ggml_tensor;
 
 namespace sdasm {
 
+// The nodes of a graph, as the graph holds them (sdasm.h).
+using Graph_nodes = std::span<ggml_tensor * const>;
+
+// The nodes of a graph, from the array and the number that ggml hands over:
+// the one place that takes the number on trust (sdasm_compute_nodes() and
+// sdasm_profile_graph() check it is above 0 and the array is there).
+Graph_nodes graph_nodes(ggml_tensor * const * const nodes, int n_nodes);
+
+// Node i of a graph, 0 <= i < nodes.size().
+inline ggml_tensor * node_at(Graph_nodes nodes, int i) {
+    return nodes[static_cast<std::size_t>(i)];
+}
+
 struct Epilogue_step {
     enum class Kind { add, mul, silu };
     Kind kind = Kind::add;
-    // The other operand of an addition or a multiplication: its element for
-    // the output element (i0, i1, i2, i3) lies at data + sum of ik * nb[k],
-    // where a dimension it is broadcast along has nb[k] = 0.
-    const char * data = nullptr;
-    std::int64_t nb[4] = {0, 0, 0, 0};
+    // The other operand of an addition or a multiplication, its elements: its
+    // element for the output element (i0, i1, i2, i3) at the sum of ik * nb[k],
+    // nb in elements, where a dimension it is broadcast along has nb[k] = 0.
+    Elements<const float> operand;
+    std::array<std::int64_t, 4> nb{};
 };
 
 struct Epilogue {
     static constexpr int kMaxSteps = 6;
     int count = 0;
-    Epilogue_step steps[kMaxSteps];
-    const ggml_tensor * operands[kMaxSteps] = {};  // the other operand of each step, if any
+    std::array<Epilogue_step, kMaxSteps> steps{};
+    std::array<const ggml_tensor *, kMaxSteps> operands{};  // the other operand of each step, if any
     int last_node = -1;    // the index of the last node of the chain
     std::int64_t ne0 = 0;  // the length of a row of the output, for SiLU
     // The tensor the operation writes in place of its own, when the chain ends
@@ -65,12 +81,13 @@ struct Epilogue {
 
     bool empty() const { return count == 0 && !from_redirect; }
 
-    // Applies the chain to n elements of the output that lie one after another
-    // along dimension 0, the first at output coordinates (i0, i1, i2, i3).
-    void apply(float * out, std::int64_t n, std::int64_t i0, std::int64_t i1, std::int64_t i2, std::int64_t i3) const;
-    // The same for n positions of channel i2 of image i3, which run on across
+    // Applies the chain to the elements of the output `out` holds, which lie
+    // one after another along dimension 0, the first at output coordinates
+    // (i0, i1, i2, i3).
+    void apply(Elements<float> out, std::int64_t i0, std::int64_t i1, std::int64_t i2, std::int64_t i3) const;
+    // The same for positions of channel i2 of image i3, which run on across
     // the rows of the image, the first at `position` (y * ne0 + x).
-    void apply_positions(float * out, std::int64_t n, std::int64_t position, std::int64_t i2, std::int64_t i3) const;
+    void apply_positions(Elements<float> out, std::int64_t position, std::int64_t i2, std::int64_t i3) const;
 };
 
 // The chain after node `index` of the graph that an operation can apply:
@@ -82,13 +99,13 @@ struct Epilogue {
 //
 // With `redirect`, the chain may end in an addition that is not in place
 // (Epilogue::redirect), when the memory allows it (redirect_apart()).
-Epilogue match_chain(const ggml_cgraph * graph, int index, bool silu, bool positions, bool redirect = false);
+Epilogue match_chain(Graph_nodes nodes, int index, bool silu, bool positions, bool redirect = false);
 
 // Whether the operation of node may write its chain's redirect: the memory of
 // the tensor written is none of what the operation or the chain reads -- the
 // allocator may have given it, for one, the memory of the operation's input,
 // free once the operation has read it, as it would be without the fusion.
-bool redirect_apart(const ggml_tensor * node, const Epilogue & chain);
+bool redirect_apart(const ggml_tensor * const node, const Epilogue & chain);
 
 // The gated GELU that stable-diffusion.cpp's GEGLU takes after a linear layer:
 // the layer's output, with the chain after it (its bias), split into halves
@@ -102,13 +119,14 @@ struct Gated_gelu {
     int last_node = -1;  // the index of out's node
 };
 
-Gated_gelu match_gated_gelu(const ggml_cgraph * graph, int index, const Epilogue & chain);
+Gated_gelu match_gated_gelu(Graph_nodes nodes, int index, const Epilogue & chain);
 
-// GELU in single precision, by its definition with tanh, as
-// 0.5 x (1 + tanh(y)) = x / (1 + exp(-2 y)), y = sqrt(2 / pi) (x + 0.044715 x^3):
-// what ggml computes, without the FP16 table it reads it from, which rounds
-// the argument and the result to FP16.
-void gated_gelu_run(float * out, const float * x, const float * gate, std::int64_t n);
+// out = x GELU(gate), element by element, of out's elements: GELU in single
+// precision, by its definition with tanh, as 0.5 x (1 + tanh(y)) =
+// x / (1 + exp(-2 y)), y = sqrt(2 / pi) (x + 0.044715 x^3) -- what ggml
+// computes, without the FP16 table it reads it from, which rounds the argument
+// and the result to FP16.
+void gated_gelu_run(Elements<float> out, Elements<const float> x, Elements<const float> gate);
 
 }  // namespace sdasm
 

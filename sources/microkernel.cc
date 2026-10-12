@@ -15,6 +15,7 @@
 // kernels the products are computed with where those are not (cpu.cc).
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 
 #include "gemm.h"
@@ -24,8 +25,21 @@ namespace sdasm {
 
 namespace {
 
-float * row(float * c, std::int64_t ldc, int i) {
-    return reinterpret_cast<float *>(reinterpret_cast<char *>(c) + i * ldc);
+// The operands of a kernel of kc, as the kernels written by hand take them:
+// panels of kMr and kNr numbers over kc, and C, kMr rows ldc bytes apart.
+struct Operands {
+    Elements<const float> a, b;
+    Elements<float> c;
+    std::int64_t ldc;  // elements
+};
+
+Operands operands(std::int64_t kc, const float * const a, const float * const b, float * const c, std::int64_t ldc) {
+    SDASM_REQUIRE(kc >= 0 && ldc % bytes_of<float>(1) == 0 && ldc >= bytes_of<float>(kNr));
+    const std::int64_t row = ldc / bytes_of<float>(1);
+    // The kernels' operands, handed over as pointers.
+#pragma clang unsafe_buffer_usage begin
+    return {elements_at(a, kc * kMr), elements_at(b, kc * kNr), elements_at(c, (kMr - 1) * row + kNr), row};
+#pragma clang unsafe_buffer_usage end
 }
 
 }  // namespace
@@ -34,50 +48,57 @@ float * row(float * c, std::int64_t ldc, int i) {
 // keep in registers only when the array is the function's and its loops over
 // rows and columns have bounds it knows: the sum is written out in each.
 
-void gemm_6x16_cxx(std::int64_t kc, const float * a, const float * b, float * c, std::int64_t ldc,
+void gemm_6x16_cxx(std::int64_t kc, const float * const a, const float * const b, float * const c, std::int64_t ldc,
                    std::int64_t accumulate) {
-    float t[kMr][kNr] = {};
+    const Operands o = operands(kc, a, b, c, ldc);
+    std::array<std::array<float, kNr>, kMr> t{};
     for (std::int64_t k = 0; k < kc; ++k) {
-        for (int i = 0; i < kMr; ++i) {
-            for (int j = 0; j < kNr; ++j) {
-                t[i][j] += a[k * kMr + i] * b[k * kNr + j];
+        for (std::size_t i = 0; i < kMr; ++i) {
+            for (std::size_t j = 0; j < kNr; ++j) {
+                t[i][j] += o.a[k * kMr + static_cast<std::int64_t>(i)] * o.b[k * kNr + static_cast<std::int64_t>(j)];
             }
         }
     }
-    for (int i = 0; i < kMr; ++i) {
-        float * r = row(c, ldc, i);
-        for (int j = 0; j < kNr; ++j) {
-            r[j] = accumulate != 0 ? r[j] + t[i][j] : t[i][j];
+    for (std::size_t i = 0; i < kMr; ++i) {
+        const Elements<float> r = o.c.part(static_cast<std::int64_t>(i) * o.ldc, kNr);
+        for (std::size_t j = 0; j < kNr; ++j) {
+            const auto jj = static_cast<std::int64_t>(j);
+            r[jj] = accumulate != 0 ? r[jj] + t[i][j] : t[i][j];
         }
     }
 }
 
-void scores_6x16_cxx(std::int64_t kc, const float * a, const float * b, float * c, std::int64_t ldc, float * max,
-                     float scale, std::int64_t accumulate) {
-    float t[kMr][kNr] = {};
+void scores_6x16_cxx(std::int64_t kc, const float * const a, const float * const b, float * const c, std::int64_t ldc,
+                     float * const max, float scale, std::int64_t accumulate) {
+    const Operands o = operands(kc, a, b, c, ldc);
+    std::array<std::array<float, kNr>, kMr> t{};
     for (std::int64_t k = 0; k < kc; ++k) {
-        for (int i = 0; i < kMr; ++i) {
-            for (int j = 0; j < kNr; ++j) {
-                t[i][j] += a[k * kMr + i] * b[k * kNr + j];
+        for (std::size_t i = 0; i < kMr; ++i) {
+            for (std::size_t j = 0; j < kNr; ++j) {
+                t[i][j] += o.a[k * kMr + static_cast<std::int64_t>(i)] * o.b[k * kNr + static_cast<std::int64_t>(j)];
             }
         }
     }
     // The largest so far in an array of the function's own, which no store to
     // c can be taken to change.
-    float m[kNr];
-    for (int j = 0; j < kNr; ++j) {
-        m[j] = max[j];
+#pragma clang unsafe_buffer_usage begin
+    const Elements<float> largest = elements_at(max, kNr);
+#pragma clang unsafe_buffer_usage end
+    std::array<float, kNr> m{};
+    for (std::size_t j = 0; j < kNr; ++j) {
+        m[j] = largest[static_cast<std::int64_t>(j)];
     }
-    for (int i = 0; i < kMr; ++i) {
-        float * r = row(c, ldc, i);
-        for (int j = 0; j < kNr; ++j) {
-            const float s = (accumulate != 0 ? r[j] + t[i][j] : t[i][j]) * scale;
-            r[j] = s;
+    for (std::size_t i = 0; i < kMr; ++i) {
+        const Elements<float> r = o.c.part(static_cast<std::int64_t>(i) * o.ldc, kNr);
+        for (std::size_t j = 0; j < kNr; ++j) {
+            const auto jj = static_cast<std::int64_t>(j);
+            const float s = (accumulate != 0 ? r[jj] + t[i][j] : t[i][j]) * scale;
+            r[jj] = s;
             m[j] = std::max(m[j], s);
         }
     }
-    for (int j = 0; j < kNr; ++j) {
-        max[j] = m[j];
+    for (std::size_t j = 0; j < kNr; ++j) {
+        largest[static_cast<std::int64_t>(j)] = m[j];
     }
 }
 

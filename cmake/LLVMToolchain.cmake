@@ -161,7 +161,7 @@ function(sdasm_check_cxx_library)
     "int main() { try { throw std::runtime_error(std::string(\"x\")); }\n"
     "             catch (const std::exception &e) { return e.what()[0] == 'x' ? 0 : 1; } }\n")
   try_compile(SDASM_CXX_LIBRARY_LINKS "${check}/build" SOURCES "${check}/main.cpp"
-    CMAKE_FLAGS "-DCMAKE_CXX_STANDARD=23" "-DCMAKE_LINKER_TYPE=LLD"
+    CMAKE_FLAGS "-DCMAKE_CXX_STANDARD=26" "-DCMAKE_LINKER_TYPE=LLD"
     OUTPUT_VARIABLE output)
   if(NOT SDASM_CXX_LIBRARY_LINKS)
     message(FATAL_ERROR

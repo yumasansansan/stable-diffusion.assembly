@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: 2026 Yuma Kakei <yumasansansan@gmail.com>
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# This file is part of stable-diffusion.assembly. The SPDX lines name its
+# copyright holder and its license, in the machine-readable form of the REUSE
+# specification: the GNU General Public License, version 3 or any later version
+# (LICENSES/GPL-3.0-or-later.txt).
+#
+# What clang-tidy holds this project's sources to (ci/tidy.sh), every finding
+# an error, beside the compiler's warnings (CMakeLists.txt), which leave some
+# things unsaid:
+#
+#  - no pointer cast to another type (reinterpret_cast), no const cast away
+#    (const_cast), no cast of C's, no read of a union's other member, no call
+#    of a function of C's variable arguments (printf: std::print in its
+#    place), no pointer made from an integer, no pointer arithmetic: memory is
+#    reached through spans (sources/memory.h);
+#  - the bugs clang-tidy knows of (bugprone-*, cert-*, the static analyzer);
+#  - const wherever it can be (misc-const-correctness): a variable that does
+#    not change, a reference or a pointer to what is not changed through it,
+#    and a pointer that is not made to point anywhere else -- const T * const p,
+#    neither what it points to nor the pointer itself changed.
+#
+# Left out, as they are not about mistakes this code can make: the order of
+# parameters of the same type (bugprone-easily-swappable-parameters); a product
+# of ints made wider after it (bugprone-implicit-widening-of-multiplication-
+# result), here of constants and of sizes far from the limits of int; the bits
+# of signed numbers (bugprone-signed-bitwise), shifts and masks of constants,
+# whose undefined cases UBSan checks; a constant seed of a random generator,
+# which the tests and the benchmark want, to be repeatable; implicit
+# constructors (misc-explicit-constructor), which the spans of memory.h have on
+# purpose; and an index into a std::array that is not a constant
+# (cppcoreguidelines-pro-bounds-constant-array-index), which the C++ library
+# checks in the builds with checks (_GLIBCXX_ASSERTIONS).
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-signed-bitwise,
+  -bugprone-random-generator-seed,
+  cert-*,
+  -cert-msc32-c,
+  -cert-msc51-cpp,
+  clang-analyzer-*,
+  cppcoreguidelines-pro-type-reinterpret-cast,
+  cppcoreguidelines-pro-type-const-cast,
+  cppcoreguidelines-pro-type-cstyle-cast,
+  cppcoreguidelines-pro-type-union-access,
+  cppcoreguidelines-pro-type-vararg,
+  cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  performance-no-int-to-ptr,
+  misc-const-correctness
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/(sources|tests|tools)/.*'
+CheckOptions:
+  misc-const-correctness.WarnPointersAsValues: true
+  misc-const-correctness.TransformPointersAsValues: true

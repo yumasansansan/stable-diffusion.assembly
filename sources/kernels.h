@@ -14,10 +14,10 @@
 #ifndef SDASM_KERNELS_H
 #define SDASM_KERNELS_H
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
-struct ggml_cgraph;
 struct ggml_tensor;
 
 namespace sdasm {
@@ -35,15 +35,16 @@ const char * kernels_name(Kernels k);
 // written by hand are written for, read once from cpuid; all false on a
 // processor other than x86-64, or in a build without those kernels.
 struct Cpu {
-    bool intel = false;        // the vendor, for the choices the kernels make by the cores
     bool avx2 = false;         // with FMA and F16C, as x86-64-v3 has them
     bool avx512 = false;       // AVX-512 F, VL, BW and DQ, as AVX10.1 has them
     bool avx512_bf16 = false;
     bool avx512_fp16 = false;
     bool avx_vnni = false;
     bool avx512_vnni = false;
+    bool avx10_2 = false;      // AVX10.2: vdpphps, pairs of FP16 summed in single precision
     bool amx_bf16 = false;     // AMX-TILE and AMX-BF16, with AVX512-BF16 and the system's leave to use the tiles
     bool amx_fp16 = false;
+    bool amx_int8 = false;     // AMX-INT8, with the tiles of amx_bf16
 };
 
 const Cpu & cpu();
@@ -63,7 +64,7 @@ Isa isa_available();
 void set_isa_cap(Isa cap);
 const char * isa_name(Isa level);
 // The level of a name isa_name() gives, if it is one.
-bool isa_named(const char * name, Isa & level);
+bool isa_named(const char * const name, Isa & level);
 
 // The name of the level in effect, for the record of a measurement.
 const char * kernels_isa();
@@ -78,7 +79,7 @@ bool amx_kernels();
 
 // A thread's time in this project's kernels for a node of a graph, for the
 // profile (profile.cc).
-void profile_busy(const ggml_cgraph * graph, const ggml_tensor * node, int fused, int threads, double seconds);
+void profile_busy(int n_nodes, const ggml_tensor * const node, int fused, int threads, double seconds);
 // For the tests, which compute the same operation in each form in turn: the
 // form every operation after takes, whatever the environment said.
 void set_kernels(Kernels k);
@@ -99,7 +100,7 @@ struct Tuning {
     int mul_mat_shared_rows = 1024;// the most rows of src1 that are shared
     int amx_kc = 256;              // on AMX's tiles: the stretch of K of a block, a multiple of 32
     int amx_mc = 128;              // and the rows of a block, a multiple of 32
-    int amx_attention = 1;         // attention on the tiles, in single precision (amx_single.S): 1, not: 0
+    int amx_attention = 0;         // attention on the tiles, in single precision (amx_single.S): 1, not: 0
     int amx_queries = 64;          // the queries of its blocks, a multiple of 32
     int amx_fp16 = 1;              // AMX-FP16's products of FP16 weights, where the processor has it (gemm.h): 1, not: 0
     int attention_queries = 32;    // the queries of a block of attention
@@ -116,65 +117,81 @@ struct Tuning {
     int winograd_small_mc = 48;    // the output channels of a block of small images
     int winograd_small_kc = 128;
     int prefetch = 1;              // the weights of the next stretch fetched ahead: 1, not: 0
-    int wide = -1;                 // AVX-512's tile of 32 columns (gemm.h): 1, of 16: 0; -1: on Intel's processors
+    int wide = 1;                  // AVX-512's tile of 32 columns (gemm.h): 1, of 16: 0
     int bf16 = 0;                  // at avx512, the products of FP16 weights by AVX512-BF16 (gemm.h): 1, for measurement
     int fuse = 1;                  // the chains after operations with them: 1, apart: 0
     int fuse_residual = 1;         // and the residual connections that end them: 1, apart: 0
     int guided = 1;                // blocks shrinking toward the end of an operation: 1, all alike: 0
     int store_forget = 1;          // the store forgets what changes: 1; 0 only for its canary test
-    int bits = 0;                  // the products': 0 single precision; 2 to 8 integers, the weights of that many bits (quant.h)
+    int bits = 0;                  // the products': 0 single precision; 2 to 8 integers, the weights of that many bits (quant.h); 16 bfloat16 or FP16 (gemm.h)
     int input_bits = 8;            // and the inputs', 2 to 8, unsigned with a zero point
     int group = 64;                // the numbers of k sharing a scale, a multiple of 4
     int weight_group = 1;          // the weights' scale for each group: 1; for a whole row of k: 0
     int quantize = 7;              // with bits, the operations quantized: 1 the linear layers, 2 the convolutions, 4 attention
+    int half_format = 0;           // bits = 16 on the vector units: 0 as fits, 1 bfloat16, 2 AVX512-FP16's FP16
+    int todo = 0;                  // attention of an image's tokens with themselves, its keys and values from every
+                                   // todo-th row and column of the grid (ToDo): 2 or 3; 0 or 1 none
+    int todo_tokens = 2048;        // the least tokens of a grid it takes them so from
 };
 
 const Tuning & tuning();
 void set_tuning(const Tuning & t);
 // Parses name=value,... into t, and says which name it did not know, if any.
-bool parse_tuning(const char * text, Tuning & t);
+bool parse_tuning(const char * const text, Tuning & t);
 
-void gemm_6x16_cxx(std::int64_t kc, const float * a, const float * b, float * c, std::int64_t ldc,
+void gemm_6x16_cxx(std::int64_t kc, const float * const a, const float * const b, float * const c, std::int64_t ldc,
                    std::int64_t accumulate);
-void scores_6x16_cxx(std::int64_t kc, const float * a, const float * b, float * c, std::int64_t ldc, float * max,
-                     float scale, std::int64_t accumulate);
-void exponentials_cxx(float * s, std::int64_t n, const float * max, double * total);
+void scores_6x16_cxx(std::int64_t kc, const float * const a, const float * const b, float * const c, std::int64_t ldc,
+                     float * const max, float scale, std::int64_t accumulate);
+void exponentials_cxx(float * const s, std::int64_t n, const float * const max, double * const total);
 
 // A job of the transform of Winograd's inputs written by hand
-// (x86_64/winograd_avx2.S, which reads its fields at their offsets): sixteen
-// tiles of a row of tiles, channel after channel.
+// (x86_64/winograd_avx2.S and winograd_avx512.S, which read its fields at
+// their offsets): sixteen tiles of a row of tiles, channel after channel. A
+// row's first input of the tiles may lie before the row, at the left edge of
+// the image: the job holds the row's first number, and the offset to the
+// tiles' first input, which the kernel forms the addresses from and reads
+// nothing outside the image of.
 struct Winograd_inputs {
     float * dst;               // the panel of s = 0; that of s at dst + s * stride bytes
     std::int64_t stride;
-    const char * a;            // row A of the tiles at their first input, the first channel's
+    const float * a;           // row A of the tiles, its first number, of the first channel
     std::int64_t a_step;       // bytes to the next channel's: a plane, or 0 for a row of zeros
-    const char * b;            // row B, likewise
+    const float * b;           // row B, likewise
     std::int64_t b_step;
     std::int64_t channels;
     const std::int32_t * masks;  // AVX2: the lanes of the eight loads inside the image, or none: all are
     std::int64_t subtract;     // A minus B, or A plus B
-    std::uint16_t lanes[4];    // AVX-512: the lanes of the loads at 0, 16, 2 and 18 inside the image
+    std::array<std::uint16_t, 4> lanes;  // AVX-512: the lanes of the loads at 0, 16, 2 and 18 inside the image
+    std::int64_t a_offset;     // bytes from a to the tiles' first input of row A
+    std::int64_t b_offset;     // and from b, of row B
 };
+
+static_assert(offsetof(Winograd_inputs, a) == 16 && offsetof(Winograd_inputs, masks) == 56 &&
+              offsetof(Winograd_inputs, subtract) == 64 && offsetof(Winograd_inputs, lanes) == 72 &&
+              offsetof(Winograd_inputs, a_offset) == 80 && offsetof(Winograd_inputs, b_offset) == 88);
 
 // A job of the transform of F(4x4, 3x3)'s inputs written by hand
 // (x86_64/winograd4_*.S, which read its fields at their offsets): the six
 // elements xi of a row r of B^T of sixteen tiles (AVX-512) or eight (AVX2) of a
-// row of tiles, channel after channel.
+// row of tiles, channel after channel; each row of the image its first number,
+// and the offset to the tiles' first input, as in Winograd_inputs.
 struct Winograd4_inputs {
     float * dst;               // the panel of s = 0; that of s at dst + s * stride bytes
     std::int64_t stride;
     std::int64_t step;         // bytes to the next channel's rows: a plane
     std::int64_t channels;
     std::int64_t rows;         // the rows of the tiles combined, at most six
-    const char * row[6];       // each one's number at the tiles' first input, of the first channel
-    float coefficient[6];      // B^T[r][i] of each
-    std::uint16_t lanes[5];    // AVX-512: the lanes of the loads at 0, 16, 32, 48 and 64 inside the image
+    std::array<const float *, 6> row;     // each one's first number, of the first channel
+    std::array<float, 6> coefficient;     // B^T[r][i] of each
+    std::array<std::uint16_t, 5> lanes;   // AVX-512: the lanes of the loads at 0, 16, 32, 48 and 64 inside the image
     const std::int32_t * masks;  // AVX2: [5][8], the lanes of the loads at 0, 8, 16, 24 and 32; or none: all are
+    std::int64_t offset;       // bytes from each row's first number to the tiles' first input
 };
 
 static_assert(offsetof(Winograd4_inputs, rows) == 32 && offsetof(Winograd4_inputs, row) == 40 &&
               offsetof(Winograd4_inputs, coefficient) == 88 && offsetof(Winograd4_inputs, lanes) == 112 &&
-              offsetof(Winograd4_inputs, masks) == 128);
+              offsetof(Winograd4_inputs, masks) == 128 && offsetof(Winograd4_inputs, offset) == 136);
 
 }  // namespace sdasm
 
@@ -206,8 +223,37 @@ void sdasm_qgemm_6x16_au_avxvnni(std::int64_t groups, std::int64_t quads, const 
 void sdasm_qgemm_6x16_bu_avxvnni(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
                                  float * c, std::int64_t ldc, std::int64_t accumulate);
 
+// The products of 16 bits, the first parts of the tiles alone (x86_64/half.S).
+void sdasm_amx_bf16_1x1(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                        std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_amx_fp16_1x1_a2(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                           std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_amx_fp16_1x1_b2(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                           std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_amx_single_1x1(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                          std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_bf16_1x1_avx512(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                           std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_bf16_single_1x1_avx512(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                                  std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_avx10_fp16_1x1_a2(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                             std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_avx10_fp16_1x1_b2(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                             std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_fp16_1x1_a2_avx512(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                              std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_fp16_1x1_b2_avx512(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,
+                              std::int64_t b_next, float * c, std::int64_t ldc, std::int64_t accumulate);
+
 // The quantization of a panel of sixteen columns (x86_64/quantize_avx2.S).
 void sdasm_quantize16_avx2(std::uint8_t * dst, const float * src, std::int64_t groups, std::int64_t quads, float levels);
+
+// And for AVX2 without VNNI, of integers narrow enough for vpmaddubsw's words
+// (x86_64/quant_maddubs.S).
+void sdasm_qgemm_6x16_au_avx2(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
+                              float * c, std::int64_t ldc, std::int64_t accumulate);
+void sdasm_qgemm_6x16_bu_avx2(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
+                              float * c, std::int64_t ldc, std::int64_t accumulate);
 
 // And for AVX512-VNNI (x86_64/quant_avx512.S).
 void sdasm_qgemm_6x16_au_avx512(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, const std::uint8_t * b,
@@ -226,6 +272,8 @@ void sdasm_gemm_6x32_avx512(std::int64_t kc, const float * a, const float * b, s
                             std::int64_t ldc, std::int64_t accumulate);
 void sdasm_scores_6x16_avx512(std::int64_t kc, const float * a, const float * b, float * c, std::int64_t ldc,
                               float * max, float scale, std::int64_t accumulate);
+void sdasm_scores_6x32_avx512(std::int64_t kc, const float * a, const float * b, std::int64_t b_next, float * c,
+                              std::int64_t c_next, std::int64_t ldc, float * max, float scale, std::int64_t flags);
 void sdasm_exponentials_avx512(float * s, std::int64_t n, const float * max, double * total);
 void sdasm_winograd_inputs_avx512(const sdasm::Winograd_inputs * job);
 void sdasm_winograd_outputs_avx512(const float * m, std::int64_t stride, float * row0, float * row1, std::int64_t groups,
@@ -248,6 +296,11 @@ void sdasm_amx_pack_rows_f16(std::uint16_t * dst, const std::uint16_t * src, std
 void sdasm_amx_pack_weights(std::uint16_t * dst, const std::uint16_t * src, std::int64_t stride, std::int64_t cols,
                             std::int64_t k);
 void sdasm_amx_pack_panel(std::uint16_t * dst, const float * src, std::int64_t k);
+// AMX-INT8 (x86_64/amx_int8.S): the quantized products of a block of 32 by 32
+// of C on the tiles (quant.h, Qkernel_amx).
+void sdasm_amx_qgemm_32x32_au(std::int64_t groups, std::int64_t quads, const std::uint8_t * a, std::int64_t a_next,
+                              const std::uint8_t * b, std::int64_t b_next, float * c, std::int64_t ldc,
+                              std::int64_t accumulate);
 // AVX512-BF16 (x86_64/bf16_avx512.S): the same block as sdasm_amx_bf16_2x2, on
 // the vector units.
 void sdasm_bf16_2x2_avx512(std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next, const std::uint16_t * b,

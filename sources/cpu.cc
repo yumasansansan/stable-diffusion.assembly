@@ -15,11 +15,14 @@
 // holds them to a level below, for a measurement of one level against another.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <print>
 #include <string>
+#include <string_view>
 
 #include "gemm.h"
 #include "kernels.h"
@@ -32,7 +35,6 @@ Cpu detect() {
     Cpu c;
 #if SDASM_X86_64
     __builtin_cpu_init();
-    c.intel = __builtin_cpu_is("intel");
     c.avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
     c.avx512 = c.avx2 && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl") &&
                __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512dq");
@@ -40,31 +42,33 @@ Cpu detect() {
     c.avx512_fp16 = c.avx512 && __builtin_cpu_supports("avx512fp16");
     c.avx_vnni = c.avx2 && __builtin_cpu_supports("avxvnni");
     c.avx512_vnni = c.avx512 && __builtin_cpu_supports("avx512vnni");
+    c.avx10_2 = c.avx512 && c.avx512_fp16 && __builtin_cpu_supports("avx10.2");
     // AMX's tiles are a state of the processor that Linux gives a process only
     // when it asks (sdasm_amx_request(), x86_64/amx.S), and that a system which
     // does not know them never gives: what cpuid says is not enough.
     c.amx_bf16 = c.avx512_bf16 && __builtin_cpu_supports("amx-tile") && __builtin_cpu_supports("amx-bf16") &&
                  sdasm_amx_request() == 0;
     c.amx_fp16 = c.amx_bf16 && __builtin_cpu_supports("amx-fp16");
+    c.amx_int8 = c.amx_bf16 && __builtin_cpu_supports("amx-int8");
 #endif
     return c;
 }
 
 Kernels kernels_from_environment() {
-    const char * value = std::getenv("SDASM_KERNELS");
-    if (value == nullptr || *value == '\0' || std::strcmp(value, "assembly") == 0) {
+    const char * const set = std::getenv("SDASM_KERNELS");
+    const std::string_view value = set != nullptr ? set : "";
+    if (value.empty() || value == "assembly") {
         return Kernels::assembly;
     }
-    if (std::strcmp(value, "cxx") == 0) {
+    if (value == "cxx") {
         return Kernels::cxx;
     }
-    if (std::strcmp(value, "upstream") == 0) {
+    if (value == "upstream") {
         return Kernels::upstream;
     }
-    std::fprintf(stderr,
-                 "stable-diffusion.assembly: SDASM_KERNELS=%s is none of assembly, cxx and upstream; "
-                 "taking assembly\n",
-                 value);
+    std::print(stderr,
+               "stable-diffusion.assembly: SDASM_KERNELS={} is none of assembly, cxx and upstream; taking assembly\n",
+               value);
     return Kernels::assembly;
 }
 
@@ -154,13 +158,18 @@ constexpr Tuning_field kTuningFields[] = {
     {"group", &Tuning::group},
     {"weight_group", &Tuning::weight_group},
     {"quantize", &Tuning::quantize},
+    {"half_format", &Tuning::half_format},
+    {"todo", &Tuning::todo},
+    {"todo_tokens", &Tuning::todo_tokens},
 };
 
 Tuning tuning_from_environment() {
     Tuning t;
-    const char * value = std::getenv("SDASM_TUNE");
+    const char * const value = std::getenv("SDASM_TUNE");
     if (value != nullptr && !parse_tuning(value, t)) {
-        std::fprintf(stderr, "stable-diffusion.assembly: SDASM_TUNE=%s has a name it does not know\n", value);
+        std::print(stderr, "stable-diffusion.assembly: SDASM_TUNE={} has a name it does not know, or a value that is not a "
+                           "number\n",
+                   value);
     }
     return t;
 }
@@ -172,26 +181,28 @@ Tuning & current_tuning() {
 
 }  // namespace
 
-bool parse_tuning(const char * text, Tuning & t) {
+bool parse_tuning(const char * const text, Tuning & t) {
     bool ok = true;
-    std::string all = text;
+    const std::string_view all = text != nullptr ? text : "";
     for (std::size_t start = 0; start < all.size();) {
-        std::size_t comma = all.find(',', start);
-        if (comma == std::string::npos) {
-            comma = all.size();
-        }
-        const std::string item = all.substr(start, comma - start);
+        const std::size_t comma = std::min(all.find(',', start), all.size());
+        const std::string_view item = all.substr(start, comma - start);
         start = comma + 1;
         const std::size_t equals = item.find('=');
-        if (equals == std::string::npos) {
+        if (equals == std::string_view::npos) {
             ok = false;
             continue;
         }
-        const std::string name = item.substr(0, equals);
+        const std::string_view name = item.substr(0, equals);
+        const std::string_view number = item.substr(equals + 1);
+        // The whole of the value a number that an int holds, or nothing set.
+        int value = 0;
+        const auto [end, error] = std::from_chars(number.begin(), number.end(), value);
+        const bool whole = error == std::errc{} && end == number.end();
         bool known = false;
         for (const auto & f : kTuningFields) {
-            if (name == f.name) {
-                t.*f.field = std::atoi(item.c_str() + equals + 1);
+            if (name == f.name && whole) {
+                t.*f.field = value;
                 known = true;
             }
         }
@@ -215,18 +226,18 @@ const Cpu & cpu() {
 
 namespace {
 
-constexpr const char * kIsaNames[] = {"cxx", "avx2", "avx512", "amx"};
+constexpr std::array<const char *, 4> kIsaNames = {"cxx", "avx2", "avx512", "amx"};
 
 // The cap of the levels, set from the environment when it is first asked for:
 // none, unless SDASM_ISA names one.
 std::atomic<int> isa_cap{-1};
 
 int cap_from_environment() {
-    const char * value = std::getenv("SDASM_ISA");
+    const char * const value = std::getenv("SDASM_ISA");
     Isa level = Isa::amx;
     if (value != nullptr && *value != '\0' && !isa_named(value, level)) {
-        std::fprintf(stderr, "stable-diffusion.assembly: SDASM_ISA=%s is none of cxx, avx2, avx512 and amx; taking amx\n",
-                     value);
+        std::print(stderr, "stable-diffusion.assembly: SDASM_ISA={} is none of cxx, avx2, avx512 and amx; taking amx\n",
+                   value);
     }
     return static_cast<int>(level);
 }
@@ -258,12 +269,13 @@ void set_isa_cap(Isa cap) {
 }
 
 const char * isa_name(Isa level) {
-    return kIsaNames[static_cast<int>(level)];
+    return kIsaNames.at(static_cast<std::size_t>(level));
 }
 
-bool isa_named(const char * name, Isa & level) {
-    for (int i = 0; i < 4; ++i) {
-        if (std::strcmp(name, kIsaNames[i]) == 0) {
+bool isa_named(const char * const name, Isa & level) {
+    const std::string_view wanted = name != nullptr ? name : "";
+    for (std::size_t i = 0; i < kIsaNames.size(); ++i) {
+        if (wanted == kIsaNames[i]) {
             level = static_cast<Isa>(i);
             return true;
         }
@@ -302,8 +314,38 @@ Microkernel microkernel() {
 Split_form split_form(Split_use use) {
     Split_form f;
 #if SDASM_X86_64
+    // With products of 16 bits (Tuning::bits), the same tiles, their first
+    // parts multiplied alone (x86_64/half.S): on AMX's tiles; or on the vector
+    // units where there are none -- the products of FP16 weights by AVX10.2's
+    // vdpphps, pairs of FP16 summed in single precision, ggml's own rounding;
+    // or by AVX512-FP16's vfmadd231ph, summed in FP16 a block of k at a time,
+    // as on a processor with AVX512-FP16 and no AMX (and no AVX10.2) or when
+    // Tuning::half_format asks for it; otherwise, and of Winograd's two
+    // operands of single precision, AVX512-BF16's vdpbf16ps.
+    const bool half = tuning().bits == 16;
     const bool tiles = amx_kernels();
-    const bool vector = !tiles && avx512_kernels() && cpu().avx512_bf16 && tuning().bf16 != 0;
+    const int format = tuning().half_format;
+    if (half && !tiles && avx512_kernels() && use != Split_use::winograd) {
+        const bool avx10 = cpu().avx10_2 && format == 0;
+        const bool fp16 = !avx10 && cpu().avx512_fp16 && (format == 2 || (format == 0 && !cpu().avx512_bf16));
+        if (avx10 || fp16) {
+            f.fp16 = true;
+            if (use == Split_use::linear) {
+                f.kernel = avx10 ? sdasm_avx10_fp16_1x1_a2 : sdasm_fp16_1x1_a2_avx512;
+                f.b_bytes = kAmxTileBytes / 2;
+            }
+            else {
+                f.kernel = avx10 ? sdasm_avx10_fp16_1x1_b2 : sdasm_fp16_1x1_b2_avx512;
+                f.a_bytes = kAmxTileBytes / 2;
+            }
+            f.pack_rows = sdasm_amx_pack_rows_fp16;
+            f.pack_weights = sdasm_amx_pack_weights_fp16;
+            f.pack_weight_rows = sdasm_amx_pack_rows_f16_one;
+            f.pack_panel = sdasm_amx_pack_panel_fp16;
+            return f;
+        }
+    }
+    const bool vector = !tiles && avx512_kernels() && cpu().avx512_bf16 && (tuning().bf16 != 0 || half);
     if (!tiles && !vector) {
         return f;
     }
@@ -311,11 +353,11 @@ Split_form split_form(Split_use use) {
     if (tiles && use != Split_use::winograd && cpu().amx_fp16 && tuning().amx_fp16 != 0) {
         f.fp16 = true;
         if (use == Split_use::linear) {
-            f.kernel = sdasm_amx_fp16_2x2_a2;
+            f.kernel = half ? sdasm_amx_fp16_1x1_a2 : sdasm_amx_fp16_2x2_a2;
             f.b_bytes = kAmxTileBytes / 2;
         }
         else {
-            f.kernel = sdasm_amx_fp16_2x2_b2;
+            f.kernel = half ? sdasm_amx_fp16_1x1_b2 : sdasm_amx_fp16_2x2_b2;
             f.a_bytes = kAmxTileBytes / 2;
         }
         f.pack_rows = sdasm_amx_pack_rows_fp16;
@@ -324,7 +366,12 @@ Split_form split_form(Split_use use) {
         f.pack_panel = sdasm_amx_pack_panel_fp16;
         return f;
     }
-    f.kernel = tiles ? sdasm_amx_bf16_2x2 : sdasm_bf16_2x2_avx512;
+    if (half) {
+        f.kernel = tiles ? sdasm_amx_bf16_1x1 : sdasm_bf16_1x1_avx512;
+    }
+    else {
+        f.kernel = tiles ? sdasm_amx_bf16_2x2 : sdasm_bf16_2x2_avx512;
+    }
     f.pack_rows = sdasm_amx_pack_rows;
     f.pack_weights = sdasm_amx_pack_weights;
     f.pack_weight_rows = sdasm_amx_pack_rows_f16;
@@ -357,8 +404,7 @@ void split_end(const Split_form & form) {
 
 Microkernel_wide microkernel_wide() {
 #if SDASM_X86_64
-    const int wide = tuning().wide;
-    if (avx512_kernels() && (wide > 0 || (wide < 0 && cpu().intel))) {
+    if (avx512_kernels() && tuning().wide != 0) {
         return sdasm_gemm_6x32_avx512;
     }
 #endif
@@ -375,6 +421,15 @@ Scores_kernel scores_kernel() {
     }
 #endif
     return scores_6x16_cxx;
+}
+
+Scores_kernel_wide scores_kernel_wide() {
+#if SDASM_X86_64
+    if (microkernel_wide() != nullptr) {
+        return sdasm_scores_6x32_avx512;
+    }
+#endif
+    return nullptr;
 }
 
 Exponentials exponentials_kernel() {

@@ -88,7 +88,7 @@
     { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
     { "name": "release",        "configurePreset": "release" },
     { "name": "emulated",       "configurePreset": "emulated" },
-    { "name": "sanitize",       "configurePreset": "sanitize", "environment": { "ASAN_OPTIONS": "detect_leaks=0" } },
+    { "name": "sanitize",       "configurePreset": "sanitize" },
     { "name": "tsan",           "configurePreset": "tsan" }
   ],
 

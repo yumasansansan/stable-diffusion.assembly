@@ -25,40 +25,41 @@ struct Epilogue;
 
 // GGML_OP_CONV_2D, the direct convolution: by the matrix product, with the
 // columns of the image that im2col would make packed straight from the image.
-bool conv2d_supported(const ggml_tensor * node);
-std::size_t conv2d_work_size(const ggml_tensor * node, int n_threads);
-void conv2d_compute(const ggml_compute_params * params, ggml_tensor * node, const Epilogue & chain);
+bool conv2d_supported(const ggml_tensor * const node);
+std::size_t conv2d_work_size(const ggml_tensor * const node, int n_threads);
+void conv2d_compute(const ggml_compute_params * const params, const ggml_tensor * const node, const Epilogue & chain);
 
 // GGML_OP_CONV_2D of a kernel of three by three at a stride of one, by
 // Winograd's F(2x2, 3x3), which takes it before the direct convolution.
-bool winograd_supported(const ggml_tensor * node);
-std::size_t winograd_work_size(const ggml_tensor * node, int n_threads);
-void winograd_compute(const ggml_compute_params * params, ggml_tensor * node, const Epilogue & chain);
+bool winograd_supported(const ggml_tensor * const node);
+std::size_t winograd_work_size(const ggml_tensor * const node, int n_threads);
+void winograd_compute(const ggml_compute_params * const params, const ggml_tensor * const node, const Epilogue & chain);
 
 // GGML_OP_MUL_MAT of a matrix of weights, the same for every matrix of the
 // other operand, as the linear layers have it.
-bool mul_mat_supported(const ggml_tensor * node);
-std::size_t mul_mat_work_size(const ggml_tensor * node, int n_threads);
-void mul_mat_compute(const ggml_compute_params * params, ggml_tensor * node, const Epilogue & chain);
+bool mul_mat_supported(const ggml_tensor * const node);
+std::size_t mul_mat_work_size(const ggml_tensor * const node, int n_threads);
+void mul_mat_compute(const ggml_compute_params * const params, const ggml_tensor * const node, const Epilogue & chain);
 // The same with the gated GELU after it (fusion.h) into out, when the memory of
 // out allows it.
-bool mul_mat_gated_supported(const ggml_tensor * node, const Epilogue & chain, const ggml_tensor * out);
-void mul_mat_compute_gated(const ggml_compute_params * params, ggml_tensor * node, const Epilogue & chain,
-                           const ggml_tensor * out);
+bool mul_mat_gated_supported(const ggml_tensor * const node, const Epilogue & chain, const ggml_tensor * const out);
+void mul_mat_compute_gated(const ggml_compute_params * const params, const ggml_tensor * const node,
+                           const Epilogue & chain, const ggml_tensor * const out);
 
 // GGML_OP_FLASH_ATTN_EXT without a mask, as stable-diffusion.cpp's attention
 // without flash attention computes it: the scores, their softmax and the sum of
 // the values by it, with the scores of a block of queries kept in the cache.
-bool attention_supported(const ggml_tensor * node);
-std::size_t attention_work_size(const ggml_tensor * node, int n_threads);
-void attention_compute(const ggml_compute_params * params, ggml_tensor * node);
+bool attention_supported(const ggml_tensor * const node);
+std::size_t attention_work_size(const ggml_tensor * const node, int n_threads);
+void attention_compute(const ggml_compute_params * const params, const ggml_tensor * const node);
 
 // GGML_OP_GROUP_NORM and GGML_OP_NORM of single-precision tensors, with the
 // chain after them (norm.cc).
-bool group_norm_supported(const ggml_tensor * node);
-void group_norm_compute(const ggml_compute_params * params, ggml_tensor * node, const Epilogue & chain);
-bool norm_supported(const ggml_tensor * node);
-void norm_compute(const ggml_compute_params * params, ggml_tensor * node, const Epilogue & chain);
+bool group_norm_supported(const ggml_tensor * const node);
+void group_norm_compute(const ggml_compute_params * const params, const ggml_tensor * const node,
+                        const Epilogue & chain);
+bool norm_supported(const ggml_tensor * const node);
+void norm_compute(const ggml_compute_params * const params, const ggml_tensor * const node, const Epilogue & chain);
 
 }  // namespace sdasm
 

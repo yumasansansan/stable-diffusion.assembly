@@ -34,39 +34,41 @@
 // avx2 or avx512.
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <exception>
+#include <format>
 #include <functional>
+#include <print>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "kernels.h"
+#include "memory.h"
 
 #include "ggml-cpu.h"
 #include "ggml.h"
 
 namespace {
 
-void fill(ggml_tensor * t) {
+void fill(const ggml_tensor * const t) {
     static std::mt19937 g(1);
     std::uniform_real_distribution<float> d(-1.0f, 1.0f);
-    const std::int64_t n = ggml_nelements(t);
     if (t->type == GGML_TYPE_F32) {
-        auto * p = static_cast<float *>(t->data);
-        for (std::int64_t i = 0; i < n; ++i) {
-            p[i] = d(g);
+        for (float & x : sdasm::elements_of<float>(t)) {
+            x = d(g);
         }
     }
     else {
-        auto * p = static_cast<ggml_fp16_t *>(t->data);
-        for (std::int64_t i = 0; i < n; ++i) {
-            p[i] = ggml_fp32_to_fp16(d(g));
+        for (std::uint16_t & x : sdasm::elements_of<std::uint16_t>(t)) {
+            x = ggml_fp32_to_fp16(d(g));
         }
     }
 }
@@ -78,12 +80,11 @@ struct Case {
 };
 
 Case conv(int w, int h, int ic, int oc, int k, int n) {
-    char name[96];
-    std::snprintf(name, sizeof name, "conv2d %dx%dx%d -> %d, %dx%d, %d images", w, h, ic, oc, k, k, n);
+    const std::string name = std::format("conv2d {}x{}x{} -> {}, {}x{}, {} images", w, h, ic, oc, k, k, n);
     const double flops = 2.0 * w * h * ic * oc * k * k * n;
-    return {name, flops, [=](ggml_context * ctx) {
-                ggml_tensor * kernel = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k, k, ic, oc);
-                ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w, h, ic, n);
+    return {name, flops, [=](ggml_context * const ctx) {
+                ggml_tensor * const kernel = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, k, k, ic, oc);
+                ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w, h, ic, n);
                 fill(kernel);
                 fill(x);
                 return ggml_conv_2d_direct(ctx, kernel, x, 1, 1, k / 2, k / 2, 1, 1);
@@ -91,12 +92,11 @@ Case conv(int w, int h, int ic, int oc, int k, int n) {
 }
 
 Case linear(int in, int out, int rows, int batch) {
-    char name[96];
-    std::snprintf(name, sizeof name, "linear %d -> %d, %d rows x %d", in, out, rows, batch);
+    const std::string name = std::format("linear {} -> {}, {} rows x {}", in, out, rows, batch);
     const double flops = 2.0 * in * out * rows * batch;
-    return {name, flops, [=](ggml_context * ctx) {
-                ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, in, out);
-                ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in, rows, batch);
+    return {name, flops, [=](ggml_context * const ctx) {
+                ggml_tensor * const w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, in, out);
+                ggml_tensor * const x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, in, rows, batch);
                 fill(w);
                 fill(x);
                 return ggml_mul_mat(ctx, w, x);
@@ -104,20 +104,20 @@ Case linear(int in, int out, int rows, int batch) {
 }
 
 Case attention(int d, int heads, int lq, int lk, int batch) {
-    char name[96];
-    std::snprintf(name, sizeof name, "attention %d x %d heads, %d queries, %d keys, %d batches", d, heads, lq, lk, batch);
+    const std::string name = std::format("attention {} x {} heads, {} queries, {} keys, {} batches", d, heads, lq, lk, batch);
     const double flops = 4.0 * d * heads * lq * static_cast<double>(lk) * batch;
-    return {name, flops, [=](ggml_context * ctx) {
-                ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d * heads, lq, batch);
-                ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d * heads, lk, batch);
-                ggml_tensor * v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d * heads, lk, batch);
+    return {name, flops, [=](ggml_context * const ctx) {
+                ggml_tensor * const q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d * heads, lq, batch);
+                ggml_tensor * const k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d * heads, lk, batch);
+                ggml_tensor * const v = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d * heads, lk, batch);
                 fill(q);
                 fill(k);
                 fill(v);
-                ggml_tensor * qv = ggml_permute(ctx, ggml_reshape_4d(ctx, q, d, heads, lq, batch), 0, 2, 1, 3);
-                ggml_tensor * kv = ggml_permute(ctx, ggml_reshape_4d(ctx, k, d, heads, lk, batch), 0, 2, 1, 3);
-                ggml_tensor * vv = ggml_permute(ctx, ggml_reshape_4d(ctx, v, d, heads, lk, batch), 0, 2, 1, 3);
-                ggml_tensor * out = ggml_flash_attn_ext(ctx, qv, kv, vv, nullptr, 1.0f / std::sqrt(static_cast<float>(d)), 0, 0);
+                ggml_tensor * const qv = ggml_permute(ctx, ggml_reshape_4d(ctx, q, d, heads, lq, batch), 0, 2, 1, 3);
+                ggml_tensor * const kv = ggml_permute(ctx, ggml_reshape_4d(ctx, k, d, heads, lk, batch), 0, 2, 1, 3);
+                ggml_tensor * const vv = ggml_permute(ctx, ggml_reshape_4d(ctx, v, d, heads, lk, batch), 0, 2, 1, 3);
+                ggml_tensor * const out = ggml_flash_attn_ext(ctx, qv, kv, vv, nullptr,
+                                                              1.0f / std::sqrt(static_cast<float>(d)), 0, 0);
                 ggml_prec_set_acc(out, GGML_PREC_F32);
                 return out;
             }};
@@ -163,15 +163,17 @@ struct Config {
 
 int info() {
     const sdasm::Cpu & c = sdasm::cpu();
-    std::printf("avx2 %d avx512 %d avx512_bf16 %d avx512_fp16 %d avx_vnni %d amx_bf16 %d amx_fp16 %d\n", c.avx2, c.avx512,
-                c.avx512_bf16, c.avx512_fp16, c.avx_vnni, c.amx_bf16, c.amx_fp16);
-    std::printf("levels:");
+    std::print("avx2 {:d} avx512 {:d} avx512_bf16 {:d} avx512_fp16 {:d} avx10_2 {:d} avx_vnni {:d} avx512_vnni {:d} amx_bf16 {:d} "
+               "amx_fp16 {:d} amx_int8 {:d}\n",
+               c.avx2, c.avx512, c.avx512_bf16, c.avx512_fp16, c.avx10_2, c.avx_vnni, c.avx512_vnni, c.amx_bf16, c.amx_fp16,
+               c.amx_int8);
+    std::print("levels:");
     for (const sdasm::Isa level : {sdasm::Isa::avx2, sdasm::Isa::avx512, sdasm::Isa::amx}) {
         if (sdasm::isa_available() >= level) {
-            std::printf(" %s", sdasm::isa_name(level));
+            std::print(" {}", sdasm::isa_name(level));
         }
     }
-    std::printf("\nkernels in effect: %s\n", sdasm::kernels_isa());
+    std::print("\nkernels in effect: {}\n", sdasm::kernels_isa());
     return 0;
 }
 
@@ -210,14 +212,14 @@ double peak(void (*kernel)(std::int64_t, const float *), double flops_per_n, int
     return best;
 }
 
-int peaks(int threads, double seconds, std::FILE * table) {
+int peaks(int threads, double seconds, std::FILE * const table) {
 #if SDASM_X86_64
-    std::printf("%d threads, %.1f s at each width; GFLOP/s of the fastest round\n", threads, seconds);
-    const auto one = [&](const char * name, void (*kernel)(std::int64_t, const float *), double flops) {
+    std::print("{} threads, {:.1f} s at each width; GFLOP/s of the fastest round\n", threads, seconds);
+    const auto one = [&](const char * const name, void (*kernel)(std::int64_t, const float *), double flops) {
         const double rate = peak(kernel, flops, threads, seconds) * 1e-9;
-        std::printf("fma peak %-8s %10.1f\n", name, rate);
+        std::print("fma peak {:<8} {:10.1f}\n", name, rate);
         if (table != nullptr) {
-            std::fprintf(table, "fma peak\t%s\t%s\t%d\t%.2f\t0\n", name, name, threads, rate);
+            std::print(table, "fma peak\t{}\t{}\t{}\t{:.2f}\t0\n", name, name, threads, rate);
         }
     };
     if (sdasm::cpu().avx2) {
@@ -236,48 +238,72 @@ double now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-}  // namespace
+// A form by its name, added to configs: one of SDASM_KERNELS, or a level of
+// the kernels written by hand, left out with a word on a processor without
+// that level. False when no form has the name.
+bool add_form(std::vector<Config> & configs, const std::string & f, const char * const program) {
+    for (const auto k : {sdasm::Kernels::assembly, sdasm::Kernels::cxx, sdasm::Kernels::upstream}) {
+        if (f == sdasm::kernels_name(k)) {
+            configs.push_back({f, k, sdasm::Isa::amx, sdasm::tuning()});
+            return true;
+        }
+    }
+    sdasm::Isa level{};
+    if (sdasm::isa_named(f.c_str(), level) && level != sdasm::Isa::cxx) {
+        if (sdasm::isa_available() < level) {
+            std::print(stderr, "{}: this processor has no {}; leaving it out\n", program, f.c_str());
+            return true;
+        }
+        configs.push_back({f, sdasm::Kernels::assembly, level, sdasm::tuning()});
+        return true;
+    }
+    return false;
+}
 
-int main(int argc, char ** argv) {
+int run(int argc, char ** const argv) {
+    const std::vector<std::string_view> arguments = sdasm::program_arguments(argc, argv);
+    const std::string program(arguments.empty() ? "sdasm_bench" : arguments.front());
     int threads = static_cast<int>(std::thread::hardware_concurrency());
     double seconds = 2.0;
     std::string only;
     std::string tsv;
     bool peak_only = false;
     std::vector<Config> configs;
-    // A form by its name: one of SDASM_KERNELS, or a level of the kernels
-    // written by hand, which is false on a processor without that level.
-    const auto add_form = [&](const std::string & f) {
-        for (auto k : {sdasm::Kernels::assembly, sdasm::Kernels::cxx, sdasm::Kernels::upstream}) {
-            if (f == sdasm::kernels_name(k)) {
-                configs.push_back({f, k, sdasm::Isa::amx, sdasm::tuning()});
-                return true;
-            }
+    // The value after an option, a number of its type: false when there is none.
+    const auto number = [&](std::size_t & i, auto & value) {
+        if (i + 1 >= arguments.size()) {
+            return false;
         }
-        sdasm::Isa level{};
-        if (sdasm::isa_named(f.c_str(), level) && level != sdasm::Isa::cxx) {
-            if (sdasm::isa_available() < level) {
-                std::fprintf(stderr, "%s: this processor has no %s; leaving it out\n", argv[0], f.c_str());
-                return true;
-            }
-            configs.push_back({f, sdasm::Kernels::assembly, level, sdasm::tuning()});
-            return true;
-        }
-        return false;
+        const std::string_view text = arguments[++i];
+        const auto [end, error] = std::from_chars(text.begin(), text.end(), value);
+        return error == std::errc{} && end == text.end();
     };
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "--threads" && i + 1 < argc) {
-            threads = std::atoi(argv[++i]);
+    const auto usage = [&]() {
+        std::print(stderr,
+                   "usage: {0} [--threads N] [--seconds S] [--forms assembly,avx2,avx512,amx,cxx,upstream]\n"
+                   "          [--variant label:name=value,...]... [--only text] [--tsv file]\n"
+                   "       {0} --info\n"
+                   "       {0} --peak [--threads N] [--seconds S] [--tsv file]\n",
+                   program);
+        return 2;
+    };
+    for (std::size_t i = 1; i < arguments.size(); ++i) {
+        const std::string_view a = arguments[i];
+        if (a == "--threads") {
+            if (!number(i, threads) || threads < 1) {
+                return usage();
+            }
         }
-        else if (a == "--seconds" && i + 1 < argc) {
-            seconds = std::atof(argv[++i]);
+        else if (a == "--seconds") {
+            if (!number(i, seconds) || !(seconds >= 0)) {
+                return usage();
+            }
         }
-        else if (a == "--only" && i + 1 < argc) {
-            only = argv[++i];
+        else if (a == "--only" && i + 1 < arguments.size()) {
+            only = arguments[++i];
         }
-        else if (a == "--tsv" && i + 1 < argc) {
-            tsv = argv[++i];
+        else if (a == "--tsv" && i + 1 < arguments.size()) {
+            tsv = arguments[++i];
         }
         else if (a == "--info") {
             return info();
@@ -285,23 +311,23 @@ int main(int argc, char ** argv) {
         else if (a == "--peak") {
             peak_only = true;
         }
-        else if (a == "--forms" && i + 1 < argc) {
-            const std::string list = argv[++i];
+        else if (a == "--forms" && i + 1 < arguments.size()) {
+            const std::string list(arguments[++i]);
             for (std::size_t start = 0; start <= list.size();) {
                 const std::size_t comma = std::min(list.find(',', start), list.size());
                 const std::string f = list.substr(start, comma - start);
-                if (!f.empty() && !add_form(f)) {
-                    std::fprintf(stderr, "%s: no form is called %s\n", argv[0], f.c_str());
+                if (!f.empty() && !add_form(configs, f, program.c_str())) {
+                    std::print(stderr, "{}: no form is called {}\n", program, f);
                     return 2;
                 }
                 start = comma + 1;
             }
         }
-        else if (a == "--variant" && i + 1 < argc) {
+        else if (a == "--variant" && i + 1 < arguments.size()) {
             // label:name=value,... -- the kernels written by hand, tuned so;
             // isa=<level> among the names holds them to that level, and leaves
             // the variant out on a processor without it.
-            const std::string v = argv[++i];
+            const std::string v(arguments[++i]);
             const std::size_t colon = v.find(':');
             Config c{v.substr(0, colon), sdasm::Kernels::assembly, sdasm::Isa::amx, sdasm::tuning()};
             std::string names = colon != std::string::npos ? v.substr(colon + 1) : std::string();
@@ -311,7 +337,7 @@ int main(int argc, char ** argv) {
                 const std::size_t end = std::min(names.find(',', at), names.size());
                 const std::string level = names.substr(at + 4, end - at - 4);
                 if (!sdasm::isa_named(level.c_str(), c.level) || c.level == sdasm::Isa::cxx) {
-                    std::fprintf(stderr, "%s: no level is called %s\n", argv[0], level.c_str());
+                    std::print(stderr, "{}: no level is called {}\n", program, level);
                     return 2;
                 }
                 names.erase(at, end < names.size() ? end - at + 1 : end - at);
@@ -320,66 +346,79 @@ int main(int argc, char ** argv) {
                 }
             }
             if (!names.empty() && !sdasm::parse_tuning(names.c_str(), c.tuning)) {
-                std::fprintf(stderr, "%s: a name it does not know in %s\n", argv[0], v.c_str());
+                std::print(stderr, "{}: a name it does not know, or a value that is not a number, in {}\n", program, v);
                 return 2;
             }
             if (level_given && sdasm::isa_available() < c.level) {
-                std::fprintf(stderr, "%s: this processor has no %s; leaving %s out\n", argv[0],
-                             sdasm::isa_name(c.level), c.label.c_str());
+                std::print(stderr, "{}: this processor has no {}; leaving {} out\n", program, sdasm::isa_name(c.level),
+                           c.label);
                 continue;
             }
             if (c.tuning.bf16 != 0 && !sdasm::cpu().avx512_bf16) {
-                std::fprintf(stderr, "%s: this processor has no AVX512-BF16; leaving %s out\n", argv[0], c.label.c_str());
+                std::print(stderr, "{}: this processor has no AVX512-BF16; leaving {} out\n", program, c.label);
+                continue;
+            }
+            // Products of 16 bits where the level they run at has some: AMX's
+            // tiles, AVX512-BF16, AVX512-FP16 or AVX10.2 at avx512 and above.
+            // Elsewhere they are the products of single precision again.
+            const sdasm::Cpu & cpu = sdasm::cpu();
+            const sdasm::Isa level = std::min(c.level, sdasm::isa_available());
+            if (c.tuning.bits == 16 &&
+                !(level >= sdasm::Isa::avx512 && (cpu.amx_bf16 || cpu.avx512_bf16 || cpu.avx512_fp16 || cpu.avx10_2))) {
+                std::print(stderr, "{}: this processor has no products of 16 bits; leaving {} out\n", program, c.label);
+                continue;
+            }
+            if (c.tuning.half_format == 2 && !cpu.avx512_fp16) {
+                std::print(stderr, "{}: this processor has no AVX512-FP16; leaving {} out\n", program, c.label);
                 continue;
             }
             configs.push_back(c);
         }
         else {
-            std::fprintf(stderr,
-                         "usage: %s [--threads N] [--seconds S] [--forms assembly,avx2,avx512,amx,cxx,upstream]\n"
-                         "          [--variant label:name=value,...]... [--only text] [--tsv file]\n"
-                         "       %s --info\n"
-                         "       %s --peak [--threads N] [--seconds S] [--tsv file]\n",
-                         argv[0], argv[0], argv[0]);
-            return 2;
+            return usage();
         }
     }
     if (configs.empty()) {
-        for (const char * f : {"assembly", "cxx", "upstream"}) {
-            add_form(f);
+        for (const char * const f : {"assembly", "cxx", "upstream"}) {
+            add_form(configs, f, program.c_str());
         }
     }
     std::FILE * table = nullptr;
     if (!tsv.empty()) {
         table = std::fopen(tsv.c_str(), "a");
         if (table == nullptr) {
-            std::fprintf(stderr, "%s: cannot open %s\n", argv[0], tsv.c_str());
+            std::print(stderr, "{}: cannot open {}\n", program, tsv);
             return 1;
         }
     }
+    // The table closed, and every line of it written.
+    const auto close = [&]() {
+        if (table != nullptr && std::fclose(table) != 0) {
+            std::print(stderr, "{}: cannot write {}\n", program, tsv);
+            return false;
+        }
+        return true;
+    };
     if (peak_only) {
         const int status = peaks(threads, seconds, table);
-        if (table != nullptr) {
-            std::fclose(table);
-        }
-        return status;
+        return close() ? status : 1;
     }
-    std::printf("%d threads, %.1f s an operation and configuration, taking turns; GFLOP/s of the fastest computation\n",
+    std::print("{} threads, {:.1f} s an operation and configuration, taking turns; GFLOP/s of the fastest computation\n",
                 threads, seconds);
-    std::printf("%-56s", "");
+    std::print("{:<56}", "");
     for (const auto & c : configs) {
-        std::printf(" %10s", c.label.c_str());
+        std::print(" {:10}", c.label.c_str());
     }
-    std::printf("\n");
+    std::print("\n");
     std::vector<std::uint8_t> work;
     for (const Case & c : cases()) {
         if (!only.empty() && c.name.find(only) == std::string::npos) {
             continue;
         }
-        ggml_init_params params{std::size_t{1} << 30, nullptr, false};
-        ggml_context * ctx = ggml_init(params);
-        ggml_tensor * out = c.build(ctx);
-        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_init_params const params{std::size_t{1} << 30, nullptr, false};
+        ggml_context * const ctx = ggml_init(params);
+        ggml_tensor * const out = c.build(ctx);
+        ggml_cgraph * const graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, out);
         // The configurations take turns, a computation each, so that a processor
         // that slows as it warms slows them alike.
@@ -406,26 +445,58 @@ int main(int argc, char ** argv) {
                 best[i] = std::min(best[i], compute(configs[i]));
             }
         }
-        std::printf("%-56s", c.name.c_str());
-        for (double b : best) {
-            std::printf(" %10.1f", c.flops / b * 1e-9);
+        std::print("{:<56}", c.name.c_str());
+        for (const double b : best) {
+            std::print(" {:10.1f}", c.flops / b * 1e-9);
         }
-        std::printf("\n");
-        std::fflush(stdout);
+        std::print("\n");
+        if (std::fflush(stdout) != 0) {
+            close();
+            return 1;
+        }
         if (table != nullptr) {
             for (std::size_t i = 0; i < configs.size(); ++i) {
                 sdasm::set_kernels(configs[i].form);
                 sdasm::set_isa_cap(configs[i].level);
                 const bool upstream = configs[i].form == sdasm::Kernels::upstream;
-                std::fprintf(table, "%s\t%s\t%s\t%d\t%.2f\t%.6f\n", c.name.c_str(), configs[i].label.c_str(),
+                std::print(table, "{}\t{}\t{}\t{}\t{:.2f}\t{:.6f}\n", c.name.c_str(), configs[i].label.c_str(),
                              upstream ? "ggml" : sdasm::kernels_isa(), threads, c.flops / best[i] * 1e-9, best[i]);
             }
-            std::fflush(table);
+            if (std::fflush(table) != 0) {
+                std::print(stderr, "{}: cannot write {}\n", program, tsv);
+                close();
+                return 1;
+            }
         }
         ggml_free(ctx);
     }
-    if (table != nullptr) {
-        std::fclose(table);
+    return close() ? 0 : 1;
+}
+
+// A line of what went wrong on the standard error, which throws nothing: a
+// line that cannot be written goes unwritten.
+void report(std::string_view what, std::string_view detail) noexcept {
+    try {
+        std::print(stderr, "{}{}\n", what, detail);
     }
-    return 0;
+    catch (...) {
+        return;
+    }
+}
+
+}  // namespace
+
+// An exception -- of a container short of memory, say -- ends the program, with
+// what it says.
+int main(int argc, char ** const argv) {
+    try {
+        return run(argc, argv);
+    }
+    catch (const std::exception & e) {
+        report("sdasm_bench: ", e.what());
+    }
+    catch (...) {
+        report("sdasm_bench: ", "an exception of no known type");
+    }
+    return 1;
 }

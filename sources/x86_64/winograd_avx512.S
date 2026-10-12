@@ -53,6 +53,8 @@
 .set J_B_STEP, 40
 .set J_CHANNELS, 48
 .set J_SUBTRACT, 64
+.set J_A_OFFSET, 80               // bytes from row A to the tiles' first input
+.set J_B_OFFSET, 88
 .set J_LANES, 72                // four 16-bit masks: the loads at 0, 16, 2, 18
 
 // The four columns of B^T d of the sixteen tiles of the row at \row, into
@@ -83,8 +85,13 @@ sdasm_winograd_inputs_avx512:
         mov rax, [rdi + J_DST]
         mov rdx, [rdi + J_STRIDE]
         lea r10, [rdx + 2*rdx]
+        // The rows at the tiles' first inputs, which may lie before the
+        // rows: the addresses are formed here, and nothing outside the
+        // image is read (the masks).
         mov rsi, [rdi + J_A]
+        add rsi, [rdi + J_A_OFFSET]
         mov rcx, [rdi + J_B]
+        add rcx, [rdi + J_B_OFFSET]
         mov r8, [rdi + J_CHANNELS]
         kmovw k1, [rdi + J_LANES + 0]
         kmovw k2, [rdi + J_LANES + 2]

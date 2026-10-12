@@ -35,6 +35,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "memory.h"
+
 struct ggml_compute_params;
 
 namespace sdasm {
@@ -55,7 +57,11 @@ Microkernel microkernel();
 // the second panel b_next bytes after the first: for processors whose loads,
 // not their multiplications, hold back the tile of one panel
 // (x86_64/gemm_avx512.S). None where there is none, or the tuning says not
-// to take it (Tuning::wide).
+// to take it (Tuning::wide), which takes it by default on every processor with
+// AVX-512. On GitHub's runners (the workflow Measure), against the tile of one
+// panel, it made the linear layers and the convolutions of Ice Lake-SP 18 to
+// 60% faster and those of Zen 5 8 to 21%, and those of Zen 4, whose units take
+// the 512 bits in two halves, no faster and no slower (-2 to +3%).
 using Microkernel_wide = void (*)(std::int64_t kc, const float * a, const float * b, std::int64_t b_next, float * c,
                                   std::int64_t ldc, std::int64_t accumulate);
 
@@ -78,6 +84,17 @@ using Scores_kernel = void (*)(std::int64_t kc, const float * a, const float * b
 
 Scores_kernel scores_kernel();
 
+// The same of a tile of kMr keys by two panels of queries, 2 * kNr, the second
+// b_next bytes after the first, its two halves written to two tiles of the
+// scores c_next bytes apart, each rows ldc bytes apart; with bit 0 of flags
+// added to them, with bit 1 scaled and max[0..2 kNr) raised, without it a
+// partial sum (x86_64/gemm_avx512.S). Where the wide micro-kernel is taken,
+// whose loads it shares; none otherwise.
+using Scores_kernel_wide = void (*)(std::int64_t kc, const float * a, const float * b, std::int64_t b_next, float * c,
+                                    std::int64_t c_next, std::int64_t ldc, float * max, float scale, std::int64_t flags);
+
+Scores_kernel_wide scores_kernel_wide();
+
 // The exponentials of attention's softmax (attention.cc): the scaled scores of
 // n keys, n a multiple of eight, for kNr queries, [key][kNr], in place,
 // exp(score - max[query]), and their sums added to total[query] in double
@@ -96,51 +113,60 @@ struct Gemm_plan {
     std::size_t thread_bytes;
 };
 
-inline constexpr std::size_t kAlign = 64;
+inline constexpr std::size_t kAlign = kWorkAlign;
 
 constexpr std::size_t align_up(std::size_t n, std::size_t a = kAlign) {
     return (n + a - 1) / a * a;
 }
 
-// Packs rows [r0, r0 + rows) of a matrix whose rows of k elements lie `stride`
-// bytes apart into panels of P rows, [panel][k1 - k0][P], with the rows past
-// the end of the matrix as zeros: P is kMr or kNr. The elements are float or
-// FP16 (ggml_fp16_t, IEEE half), widened to float.
-void pack_rows_f32(float * dst, const float * src, std::int64_t stride, std::int64_t rows,
+// The bytes of n elements of T, as the kernels written by hand take strides.
+template <class T>
+constexpr std::int64_t bytes_of(std::int64_t n) {
+    return n * static_cast<std::int64_t>(sizeof(T));
+}
+
+// Packs rows [0, rows) of a matrix, src, whose rows of k elements lie `stride`
+// elements apart, into panels of P rows, [panel][k1 - k0][P], with the rows
+// past the end of the matrix as zeros: P is kMr or kNr. The elements are float
+// or FP16 (the bits of an IEEE half), widened to float.
+void pack_rows_f32(Elements<float> dst, Elements<const float> src, std::int64_t stride, std::int64_t rows,
                    std::int64_t k0, std::int64_t k1, int p);
-void pack_rows_f16(float * dst, const std::uint16_t * src, std::int64_t stride, std::int64_t rows,
+void pack_rows_f16(Elements<float> dst, Elements<const std::uint16_t> src, std::int64_t stride, std::int64_t rows,
                    std::int64_t k0, std::int64_t k1, int p);
 
 // The part of a tile that rows and cols say: the micro-kernel's whole tile
 // into a buffer of its own, and the part copied out.
-void tile_part(Microkernel uk, std::int64_t kc, const float * a, const float * b, float * c, std::int64_t ldc,
-               bool accumulate, std::int64_t rows, std::int64_t cols);
+void tile_part(Microkernel uk, std::int64_t kc, Elements<const float> a, Elements<const float> b, Elements<float> c,
+               std::int64_t ldc, bool accumulate, std::int64_t rows, std::int64_t cols);
 
-// Computes one tile of C from two panels, a kMr by kNr tile when rows and cols
-// say it is whole, and the part of one that they say otherwise.
-inline void tile(Microkernel uk, std::int64_t kc, const float * a, const float * b, float * c, std::int64_t ldc,
-                 bool accumulate, std::int64_t rows, std::int64_t cols) {
+// Computes one tile of C from two panels, a of kc kMr numbers and b of kc kNr,
+// into c, rows ldc elements apart: a kMr by kNr tile when rows and cols say it
+// is whole, and the part of one that they say otherwise.
+inline void tile(Microkernel uk, std::int64_t kc, Elements<const float> a, Elements<const float> b, Elements<float> c,
+                 std::int64_t ldc, bool accumulate, std::int64_t rows, std::int64_t cols) {
     if (rows == kMr && cols == kNr) {
-        uk(kc, a, b, c, ldc, accumulate ? 1 : 0);
+        SDASM_CHECK(a.size() >= kc * kMr && b.size() >= kc * kNr && c.size() >= (kMr - 1) * ldc + kNr);
+        uk(kc, a.data(), b.data(), c.data(), bytes_of<float>(ldc), accumulate ? 1 : 0);
         return;
     }
     tile_part(uk, kc, a, b, c, ldc, accumulate, rows, cols);
 }
 
 // The tiles of a panel of A and of the panels of B at b, cols columns of them,
-// at most panel_step(wide): the second panel b_next bytes after the first. By
-// the wide micro-kernel when there is one and the two panels are whole, and a
-// panel at a time by tile() otherwise.
-inline void tiles(Microkernel uk, Microkernel_wide wide, std::int64_t kc, const float * a, const float * b,
-                  std::int64_t b_next, float * c, std::int64_t ldc, bool accumulate, std::int64_t rows, std::int64_t cols) {
+// at most panel_step(wide): the second panel b_next elements after the first.
+// By the wide micro-kernel when there is one and the two panels are whole, and
+// a panel at a time by tile() otherwise.
+inline void tiles(Microkernel uk, Microkernel_wide wide, std::int64_t kc, Elements<const float> a, Elements<const float> b,
+                  std::int64_t b_next, Elements<float> c, std::int64_t ldc, bool accumulate, std::int64_t rows,
+                  std::int64_t cols) {
     if (wide != nullptr && rows == kMr && cols == 2 * kNr) {
-        wide(kc, a, b, b_next, c, ldc, accumulate ? 1 : 0);
+        SDASM_CHECK(a.size() >= kc * kMr && b.size() >= b_next + kc * kNr && c.size() >= (kMr - 1) * ldc + 2 * kNr);
+        wide(kc, a.data(), b.data(), bytes_of<float>(b_next), c.data(), bytes_of<float>(ldc), accumulate ? 1 : 0);
         return;
     }
     tile(uk, kc, a, b, c, ldc, accumulate, rows, cols < kNr ? cols : kNr);
     if (cols > kNr) {
-        tile(uk, kc, a, reinterpret_cast<const float *>(reinterpret_cast<const char *>(b) + b_next), c + kNr, ldc, accumulate,
-             rows, cols - kNr);
+        tile(uk, kc, a, b.from(b_next), c.from(kNr), ldc, accumulate, rows, cols - kNr);
     }
 }
 
@@ -195,13 +221,13 @@ void split_begin(const Split_form & form);
 void split_end(const Split_form & form);
 
 // A block of 32 by 32 of C over `blocks` blocks of k, from the tiles of A at a
-// (those of its rows 16 to 31 a_next bytes after) and of B at b (its columns
-// 16 to 31 b_next bytes after): straight into c, rows ldc bytes apart, when
-// the block is whole, rows by cols, and through `spare`, 32 by 32, when it
-// reaches past C; added to C when accumulate says so.
-void split_block(const Split_form & form, std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next,
-                 const std::uint16_t * b, std::int64_t b_next, float * c, std::int64_t ldc, bool accumulate,
-                 std::int64_t rows, std::int64_t cols, float * spare);
+// (those of its rows 16 to 31 a_next elements after) and of B at b (its
+// columns 16 to 31 b_next elements after): straight into c, rows ldc elements
+// apart, when the block is whole, rows by cols, and through `spare`, 32 by 32,
+// when it reaches past C; added to C when accumulate says so.
+void split_block(const Split_form & form, std::int64_t blocks, Elements<const std::uint16_t> a, std::int64_t a_next,
+                 Elements<const std::uint16_t> b, std::int64_t b_next, Elements<float> c, std::int64_t ldc,
+                 bool accumulate, std::int64_t rows, std::int64_t cols, Elements<float> spare);
 
 // A stretch of one of several ranges of the same length -- the positions of
 // one image of a batch, say -- that a block of work covers.
@@ -229,14 +255,21 @@ std::vector<Block> guided_blocks(std::int64_t segments, std::int64_t length, std
 // handed out by a counter that ggml's thread pool keeps for its own kernels.
 // An operation of two phases numbers the items of both in one sequence and has
 // the threads meet at barrier() between them: an item a thread takes past the
-// end of the first phase is the first it does in the second.
+// end of the first phase is the first it does in the second. The threads first
+// meet in the constructor, and the arrays of the operation's work buffer, which
+// each thread began the lifetimes of before, are theirs to reach after it
+// (memory.h).
 class Work_queue {
 public:
-    explicit Work_queue(const ggml_compute_params * params);
+    explicit Work_queue(const ggml_compute_params * const params [[clang::lifetimebound]]);
+    Work_queue(const ggml_compute_params * const params [[clang::lifetimebound]], Work_buffer & buffer);
     int next();
     void barrier() const;
 
 private:
+    // The first meeting, where the first thread sets the counter.
+    void meet() const;
+
     const ggml_compute_params * params_;
     bool first_ = true;
 };

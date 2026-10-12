@@ -11,8 +11,8 @@
 #include "phases.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
-#include <cstring>
 
 #include "ggml-cpu-impl.h"
 
@@ -20,33 +20,33 @@ namespace sdasm {
 
 namespace {
 
-// Rows [r0, r0 + rows) of a matrix into panels of p rows, [panel][k1 - k0][p]:
-// for each k, the p numbers of a panel side by side, zeros for the rows past
-// the end. Each panel is read a row at a time, along k, and written a column at
-// a time; the compiler vectorizes the reading. With the kernels written by hand
+// Rows [0, rows) of a matrix into panels of p rows, [panel][k1 - k0][p]: for
+// each k, the p numbers of a panel side by side, zeros for the rows past the
+// end. Each panel is read a row at a time, along k, and written a column at a
+// time; the compiler vectorizes the reading. With the kernels written by hand
 // for AVX2, a whole panel of six or sixteen rows is transposed by them (x86_64/
 // pack_avx2.S), eight numbers of each row at a time, and only what is left
 // past the last eight of k here.
 template <class T, class Widen, class Hand>
-void pack(float * dst, const T * src, std::int64_t stride, std::int64_t rows, std::int64_t k0, std::int64_t k1, int p,
-          Widen widen, Hand hand) {
+void pack(Elements<float> dst, Elements<const T> src, std::int64_t stride, std::int64_t rows, std::int64_t k0,
+          std::int64_t k1, int p, Widen widen, Hand hand) {
     const std::int64_t kc = k1 - k0;
-    const char * base = reinterpret_cast<const char *>(src);
-    for (std::int64_t r0 = 0; r0 < rows; r0 += p, dst += kc * p) {
+    for (std::int64_t r0 = 0; r0 < rows; r0 += p) {
+        const Elements<float> panel = dst.part(r0 / p * kc * p, kc * p);
         const std::int64_t valid = std::min<std::int64_t>(p, rows - r0);
         std::int64_t done = 0;
         if (valid == p) {
-            done = hand(dst, reinterpret_cast<const T *>(base + r0 * stride) + k0, kc);
+            done = hand(panel, src.from(r0 * stride + k0), kc);
         }
         for (std::int64_t i = 0; i < valid; ++i) {
-            const T * row = reinterpret_cast<const T *>(base + (r0 + i) * stride) + k0;
+            const Elements<const T> row = src.part((r0 + i) * stride + k0, kc);
             for (std::int64_t k = done; k < kc; ++k) {
-                dst[k * p + i] = widen(row[k]);
+                panel[k * p + i] = widen(row[k]);
             }
         }
         for (std::int64_t i = valid; i < p; ++i) {
             for (std::int64_t k = done; k < kc; ++k) {
-                dst[k * p + i] = 0.0f;
+                panel[k * p + i] = 0.0f;
             }
         }
     }
@@ -54,14 +54,17 @@ void pack(float * dst, const T * src, std::int64_t stride, std::int64_t rows, st
 
 }  // namespace
 
-void pack_rows_f32(float * dst, const float * src, std::int64_t stride, std::int64_t rows, std::int64_t k0,
+void pack_rows_f32(Elements<float> dst, Elements<const float> src, std::int64_t stride, std::int64_t rows, std::int64_t k0,
                    std::int64_t k1, int p) {
     pack(dst, src, stride, rows, k0, k1, p, [](float x) { return x; },
-         [&](float * d, const float * s, std::int64_t kc) -> std::int64_t {
+         [&](Elements<float> d, Elements<const float> s, std::int64_t kc) -> std::int64_t {
 #if SDASM_X86_64
              if (avx2_kernels() && (p == 16 || p == 6)) {
+                 // Eight numbers of each of the p rows at a time.
                  const std::int64_t whole = kc / 8 * 8;
-                 (p == 16 ? sdasm_pack16_f32_avx2 : sdasm_pack6_f32_avx2)(d, s, stride, whole);
+                 SDASM_CHECK(d.size() >= whole * p && (whole == 0 || s.size() >= (p - 1) * stride + whole));
+                 (p == 16 ? sdasm_pack16_f32_avx2 : sdasm_pack6_f32_avx2)(d.data(), s.data(), bytes_of<float>(stride),
+                                                                          whole);
                  return whole;
              }
 #endif
@@ -72,14 +75,16 @@ void pack_rows_f32(float * dst, const float * src, std::int64_t stride, std::int
          });
 }
 
-void pack_rows_f16(float * dst, const std::uint16_t * src, std::int64_t stride, std::int64_t rows,
+void pack_rows_f16(Elements<float> dst, Elements<const std::uint16_t> src, std::int64_t stride, std::int64_t rows,
                    std::int64_t k0, std::int64_t k1, int p) {
     pack(dst, src, stride, rows, k0, k1, p, [](std::uint16_t h) { return static_cast<float>(std::bit_cast<_Float16>(h)); },
-         [&](float * d, const std::uint16_t * s, std::int64_t kc) -> std::int64_t {
+         [&](Elements<float> d, Elements<const std::uint16_t> s, std::int64_t kc) -> std::int64_t {
 #if SDASM_X86_64
              if (avx2_kernels() && (p == 16 || p == 6)) {
                  const std::int64_t whole = kc / 8 * 8;
-                 (p == 16 ? sdasm_pack16_f16_avx2 : sdasm_pack6_f16_avx2)(d, s, stride, whole);
+                 SDASM_CHECK(d.size() >= whole * p && (whole == 0 || s.size() >= (p - 1) * stride + whole));
+                 (p == 16 ? sdasm_pack16_f16_avx2 : sdasm_pack6_f16_avx2)(d.data(), s.data(),
+                                                                          bytes_of<std::uint16_t>(stride), whole);
                  return whole;
              }
 #endif
@@ -90,38 +95,46 @@ void pack_rows_f16(float * dst, const std::uint16_t * src, std::int64_t stride, 
          });
 }
 
-void tile_part(Microkernel uk, std::int64_t kc, const float * a, const float * b, float * c, std::int64_t ldc,
-               bool accumulate, std::int64_t rows, std::int64_t cols) {
-    alignas(32) float t[kMr * kNr];
-    uk(kc, a, b, t, kNr * sizeof(float), 0);
+void tile_part(Microkernel uk, std::int64_t kc, Elements<const float> a, Elements<const float> b, Elements<float> c,
+               std::int64_t ldc, bool accumulate, std::int64_t rows, std::int64_t cols) {
+    std::array<float, kMr * kNr> t{};
+    SDASM_CHECK(a.size() >= kc * kMr && b.size() >= kc * kNr);
+    uk(kc, a.data(), b.data(), t.data(), bytes_of<float>(kNr), 0);
+    const Elements<const float> tile = t;
     for (std::int64_t i = 0; i < rows; ++i) {
-        float * ci = reinterpret_cast<float *>(reinterpret_cast<char *>(c) + i * ldc);
+        const Elements<float> ci = c.part(i * ldc, cols);
         for (std::int64_t j = 0; j < cols; ++j) {
-            ci[j] = accumulate ? ci[j] + t[i * kNr + j] : t[i * kNr + j];
+            ci[j] = accumulate ? ci[j] + tile[i * kNr + j] : tile[i * kNr + j];
         }
     }
 }
 
-void split_block(const Split_form & form, std::int64_t blocks, const std::uint16_t * a, std::int64_t a_next,
-                 const std::uint16_t * b, std::int64_t b_next, float * c, std::int64_t ldc, bool accumulate,
-                 std::int64_t rows, std::int64_t cols, float * spare) {
+void split_block(const Split_form & form, std::int64_t blocks, Elements<const std::uint16_t> a, std::int64_t a_next,
+                 Elements<const std::uint16_t> b, std::int64_t b_next, Elements<float> c, std::int64_t ldc, bool accumulate,
+                 std::int64_t rows, std::int64_t cols, Elements<float> spare) {
     const Split_kernel kernel = form.kernel;
+    // Each of the two tiles of A and of B: a block of k of a tile is a_bytes,
+    // or b_bytes, of elements of two bytes.
+    SDASM_CHECK(a.size() >= a_next + blocks * form.a_bytes / 2 && b.size() >= b_next + blocks * form.b_bytes / 2);
     if (rows == kAmxBlock && cols == kAmxBlock) {
-        kernel(blocks, a, a_next, b, b_next, c, ldc, accumulate ? 1 : 0);
+        SDASM_CHECK(c.size() >= (kAmxBlock - 1) * ldc + kAmxBlock);
+        kernel(blocks, a.data(), bytes_of<std::uint16_t>(a_next), b.data(), bytes_of<std::uint16_t>(b_next), c.data(),
+               bytes_of<float>(ldc), accumulate ? 1 : 0);
         return;
     }
-    const auto row = [&](std::int64_t i) { return reinterpret_cast<float *>(reinterpret_cast<char *>(c) + i * ldc); };
     if (accumulate) {
         for (std::int64_t i = 0; i < kAmxBlock; ++i) {
             for (std::int64_t j = 0; j < kAmxBlock; ++j) {
-                spare[i * kAmxBlock + j] = i < rows && j < cols ? row(i)[j] : 0.0f;
+                spare[i * kAmxBlock + j] = i < rows && j < cols ? c[i * ldc + j] : 0.0f;
             }
         }
     }
-    kernel(blocks, a, a_next, b, b_next, spare, kAmxBlock * sizeof(float), accumulate ? 1 : 0);
+    SDASM_CHECK(spare.size() >= kAmxBlock * kAmxBlock);
+    kernel(blocks, a.data(), bytes_of<std::uint16_t>(a_next), b.data(), bytes_of<std::uint16_t>(b_next), spare.data(),
+           bytes_of<float>(kAmxBlock), accumulate ? 1 : 0);
     for (std::int64_t i = 0; i < rows; ++i) {
         for (std::int64_t j = 0; j < cols; ++j) {
-            row(i)[j] = spare[i * kAmxBlock + j];
+            c[i * ldc + j] = spare[i * kAmxBlock + j];
         }
     }
 }
@@ -143,11 +156,20 @@ std::vector<Block> guided_blocks(std::int64_t segments, std::int64_t length, std
     return blocks;
 }
 
-Work_queue::Work_queue(const ggml_compute_params * params) : params_(params) {
-    if (params->ith == 0) {
-        ggml_threadpool_chunk_set(params->threadpool, params->nth);
+Work_queue::Work_queue(const ggml_compute_params * const params) : params_(params) {
+    meet();
+}
+
+Work_queue::Work_queue(const ggml_compute_params * const params, Work_buffer & buffer) : params_(params) {
+    meet();
+    buffer.met();
+}
+
+void Work_queue::meet() const {
+    if (params_->ith == 0) {
+        ggml_threadpool_chunk_set(params_->threadpool, params_->nth);
     }
-    ggml_barrier(params->threadpool);
+    ggml_barrier(params_->threadpool);
 }
 
 int Work_queue::next() {

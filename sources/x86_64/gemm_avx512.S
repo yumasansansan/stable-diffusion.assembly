@@ -40,6 +40,20 @@
 // seven take three and a half cycles to the FMAs' three, and the eight here
 // four to their six. Twelve sums, each summed in the order of the steps.
 //
+//     void sdasm_scores_6x32_avx512(int64_t kc, const float *a,
+//                                   const float *b, int64_t b_next, float *c,
+//                                   int64_t c_next, int64_t ldc, float *max,
+//                                   float scale, int64_t flags);
+//
+// The tile of six rows by 32 columns of attention's scores, from a panel of
+// the keys and two of the queries, the second b_next bytes after the first,
+// as sdasm_gemm_6x32_avx512 computes it: its columns 0 to 15 written at c and
+// 16 to 31 at c + c_next bytes, each six rows ldc bytes apart -- the two
+// panels of the scores of two panels of queries, which lie apart. With bit 0
+// of flags, the tile is added to them; with bit 1, it is multiplied by the
+// scale and the 32 largest scores at max raised to the largest of the six
+// rows, as sdasm_scores_6x16_avx512 does; without, it is a partial sum.
+//
 // Assembled by Clang, in Intel's syntax, for the System V calling convention.
 
         .intel_syntax noprefix
@@ -282,5 +296,114 @@ sdasm_gemm_6x32_avx512:
         vzeroupper
         ret
         .size sdasm_gemm_6x32_avx512, .-sdasm_gemm_6x32_avx512
+
+        .globl sdasm_scores_6x32_avx512
+        .type sdasm_scores_6x32_avx512, @function
+        .p2align 5
+// rdi kc, rsi a, rdx b, rcx b_next, r8 c, r9 c_next, [rsp + 8] ldc,
+// [rsp + 16] max, xmm0 scale, [rsp + 24] flags
+sdasm_scores_6x32_avx512:
+        vbroadcastss zmm31, xmm0
+        vpxord zmm0, zmm0, zmm0
+        vpxord zmm1, zmm1, zmm1
+        vpxord zmm2, zmm2, zmm2
+        vpxord zmm3, zmm3, zmm3
+        vpxord zmm4, zmm4, zmm4
+        vpxord zmm5, zmm5, zmm5
+        vpxord zmm6, zmm6, zmm6
+        vpxord zmm7, zmm7, zmm7
+        vpxord zmm8, zmm8, zmm8
+        vpxord zmm9, zmm9, zmm9
+        vpxord zmm10, zmm10, zmm10
+        vpxord zmm11, zmm11, zmm11
+        mov r11, rdi
+        shr r11, 2
+        jz 2f
+        .p2align 5
+1:
+        WIDE_STEP 0
+        WIDE_STEP 1
+        WIDE_STEP 2
+        WIDE_STEP 3
+        add rsi, 96
+        add rdx, 256
+        dec r11
+        jnz 1b
+2:
+        and edi, 3
+        jz 4f
+3:
+        WIDE_STEP 0
+        add rsi, 24
+        add rdx, 64
+        dec edi
+        jnz 3b
+4:
+        // The rows of the two tiles: r8 and r9, then ldc, 2 ldc, 3 ldc (r10),
+        // 4 ldc and 5 ldc (r11) after each.
+        mov rax, [rsp + 8]
+        lea r10, [rax + 2*rax]
+        lea r11, [rax + 4*rax]
+        add r9, r8
+        test byte ptr [rsp + 24], 1
+        jz 5f
+        vaddps zmm0, zmm0, [r8]
+        vaddps zmm1, zmm1, [r8 + rax]
+        vaddps zmm2, zmm2, [r8 + 2*rax]
+        vaddps zmm3, zmm3, [r8 + r10]
+        vaddps zmm4, zmm4, [r8 + 4*rax]
+        vaddps zmm5, zmm5, [r8 + r11]
+        vaddps zmm6, zmm6, [r9]
+        vaddps zmm7, zmm7, [r9 + rax]
+        vaddps zmm8, zmm8, [r9 + 2*rax]
+        vaddps zmm9, zmm9, [r9 + r10]
+        vaddps zmm10, zmm10, [r9 + 4*rax]
+        vaddps zmm11, zmm11, [r9 + r11]
+5:
+        test byte ptr [rsp + 24], 2
+        jz 6f
+        vmulps zmm0, zmm0, zmm31
+        vmulps zmm1, zmm1, zmm31
+        vmulps zmm2, zmm2, zmm31
+        vmulps zmm3, zmm3, zmm31
+        vmulps zmm4, zmm4, zmm31
+        vmulps zmm5, zmm5, zmm31
+        vmulps zmm6, zmm6, zmm31
+        vmulps zmm7, zmm7, zmm31
+        vmulps zmm8, zmm8, zmm31
+        vmulps zmm9, zmm9, zmm31
+        vmulps zmm10, zmm10, zmm31
+        vmulps zmm11, zmm11, zmm31
+        mov rdx, [rsp + 16]
+        vmaxps zmm12, zmm0, zmm1
+        vmaxps zmm13, zmm2, zmm3
+        vmaxps zmm14, zmm4, zmm5
+        vmaxps zmm12, zmm12, zmm13
+        vmaxps zmm12, zmm12, zmm14
+        vmaxps zmm12, zmm12, [rdx]
+        vmovups [rdx], zmm12
+        vmaxps zmm12, zmm6, zmm7
+        vmaxps zmm13, zmm8, zmm9
+        vmaxps zmm14, zmm10, zmm11
+        vmaxps zmm12, zmm12, zmm13
+        vmaxps zmm12, zmm12, zmm14
+        vmaxps zmm12, zmm12, [rdx + 64]
+        vmovups [rdx + 64], zmm12
+6:
+        vmovups [r8], zmm0
+        vmovups [r8 + rax], zmm1
+        vmovups [r8 + 2*rax], zmm2
+        vmovups [r8 + r10], zmm3
+        vmovups [r8 + 4*rax], zmm4
+        vmovups [r8 + r11], zmm5
+        vmovups [r9], zmm6
+        vmovups [r9 + rax], zmm7
+        vmovups [r9 + 2*rax], zmm8
+        vmovups [r9 + r10], zmm9
+        vmovups [r9 + 4*rax], zmm10
+        vmovups [r9 + r11], zmm11
+        vzeroupper
+        ret
+        .size sdasm_scores_6x32_avx512, .-sdasm_scores_6x32_avx512
 
         .section .note.GNU-stack, "", @progbits

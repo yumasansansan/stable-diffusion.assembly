@@ -24,18 +24,27 @@
 // image to FP16 before the products when the weights are FP16, as
 // stable-diffusion.cpp has always computed them.
 
+#include <array>
+#include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <exception>
+#include <format>
 #include <functional>
+#include <print>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "kernels.h"
+#include "memory.h"
+#include "quant.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -54,35 +63,56 @@ std::mt19937 & generator() {
     return g;
 }
 
-void fill(ggml_tensor * t, float scale) {
+void fill(const ggml_tensor * const t, float scale) {
     std::uniform_real_distribution<float> d(-scale, scale);
-    const std::int64_t n = ggml_nelements(t);
     if (t->type == GGML_TYPE_F32) {
-        auto * p = static_cast<float *>(t->data);
-        for (std::int64_t i = 0; i < n; ++i) {
-            p[i] = d(generator());
+        for (float & x : sdasm::elements_of<float>(t)) {
+            x = d(generator());
         }
     }
     else {
-        auto * p = static_cast<ggml_fp16_t *>(t->data);
-        for (std::int64_t i = 0; i < n; ++i) {
-            p[i] = ggml_fp32_to_fp16(d(generator()));
+        for (std::uint16_t & x : sdasm::elements_of<std::uint16_t>(t)) {
+            x = ggml_fp32_to_fp16(d(generator()));
         }
     }
 }
 
-double at(const ggml_tensor * t, std::int64_t i0, std::int64_t i1, std::int64_t i2, std::int64_t i3) {
-    const char * p = static_cast<const char *>(t->data) + i0 * static_cast<std::int64_t>(t->nb[0]) +
-                     i1 * static_cast<std::int64_t>(t->nb[1]) + i2 * static_cast<std::int64_t>(t->nb[2]) +
-                     i3 * static_cast<std::int64_t>(t->nb[3]);
-    if (t->type == GGML_TYPE_F32) {
-        float v;
-        std::memcpy(&v, p, sizeof v);
-        return static_cast<double>(v);
+// The elements of a tensor of single precision or FP16, read as double: its
+// type, its alignment and its strides checked once, where it is taken.
+class Reader {
+public:
+    explicit Reader(const ggml_tensor * const t) : half_(t->type == GGML_TYPE_F16) {
+        for (int k = 0; k < 4; ++k) {
+            nb_[static_cast<std::size_t>(k)] = half_ ? sdasm::stride_of<std::uint16_t>(t, k) : sdasm::stride_of<float>(t, k);
+        }
+        if (half_) {
+            halves_ = sdasm::elements_of<const std::uint16_t>(t);
+        }
+        else {
+            singles_ = sdasm::elements_of<const float>(t);
+        }
     }
-    ggml_fp16_t h;
-    std::memcpy(&h, p, sizeof h);
-    return static_cast<double>(ggml_fp16_to_fp32(h));
+
+    double operator()(std::int64_t i0, std::int64_t i1, std::int64_t i2, std::int64_t i3) const {
+        const std::int64_t at = i0 * nb_[0] + i1 * nb_[1] + i2 * nb_[2] + i3 * nb_[3];
+        return half_ ? static_cast<double>(std::bit_cast<_Float16>(halves_[at])) : static_cast<double>(singles_[at]);
+    }
+
+private:
+    bool half_;
+    std::array<std::int64_t, 4> nb_{};
+    sdasm::Elements<const float> singles_;
+    sdasm::Elements<const std::uint16_t> halves_;
+};
+
+// What an output is set to before it is computed: the bits of a NaN, all ones,
+// which an element the computation leaves unwritten keeps.
+constexpr float kUnwritten = std::bit_cast<float>(std::uint32_t{0xffffffff});
+
+// The output of a graph, its n elements.
+std::vector<float> output_of(const ggml_tensor * const out) {
+    const sdasm::Elements<const float> values = sdasm::elements_of<const float>(out).first(ggml_nelements(out));
+    return {values.begin(), values.end()};
 }
 
 // A form of the kernels a test computes in: those written by hand, held to a
@@ -141,22 +171,22 @@ constexpr double kAmxProducts = 0x1p-15 + kSingle;
 // amx_bound: kSingle where they compute in single precision, kAmxProducts where
 // the products go to the tiles.
 template <class Exact>
-bool run(const char * name, ggml_context * ctx, ggml_tensor * out, int threads, Exact exact,
+bool run(const char * const name, ggml_context * const ctx, ggml_tensor * const out, int threads, Exact exact,
          double amx_bound = kSingle) {
-    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_cgraph * const graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
     const std::int64_t n = ggml_nelements(out);
     const std::vector<Form> all = forms(true);
     std::vector<Result> results(all.size());
     for (std::size_t f = 0; f < all.size(); ++f) {
         use(all[f]);
-        std::memset(out->data, 0xff, ggml_nbytes(out));
+        sdasm::fill_with(sdasm::elements_of<float>(out), kUnwritten);
         if (ggml_graph_compute_with_ctx(ctx, graph, threads) != GGML_STATUS_SUCCESS) {
-            std::printf("FAIL %s: the graph was not computed\n", name);
+            std::print("FAIL {}: the graph was not computed\n", name);
             use_default();
             return false;
         }
-        results[f].values.assign(static_cast<const float *>(out->data), static_cast<const float *>(out->data) + n);
+        results[f].values = output_of(out);
     }
     use_default();
     for (std::int64_t i = 0; i < n; ++i) {
@@ -174,21 +204,22 @@ bool run(const char * name, ggml_context * ctx, ggml_tensor * out, int threads, 
         if (all[f].kernels != sdasm::Kernels::upstream) {
             ok = ok && results[f].worst <= (all[f].level == sdasm::Isa::amx ? amx_bound : kSingle);
         }
-        char text[64];
-        std::snprintf(text, sizeof text, "%s%s %.3g", f == 0 ? "" : ", ", all[f].name, results[f].worst);
-        errors += text;
+        errors += std::format("{}{} {:.3g}", f == 0 ? "" : ", ", all[f].name, results[f].worst);
     }
-    std::printf("%s %s: error relative to the magnitudes: %s\n", ok ? "ok  " : "FAIL", name, errors.c_str());
+    std::print("{} {}: error relative to the magnitudes: {}\n", ok ? "ok  " : "FAIL", name, errors.c_str());
     return ok;
 }
 
-// The quantized forms (quant.h, Tuning::bits): each within kQuantized of the
+// The quantized forms (quant.h, Tuning::bits): each within a bound of the
 // exact result, of the magnitudes summed, and the kernels written by hand
-// within kSingle of the C++ ones, which sum the same integers. Inputs of 8
-// bits in [-1, 1] are within 1/255 of themselves, weights of 8 bits in
-// [-0.25, 0.25] within 1/1016: a product within about 1% of the magnitudes in
-// the worst case, the sum of a few hundred of them, with errors of either
-// sign, nearer 0.1%.
+// within kSingle of the C++ ones, which sum the same integers. Inputs in
+// [-1, 1] of L levels are within 1/L of themselves, weights in [-0.25, 0.25]
+// of greatest magnitude W within 1/(8 W): over the operands' mean magnitudes,
+// 1/2 and 1/8, a product within 2/L + 1/W of its own in the worst case -- 1.6%
+// with 8 bits of both, L = 255 and W = 127 -- and the sum of a few hundred of
+// them, with errors of either sign, nearer 0.1%. The bound is kQuantized with
+// 8 bits of both, and with fewer, kQuantized in proportion to 2/L + 1/W: 1.5
+// times as much with weights of 7 bits, or inputs of 7.
 constexpr double kQuantized = 1e-2;
 
 // Attention's forms differ in the last bits of their exponentials, as in single
@@ -198,13 +229,15 @@ constexpr double kQuantized = 1e-2;
 constexpr double kQuantizedApart = 1e-3;
 
 template <class Exact>
-bool run_quantized(const char * name, ggml_context * ctx, ggml_tensor * out, int threads, Exact exact,
+bool run_quantized(const char * const name, ggml_context * const ctx, ggml_tensor * const out, int threads, Exact exact, int bits,
                    double apart_bound = kSingle) {
     const sdasm::Tuning saved = sdasm::tuning();
     sdasm::Tuning t = saved;
-    t.bits = 8;
+    t.bits = bits;
     sdasm::set_tuning(t);
-    ggml_cgraph * graph = ggml_new_graph(ctx);
+    const sdasm::Quant q = sdasm::quant();
+    const double bound = kQuantized * (2.0 / q.input_levels + 1.0 / q.weight_max) / (2.0 / 255 + 1.0 / 127);
+    ggml_cgraph * const graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
     const std::int64_t n = ggml_nelements(out);
     const std::vector<Form> all = forms(false);
@@ -212,16 +245,26 @@ bool run_quantized(const char * name, ggml_context * ctx, ggml_tensor * out, int
     bool computed = true;
     for (std::size_t f = 0; f < all.size() && computed; ++f) {
         use(all[f]);
-        std::memset(out->data, 0xff, ggml_nbytes(out));
+        sdasm::fill_with(sdasm::elements_of<float>(out), kUnwritten);
         computed = ggml_graph_compute_with_ctx(ctx, graph, threads) == GGML_STATUS_SUCCESS;
-        results[f].values.assign(static_cast<const float *>(out->data), static_cast<const float *>(out->data) + n);
+        results[f].values = output_of(out);
     }
     use_default();
     sdasm::set_tuning(saved);
     if (!computed) {
-        std::printf("FAIL %s: the graph was not computed\n", name);
+        std::print("FAIL {}: the graph was not computed\n", name);
         return false;
     }
+    // The forms whose kernels quantize: those of single precision, where the
+    // level has no VNNI, are held to kSingle instead, apart from none.
+    std::vector<bool> quantizing(all.size());
+    sdasm::set_tuning(t);
+    for (std::size_t f = 0; f < all.size(); ++f) {
+        use(all[f]);
+        quantizing[f] = sdasm::quantized_kernels();
+    }
+    use_default();
+    sdasm::set_tuning(saved);
     const Result & cxx = results.back();
     std::vector<double> apart(all.size(), 0.0);
     for (std::int64_t i = 0; i < n; ++i) {
@@ -240,12 +283,96 @@ bool run_quantized(const char * name, ggml_context * ctx, ggml_tensor * out, int
     bool ok = true;
     std::string errors;
     for (std::size_t f = 0; f < all.size(); ++f) {
-        ok = ok && results[f].worst <= kQuantized && apart[f] <= apart_bound;
-        char text[96];
-        std::snprintf(text, sizeof text, "%s%s %.3g (%.2g from cxx)", f == 0 ? "" : ", ", all[f].name, results[f].worst, apart[f]);
-        errors += text;
+        ok = ok && (quantizing[f] ? results[f].worst <= bound && apart[f] <= apart_bound : results[f].worst <= kSingle);
+        if (quantizing[f]) {
+            errors += std::format("{}{} {:.3g} ({:.2g} from cxx)", f == 0 ? "" : ", ", all[f].name, results[f].worst, apart[f]);
+        }
+        else {
+            errors += std::format("{}{} {:.3g} (single)", f == 0 ? "" : ", ", all[f].name, results[f].worst);
+        }
     }
-    std::printf("%s %s, quantized: error relative to the magnitudes: %s\n", ok ? "ok  " : "FAIL", name, errors.c_str());
+    std::print("{} {}, quantized: error relative to the magnitudes: {}\n", ok ? "ok  " : "FAIL", name, errors.c_str());
+    return ok;
+}
+
+// The products of 16 bits (Tuning::bits = 16): where the processor has them --
+// AMX's tiles, or AVX-512's vector units -- both operands rounded to bfloat16,
+// 8 bits of significand, each within 2^-9 of itself, a product within 2^-8 of
+// the exact one; or with AMX-FP16 and AVX10.2, the FP16 weights as they are and
+// the other operand rounded to FP16, ggml's own rounding; or AVX512-FP16's sums
+// in FP16. The forms that have none compute in single precision. Each form
+// within kHalf of the exact result, of the magnitudes summed.
+constexpr double kHalf = 8e-3;
+
+// A form of the products of 16 bits: the kernels' form and level, and the
+// format of the vector units' products (Tuning::half_format).
+struct Half_form {
+    Form form;
+    int format;
+};
+
+// The forms of the processor, each in the format the kernels take by default;
+// and at the level avx512, the formats they leave out where the processor has
+// more than one -- bfloat16 beside AVX10.2's, AVX512-FP16's beside either --
+// so that each kernel of 16 bits the processor can run is run.
+std::vector<Half_form> half_forms() {
+    std::vector<Half_form> all;
+    for (const Form & f : forms(false)) {
+        all.push_back({f, 0});
+    }
+    const sdasm::Cpu & c = sdasm::cpu();
+    if (sdasm::isa_available() >= sdasm::Isa::avx512) {
+        if (c.avx512_bf16 && c.avx10_2) {
+            all.push_back({{"avx512 bfloat16", sdasm::Kernels::assembly, sdasm::Isa::avx512}, 1});
+        }
+        if (c.avx512_fp16 && (c.avx10_2 || c.avx512_bf16)) {
+            all.push_back({{"avx512 fp16", sdasm::Kernels::assembly, sdasm::Isa::avx512}, 2});
+        }
+    }
+    return all;
+}
+
+template <class Exact>
+bool run_half(const char * const name, ggml_context * const ctx, ggml_tensor * const out, int threads, Exact exact) {
+    const sdasm::Tuning saved = sdasm::tuning();
+    sdasm::Tuning t = saved;
+    t.bits = 16;
+    ggml_cgraph * const graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, out);
+    const std::int64_t n = ggml_nelements(out);
+    const std::vector<Half_form> all = half_forms();
+    std::vector<Result> results(all.size());
+    bool computed = true;
+    for (std::size_t f = 0; f < all.size() && computed; ++f) {
+        t.half_format = all[f].format;
+        sdasm::set_tuning(t);
+        use(all[f].form);
+        sdasm::fill_with(sdasm::elements_of<float>(out), kUnwritten);
+        computed = ggml_graph_compute_with_ctx(ctx, graph, threads) == GGML_STATUS_SUCCESS;
+        results[f].values = output_of(out);
+    }
+    use_default();
+    sdasm::set_tuning(saved);
+    if (!computed) {
+        std::print("FAIL {}: the graph was not computed\n", name);
+        return false;
+    }
+    for (std::int64_t i = 0; i < n; ++i) {
+        double magnitude = 0;
+        const double value = exact(i, magnitude);
+        const double scale = magnitude > 0 ? magnitude : 1;
+        for (auto & r : results) {
+            const double e = std::fabs(static_cast<double>(r.values[static_cast<std::size_t>(i)]) - value) / scale;
+            r.worst = std::isfinite(e) ? std::fmax(r.worst, e) : HUGE_VAL;
+        }
+    }
+    bool ok = true;
+    std::string errors;
+    for (std::size_t f = 0; f < all.size(); ++f) {
+        ok = ok && results[f].worst <= kHalf;
+        errors += std::format("{}{} {:.3g}", f == 0 ? "" : ", ", all[f].form.name, results[f].worst);
+    }
+    std::print("{} {}, 16 bits: error relative to the magnitudes: {}\n", ok ? "ok  " : "FAIL", name, errors.c_str());
     return ok;
 }
 
@@ -254,20 +381,23 @@ struct Conv_case {
     ggml_type type;
 };
 
-bool conv2d(const Conv_case & c, int threads, bool quantized = false) {
+bool conv2d(const Conv_case & c, int threads, int bits = 0) {
     const std::size_t bytes = std::size_t{512} << 20;
-    ggml_init_params params{bytes, nullptr, false};
-    ggml_context * ctx = ggml_init(params);
-    ggml_tensor * w = ggml_new_tensor_4d(ctx, c.type, c.kw, c.kh, c.ic, c.oc);
-    ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c.w, c.h, c.ic, c.n);
+    ggml_init_params const params{bytes, nullptr, false};
+    ggml_context * const ctx = ggml_init(params);
+    ggml_tensor * const w = ggml_new_tensor_4d(ctx, c.type, c.kw, c.kh, c.ic, c.oc);
+    ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, c.w, c.h, c.ic, c.n);
     fill(w, 0.25f);
     fill(x, 1.0f);
-    ggml_tensor * y = ggml_conv_2d_direct(ctx, w, x, c.s0, c.s1, c.p0, c.p1, c.d0, c.d1);
-    char name[160];
-    std::snprintf(name, sizeof name, "conv2d %s %dx%dx%d -> %d, kernel %dx%d, stride %d,%d, padding %d,%d, dilation %d,%d, %d images",
-                  ggml_type_name(c.type), c.w, c.h, c.ic, c.oc, c.kw, c.kh, c.s0, c.s1, c.p0, c.p1, c.d0, c.d1, c.n);
+    ggml_tensor * const y = ggml_conv_2d_direct(ctx, w, x, c.s0, c.s1, c.p0, c.p1, c.d0, c.d1);
+    const std::string label =
+        std::format("conv2d {} {}x{}x{} -> {}, kernel {}x{}, stride {},{}, padding {},{}, dilation {},{}, {} images",
+                    ggml_type_name(c.type), c.w, c.h, c.ic, c.oc, c.kw, c.kh, c.s0, c.s1, c.p0, c.p1, c.d0, c.d1, c.n);
+    const char * const name = label.c_str();
     const std::int64_t ow = y->ne[0];
     const std::int64_t oh = y->ne[1];
+    const Reader rw(w);
+    const Reader rx(x);
     const auto exact = [&](std::int64_t i, double & magnitude) {
         const std::int64_t ox = i % ow;
         const std::int64_t oy = (i / ow) % oh;
@@ -283,7 +413,7 @@ bool conv2d(const Conv_case & c, int threads, bool quantized = false) {
                     if (iy < 0 || iy >= c.h || ix < 0 || ix >= c.w) {
                         continue;
                     }
-                    const double p = at(w, kx, ky, ic, oc) * at(x, ix, iy, ic, n);
+                    const double p = rw(kx, ky, ic, oc) * rx(ix, iy, ic, n);
                     sum += p;
                     magnitude += std::fabs(p);
                 }
@@ -291,7 +421,9 @@ bool conv2d(const Conv_case & c, int threads, bool quantized = false) {
         }
         return sum;
     };
-    const bool ok = quantized ? run_quantized(name, ctx, y, threads, exact) : run(name, ctx, y, threads, exact, kAmxProducts);
+    const bool ok = bits == 16  ? run_half(name, ctx, y, threads, exact)
+                    : bits != 0 ? run_quantized(name, ctx, y, threads, exact, bits)
+                                : run(name, ctx, y, threads, exact, kAmxProducts);
     ggml_free(ctx);
     return ok;
 }
@@ -301,17 +433,19 @@ struct Mul_mat_case {
     ggml_type type;
 };
 
-bool mul_mat(const Mul_mat_case & c, int threads, bool quantized = false) {
+bool mul_mat(const Mul_mat_case & c, int threads, int bits = 0) {
     const std::size_t bytes = std::size_t{512} << 20;
-    ggml_init_params params{bytes, nullptr, false};
-    ggml_context * ctx = ggml_init(params);
-    ggml_tensor * w = ggml_new_tensor_2d(ctx, c.type, c.k, c.n);
-    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k, c.m, c.batch);
+    ggml_init_params const params{bytes, nullptr, false};
+    ggml_context * const ctx = ggml_init(params);
+    ggml_tensor * const w = ggml_new_tensor_2d(ctx, c.type, c.k, c.n);
+    ggml_tensor * const x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k, c.m, c.batch);
     fill(w, 0.25f);
     fill(x, 1.0f);
-    ggml_tensor * y = ggml_mul_mat(ctx, w, x);
-    char name[128];
-    std::snprintf(name, sizeof name, "mul_mat %s %d -> %d, %d rows x %d", ggml_type_name(c.type), c.k, c.n, c.m, c.batch);
+    ggml_tensor * const y = ggml_mul_mat(ctx, w, x);
+    const std::string label = std::format("mul_mat {} {} -> {}, {} rows x {}", ggml_type_name(c.type), c.k, c.n, c.m, c.batch);
+    const char * const name = label.c_str();
+    const Reader rw(w);
+    const Reader rx(x);
     const auto exact = [&](std::int64_t i, double & magnitude) {
         const std::int64_t j = i % c.n;
         const std::int64_t r = (i / c.n) % c.m;
@@ -319,13 +453,15 @@ bool mul_mat(const Mul_mat_case & c, int threads, bool quantized = false) {
         double sum = 0;
         magnitude = 0;
         for (std::int64_t k = 0; k < c.k; ++k) {
-            const double p = at(w, k, j, 0, 0) * at(x, k, r, b, 0);
+            const double p = rw(k, j, 0, 0) * rx(k, r, b, 0);
             sum += p;
             magnitude += std::fabs(p);
         }
         return sum;
     };
-    const bool ok = quantized ? run_quantized(name, ctx, y, threads, exact) : run(name, ctx, y, threads, exact, kAmxProducts);
+    const bool ok = bits == 16  ? run_half(name, ctx, y, threads, exact)
+                    : bits != 0 ? run_quantized(name, ctx, y, threads, exact, bits)
+                                : run(name, ctx, y, threads, exact, kAmxProducts);
     ggml_free(ctx);
     return ok;
 }
@@ -338,8 +474,8 @@ struct Attention_case {
 // The output of attention, [d * h, lq, b] as stable-diffusion.cpp has it, by
 // the graph it builds without flash attention: the scores, their scale, their
 // softmax and the product with the values.
-ggml_tensor * attention_graph(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, const Attention_case & c,
-                              float scale) {
+ggml_tensor * attention_graph(ggml_context * const ctx, ggml_tensor * const q, ggml_tensor * const k,
+                              ggml_tensor * const v, const Attention_case & c, float scale) {
     ggml_tensor * qh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, c.d, c.h, c.lq, c.b), 0, 2, 1, 3));
     qh = ggml_reshape_3d(ctx, qh, c.d, c.lq, c.h * c.b);
     ggml_tensor * kh = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, k, c.d, c.hk, c.lk, c.b), 0, 2, 1, 3));
@@ -355,23 +491,26 @@ ggml_tensor * attention_graph(ggml_context * ctx, ggml_tensor * q, ggml_tensor *
     return ggml_reshape_3d(ctx, kqv, c.d * c.h, c.lq, c.b);
 }
 
-bool attention(const Attention_case & c, int threads, bool quantized = false) {
+bool attention(const Attention_case & c, int threads, int bits = 0) {
     const std::size_t bytes = std::size_t{1} << 30;
-    ggml_init_params params{bytes, nullptr, false};
-    ggml_context * ctx = ggml_init(params);
-    ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.d * c.h, c.lq, c.b);
-    ggml_tensor * k = ggml_new_tensor_3d(ctx, c.kv_type, c.d * c.hk, c.lk, c.b);
-    ggml_tensor * v = ggml_new_tensor_3d(ctx, c.kv_type, c.d * c.hk, c.lk, c.b);
+    ggml_init_params const params{bytes, nullptr, false};
+    ggml_context * const ctx = ggml_init(params);
+    ggml_tensor * const q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.d * c.h, c.lq, c.b);
+    ggml_tensor * const k = ggml_new_tensor_3d(ctx, c.kv_type, c.d * c.hk, c.lk, c.b);
+    ggml_tensor * const v = ggml_new_tensor_3d(ctx, c.kv_type, c.d * c.hk, c.lk, c.b);
     fill(q, 1.0f);
     fill(k, 1.0f);
     fill(v, 1.0f);
     const float scale = 1.0f / std::sqrt(static_cast<float>(c.d));
-    ggml_tensor * qv = ggml_permute(ctx, ggml_reshape_4d(ctx, q, c.d, c.h, c.lq, c.b), 0, 2, 1, 3);
-    ggml_tensor * kv = ggml_permute(ctx, ggml_reshape_4d(ctx, k, c.d, c.hk, c.lk, c.b), 0, 2, 1, 3);
-    ggml_tensor * vv = ggml_permute(ctx, ggml_reshape_4d(ctx, v, c.d, c.hk, c.lk, c.b), 0, 2, 1, 3);
-    ggml_tensor * out = ggml_flash_attn_ext(ctx, qv, kv, vv, nullptr, scale, 0, 0);
+    ggml_tensor * const qv = ggml_permute(ctx, ggml_reshape_4d(ctx, q, c.d, c.h, c.lq, c.b), 0, 2, 1, 3);
+    ggml_tensor * const kv = ggml_permute(ctx, ggml_reshape_4d(ctx, k, c.d, c.hk, c.lk, c.b), 0, 2, 1, 3);
+    ggml_tensor * const vv = ggml_permute(ctx, ggml_reshape_4d(ctx, v, c.d, c.hk, c.lk, c.b), 0, 2, 1, 3);
+    ggml_tensor * const out = ggml_flash_attn_ext(ctx, qv, kv, vv, nullptr, scale, 0, 0);
     ggml_prec_set_acc(out, GGML_PREC_F32);
 
+    const Reader rq(q);
+    const Reader rk(k);
+    const Reader rv(v);
     // The exact output: the weights of each query, and the magnitude of the sum
     // of the values by them.
     const std::int64_t group = c.h / c.hk;
@@ -386,7 +525,7 @@ bool attention(const Attention_case & c, int threads, bool quantized = false) {
                 for (std::int64_t j = 0; j < c.lk; ++j) {
                     double sum = 0;
                     for (std::int64_t e = 0; e < c.d; ++e) {
-                        sum += at(q, h * c.d + e, i, b, 0) * at(k, hk * c.d + e, j, b, 0);
+                        sum += rq(h * c.d + e, i, b, 0) * rk(hk * c.d + e, j, b, 0);
                     }
                     w[static_cast<std::size_t>(j)] = sum * static_cast<double>(scale);
                     max = std::fmax(max, w[static_cast<std::size_t>(j)]);
@@ -400,7 +539,7 @@ bool attention(const Attention_case & c, int threads, bool quantized = false) {
                     double sum = 0;
                     double magnitude = 0;
                     for (std::int64_t j = 0; j < c.lk; ++j) {
-                        const double p = w[static_cast<std::size_t>(j)] / total * at(v, hk * c.d + e, j, b, 0);
+                        const double p = w[static_cast<std::size_t>(j)] / total * rv(hk * c.d + e, j, b, 0);
                         sum += p;
                         magnitude += std::fabs(p);
                     }
@@ -411,15 +550,17 @@ bool attention(const Attention_case & c, int threads, bool quantized = false) {
             }
         }
     }
-    char name[160];
-    std::snprintf(name, sizeof name, "attention q %s, k and v %s: %d dimensions, %d queries, %d keys, %d heads (%d of keys), %d batches",
-                  ggml_type_name(GGML_TYPE_F32), ggml_type_name(c.kv_type), c.d, c.lq, c.lk, c.h, c.hk, c.b);
+    const std::string label =
+        std::format("attention q {}, k and v {}: {} dimensions, {} queries, {} keys, {} heads ({} of keys), {} batches",
+                    ggml_type_name(GGML_TYPE_F32), ggml_type_name(c.kv_type), c.d, c.lq, c.lk, c.h, c.hk, c.b);
+    const char * const name = label.c_str();
     const auto exact_at = [&](std::int64_t i, double & magnitude) {
         magnitude = magnitudes[static_cast<std::size_t>(i)];
         return exact[static_cast<std::size_t>(i)];
     };
-    if (quantized) {
-        const bool ok = run_quantized(name, ctx, out, threads, exact_at, kQuantizedApart);
+    if (bits != 0) {
+        const bool ok = bits == 16 ? run_half(name, ctx, out, threads, exact_at)
+                                   : run_quantized(name, ctx, out, threads, exact_at, bits, kQuantizedApart);
         ggml_free(ctx);
         return ok;
     }
@@ -428,8 +569,8 @@ bool attention(const Attention_case & c, int threads, bool quantized = false) {
     // The graph stable-diffusion.cpp builds without flash attention, in ggml's
     // own kernels, which is what the operation stands in for.
     if (c.hk == c.h && c.kv_type == GGML_TYPE_F32) {
-        ggml_tensor * reference = attention_graph(ctx, q, k, v, c, scale);
-        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_tensor * const reference = attention_graph(ctx, q, k, v, c, scale);
+        ggml_cgraph * const graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, reference);
         sdasm::set_kernels(sdasm::Kernels::upstream);
         const bool computed = ggml_graph_compute_with_ctx(ctx, graph, threads) == GGML_STATUS_SUCCESS;
@@ -437,10 +578,10 @@ bool attention(const Attention_case & c, int threads, bool quantized = false) {
         double worst = 0;
         for (std::int64_t e = 0; computed && e < ggml_nelements(reference); ++e) {
             const auto i = static_cast<std::size_t>(e);
-            const double value = static_cast<double>(static_cast<const float *>(reference->data)[i]);
+            const double value = static_cast<double>(sdasm::elements_of<const float>(reference)[e]);
             worst = std::fmax(worst, std::fabs(value - exact[i]) / magnitudes[i]);
         }
-        std::printf("     the graph without flash attention, in ggml's kernels: %.3g\n", worst);
+        std::print("     the graph without flash attention, in ggml's kernels: {:.3g}\n", worst);
         ok = ok && computed;
     }
     ggml_free(ctx);
@@ -451,13 +592,13 @@ bool attention(const Attention_case & c, int threads, bool quantized = false) {
 // form of the kernels with the chain fused into the operation and apart from it:
 // the two need only be within `close` of each other, relative to the largest
 // output, for the fused operation may sum in an order of its own.
-bool fusion(const char * name, int threads, const std::function<ggml_tensor *(ggml_context *)> & build,
+bool fusion(const char * const name, int threads, const std::function<ggml_tensor *(ggml_context *)> & build,
             double close = 1e-6) {
     const std::size_t bytes = std::size_t{512} << 20;
-    ggml_init_params params{bytes, nullptr, false};
-    ggml_context * ctx = ggml_init(params);
-    ggml_tensor * out = build(ctx);
-    ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_init_params const params{bytes, nullptr, false};
+    ggml_context * const ctx = ggml_init(params);
+    ggml_tensor * const out = build(ctx);
+    ggml_cgraph * const graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, out);
     // The chain changes the output of the head in place, which the graph
     // computes again from the inputs each time.
@@ -467,8 +608,7 @@ bool fusion(const char * name, int threads, const std::function<ggml_tensor *(gg
         t.fuse = fuse;
         sdasm::set_tuning(t);
         ggml_graph_compute_with_ctx(ctx, graph, threads);
-        const auto * p = static_cast<const float *>(out->data);
-        return std::vector<float>(p, p + ggml_nelements(out));
+        return output_of(out);
     };
     bool ok = true;
     double worst = 0;
@@ -489,7 +629,7 @@ bool fusion(const char * name, int threads, const std::function<ggml_tensor *(gg
     sdasm::Tuning t = sdasm::tuning();
     t.fuse = 1;
     sdasm::set_tuning(t);
-    std::printf("%s fusion %s: fused and apart, in each form, within %.3g of the largest output\n", ok ? "ok  " : "FAIL",
+    std::print("{} fusion {}: fused and apart, in each form, within {:.3g} of the largest output\n", ok ? "ok  " : "FAIL",
                 name, worst);
     ggml_free(ctx);
     return ok;
@@ -499,11 +639,11 @@ bool fusion(const char * name, int threads, const std::function<ggml_tensor *(gg
 // when they change: an operation computed, its weights set anew through ggml's
 // backend, and the operation computed again gives what a fresh computation with
 // the new weights gives, and not what the old weights gave.
-bool store(const char * name, int threads,
+bool store(const char * const name, int threads,
            const std::function<ggml_tensor *(ggml_context *, ggml_tensor ** weights)> & build) {
     ggml_backend_t backend = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(backend, threads);
-    const auto set = [](ggml_tensor * t, std::uint32_t seed) {
+    const auto set = [](ggml_tensor * const t, std::uint32_t seed) {
         std::mt19937 g(seed);
         std::uniform_real_distribution<float> d(-1.0f, 1.0f);
         const auto n = static_cast<std::size_t>(ggml_nelements(t));
@@ -525,13 +665,13 @@ bool store(const char * name, int threads,
     // The inputs from seed 100, the weights from `first`, computed, and with
     // `second` given, the weights set from it and computed again.
     const auto run = [&](std::uint32_t first, std::uint32_t second) {
-        ggml_init_params params{std::size_t{64} << 20, nullptr, true};
-        ggml_context * ctx = ggml_init(params);
+        ggml_init_params const params{std::size_t{64} << 20, nullptr, true};
+        ggml_context * const ctx = ggml_init(params);
         ggml_tensor * weights = nullptr;
-        ggml_tensor * out = build(ctx, &weights);
-        ggml_cgraph * graph = ggml_new_graph(ctx);
+        ggml_tensor * const out = build(ctx, &weights);
+        ggml_cgraph * const graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, out);
-        ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        ggml_backend_buffer_t const buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op == GGML_OP_NONE && t != weights) {
                 set(t, 100);
@@ -569,7 +709,7 @@ bool store(const char * name, int threads,
         const bool same = from_fresh <= 1e-6 * largest;
         const bool moved = from_old > 1e-3 * largest;
         ok = ok && same && moved;
-        std::printf("%s store %s, %s: weights set anew are %s%s\n", same && moved ? "ok  " : "FAIL", name, form.name,
+        std::print("{} store {}, {}: weights set anew are {}{}\n", same && moved ? "ok  " : "FAIL", name, form.name,
                     moved ? "used" : "NOT USED (the old packing was kept)", same ? "" : ", and differ from a fresh computation");
     }
     use_default();
@@ -585,32 +725,35 @@ bool store(const char * name, int threads,
 // table of FP16; the error of each form is measured against the exact
 // x GELU(gate), relative to the magnitudes it is computed from: those of the
 // products summed into x and the gate, by how much the result moves with each.
-bool gated_gelu(int k, int half, int m, int batch, int threads, bool quantized = false) {
+bool gated_gelu(int k, int half, int m, int batch, int threads, int bits = 0) {
     const std::size_t bytes = std::size_t{512} << 20;
-    ggml_init_params params{bytes, nullptr, false};
-    ggml_context * ctx = ggml_init(params);
-    ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, 2 * half);
-    ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, batch);
-    ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * half);
+    ggml_init_params const params{bytes, nullptr, false};
+    ggml_context * const ctx = ggml_init(params);
+    ggml_tensor * const w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, 2 * half);
+    ggml_tensor * const x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, batch);
+    ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * half);
     fill(w, 0.25f);
     fill(x, 1.0f);
     fill(b, 1.0f);
-    ggml_tensor * y = ggml_add_inplace(ctx, ggml_mul_mat(ctx, w, x), b);
-    ggml_tensor * xs = ggml_view_4d(ctx, y, half, m, batch, 1, y->nb[1], y->nb[2], y->nb[3], 0);
+    ggml_tensor * const y = ggml_add_inplace(ctx, ggml_mul_mat(ctx, w, x), b);
+    ggml_tensor * const xs = ggml_view_4d(ctx, y, half, m, batch, 1, y->nb[1], y->nb[2], y->nb[3], 0);
     ggml_tensor * gate = ggml_view_4d(ctx, y, half, m, batch, 1, y->nb[1], y->nb[2], y->nb[3], static_cast<std::size_t>(half) * y->nb[0]);
     gate = ggml_gelu_inplace(ctx, ggml_cont(ctx, gate));
-    ggml_tensor * out = ggml_mul(ctx, xs, gate);
+    ggml_tensor * const out = ggml_mul(ctx, xs, gate);
 
     std::vector<double> exact(static_cast<std::size_t>(ggml_nelements(out)));
     std::vector<double> magnitudes(exact.size());
+    const Reader rb(b);
+    const Reader rw(w);
+    const Reader rx(x);
     const auto gelu = [](double v) { return 0.5 * v * (1.0 + std::tanh(0.79788456080286535587989211986876 * (v + 0.044715 * v * v * v))); };
     for (std::int64_t r = 0; r < static_cast<std::int64_t>(m) * batch; ++r) {
         for (std::int64_t j = 0; j < half; ++j) {
-            double sum[2] = {at(b, j, 0, 0, 0), at(b, half + j, 0, 0, 0)};
-            double magnitude[2] = {std::fabs(sum[0]), std::fabs(sum[1])};
-            for (int side = 0; side < 2; ++side) {
+            std::array<double, 2> sum = {rb(j, 0, 0, 0), rb(half + j, 0, 0, 0)};
+            std::array<double, 2> magnitude = {std::fabs(sum[0]), std::fabs(sum[1])};
+            for (std::size_t side = 0; side < 2; ++side) {
                 for (std::int64_t e = 0; e < k; ++e) {
-                    const double p = at(w, e, side * half + j, 0, 0) * at(x, e, r % m, r / m, 0);
+                    const double p = rw(e, static_cast<std::int64_t>(side) * half + j, 0, 0) * rx(e, r % m, r / m, 0);
                     sum[side] += p;
                     magnitude[side] += std::fabs(p);
                 }
@@ -621,27 +764,37 @@ bool gated_gelu(int k, int half, int m, int batch, int threads, bool quantized =
             magnitudes[i] = magnitude[0] * std::fabs(gelu(sum[1])) + std::fabs(sum[0]) * 1.13 * magnitude[1];
         }
     }
-    char name[128];
-    std::snprintf(name, sizeof name, "gated GELU after linear %d -> 2 x %d, %d rows x %d", k, half, m, batch);
+    const std::string label = std::format("gated GELU after linear {} -> 2 x {}, {} rows x {}", k, half, m, batch);
+    const char * const name = label.c_str();
     const auto exact_at = [&](std::int64_t i, double & magnitude) {
         magnitude = magnitudes[static_cast<std::size_t>(i)];
         return exact[static_cast<std::size_t>(i)];
     };
-    const bool ok = quantized ? run_quantized(name, ctx, out, threads, exact_at) : run(name, ctx, out, threads, exact_at, kAmxProducts);
+    const bool ok = bits == 16  ? run_half(name, ctx, out, threads, exact_at)
+                    : bits != 0 ? run_quantized(name, ctx, out, threads, exact_at, bits)
+                                : run(name, ctx, out, threads, exact_at, kAmxProducts);
     ggml_free(ctx);
     return ok;
 }
 
-}  // namespace
-
-int main(int argc, char ** argv) {
-    if (argc < 2) {
-        std::fprintf(stderr, "usage: %s conv2d|mul_mat|attention|gated|fusion|store|quantized [threads]\n", argv[0]);
+int run(int argc, char ** const argv) {
+    const std::vector<std::string_view> arguments = sdasm::program_arguments(argc, argv);
+    const std::string_view program = arguments.empty() ? "sdasm_ops_test" : arguments.front();
+    int threads = static_cast<int>(std::thread::hardware_concurrency());
+    if (arguments.size() > 2) {
+        const std::string_view count = arguments[2];
+        const auto [end, error] = std::from_chars(count.begin(), count.end(), threads);
+        if (error != std::errc{} || end != count.end() || threads < 1) {
+            std::print(stderr, "{}: {} is not a number of threads\n", program, count);
+            return 2;
+        }
+    }
+    if (arguments.size() < 2) {
+        std::print(stderr, "usage: {} conv2d|mul_mat|attention|gated|fusion|store|quantized|half [threads]\n", program);
         return 2;
     }
-    const std::string what = argv[1];
-    const int threads = argc > 2 ? std::atoi(argv[2]) : static_cast<int>(std::thread::hardware_concurrency());
-    std::printf("%d threads\n", threads);
+    const std::string_view what = arguments[1];
+    std::print("{} threads\n", threads);
     bool ok = true;
     if (what == "conv2d") {
         const Conv_case cases[] = {
@@ -680,7 +833,10 @@ int main(int argc, char ** argv) {
             ok = mul_mat(c, threads) && ok;
         }
     }
-    else if (what == "quantized") {
+    else if (what == "quantized" || what == "half") {
+        // The same cases of products of integers (quantized) and of 16 bits
+        // (half).
+        const int bits = what == "half" ? 16 : 8;
         // Winograd's convolutions of small and large images, and the direct
         // ones, of the cases above.
         const Conv_case conv_cases[] = {
@@ -695,7 +851,7 @@ int main(int argc, char ** argv) {
             {96, 16, 32, 17, 3, 3, 1, 1, 1, 1, 1, 1, 1, GGML_TYPE_F32},
         };
         for (const auto & c : conv_cases) {
-            ok = conv2d(c, threads, true) && ok;
+            ok = conv2d(c, threads, bits) && ok;
         }
         // The linear layers of 256 rows and more, which are quantized, sizes of
         // no multiple of a panel or a group among them; and of fewer, which
@@ -710,13 +866,47 @@ int main(int argc, char ** argv) {
             {768, 320, 77, 2, GGML_TYPE_F16},
         };
         for (const auto & c : cases) {
-            ok = mul_mat(c, threads, true) && ok;
+            ok = mul_mat(c, threads, bits) && ok;
         }
         // The gated GELU after the product, fused; and of halves of no multiple
         // of a panel, apart.
-        ok = gated_gelu(320, 1280, 200, 2, threads, true) && ok;
-        ok = gated_gelu(96, 2000, 300, 1, threads, true) && ok;
-        ok = gated_gelu(40, 100, 300, 1, threads, true) && ok;
+        ok = gated_gelu(320, 1280, 200, 2, threads, bits) && ok;
+        ok = gated_gelu(96, 2000, 300, 1, threads, bits) && ok;
+        ok = gated_gelu(40, 100, 300, 1, threads, bits) && ok;
+        if (bits == 8) {
+            // Groups of 128 and of 256 numbers of k, which AMX-INT8's tiles take
+            // two and four tiles of k at a time, and of 32, which they leave to
+            // the vector units: a linear layer and a gated GELU of each, of
+            // shapes of their own.
+            const sdasm::Tuning saved = sdasm::tuning();
+            for (const int group : {128, 256, 32}) {
+                sdasm::Tuning t = saved;
+                t.group = group;
+                sdasm::set_tuning(t);
+                std::print("groups of {} numbers of k:\n", group);
+                ok = mul_mat({640, 384, 300, 1, GGML_TYPE_F16}, threads, bits) && ok;
+                ok = gated_gelu(256, 640, 300, 1, threads, bits) && ok;
+            }
+            // Weights of 7 bits with inputs of 8, and of 8 with inputs of 7:
+            // integers narrow enough for vpmaddubsw, which AVX2 without VNNI
+            // takes them with -- the linear layers' products, whose unsigned
+            // operand is A, and the convolutions' and attention's, whose is B.
+            for (const auto & [weights, inputs] : {std::pair{7, 8}, std::pair{8, 7}}) {
+                sdasm::Tuning t = saved;
+                t.input_bits = inputs;
+                sdasm::set_tuning(t);
+                std::print("weights of {} bits, inputs of {}:\n", weights, inputs);
+                ok = mul_mat({640, 384, 300, 1, GGML_TYPE_F16}, threads, weights) && ok;
+                ok = mul_mat({77, 100, 300, 1, GGML_TYPE_F32}, threads, weights) && ok;
+                ok = gated_gelu(256, 640, 300, 1, threads, weights) && ok;
+                ok = conv2d({64, 64, 64, 48, 3, 3, 1, 1, 1, 1, 1, 1, 2, GGML_TYPE_F16}, threads, weights) && ok;
+                ok = conv2d({33, 33, 24, 30, 3, 3, 2, 2, 1, 1, 1, 1, 1, GGML_TYPE_F16}, threads, weights) && ok;
+                ok = conv2d({17, 13, 5, 7, 3, 3, 1, 1, 1, 1, 1, 1, 3, GGML_TYPE_F32}, threads, weights) && ok;
+                ok = attention({40, 300, 4096, 2, 2, 2, GGML_TYPE_F32}, threads, weights) && ok;
+                ok = attention({13, 37, 290, 4, 2, 3, GGML_TYPE_F32}, threads, weights) && ok;
+            }
+            sdasm::set_tuning(saved);
+        }
         // Self-attention, over enough keys to be quantized, and cross-attention,
         // over too few, in single precision.
         const Attention_case attention_cases[] = {
@@ -727,7 +917,7 @@ int main(int argc, char ** argv) {
             {13, 37, 290, 4, 2, 3, GGML_TYPE_F32},
         };
         for (const auto & c : attention_cases) {
-            ok = attention(c, threads, true) && ok;
+            ok = attention(c, threads, bits) && ok;
         }
     }
     else if (what == "attention") {
@@ -759,21 +949,21 @@ int main(int argc, char ** argv) {
     }
     else if (what == "fusion") {
         // A convolution, its bias in place, and the input added in place after.
-        ok = fusion("conv2d, bias", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 24, 40);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 24, 2);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 40);
+        ok = fusion("conv2d, bias", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 24, 40);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 24, 2);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 40);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(b, 1.0f);
-                 ggml_tensor * y = ggml_conv_2d_direct(ctx, w, x, 1, 1, 1, 1, 1, 1);
+                 ggml_tensor * const y = ggml_conv_2d_direct(ctx, w, x, 1, 1, 1, 1, 1, 1);
                  return ggml_add_inplace(ctx, y, ggml_reshape_4d(ctx, b, 1, 1, 40, 1));
              }) && ok;
-        ok = fusion("conv2d 1x1, bias, scale per image", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, 16, 20);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 17, 9, 16, 2);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 20);
-                 ggml_tensor * e = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 20, 2);
+        ok = fusion("conv2d 1x1, bias, scale per image", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, 16, 20);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 17, 9, 16, 2);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 20);
+                 ggml_tensor * const e = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 20, 2);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(b, 1.0f);
@@ -782,11 +972,11 @@ int main(int argc, char ** argv) {
                  y = ggml_add_inplace(ctx, y, ggml_reshape_4d(ctx, b, 1, 1, 20, 1));
                  return ggml_mul_inplace(ctx, y, e);
              }) && ok;
-        ok = fusion("conv2d by Winograd, bias, residual", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 16, 24);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 66, 40, 16, 1);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
-                 ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 66, 40, 24, 1);
+        ok = fusion("conv2d by Winograd, bias, residual", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 16, 24);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 66, 40, 16, 1);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
+                 ggml_tensor * const r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 66, 40, 24, 1);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(b, 1.0f);
@@ -798,11 +988,11 @@ int main(int argc, char ** argv) {
         // Residual connections: the sum of the operation's output and another
         // tensor written to a tensor of its own, the operation's output on the
         // left of the addition or on the right.
-        ok = fusion("conv2d, bias, residual not in place", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 24, 40);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 24, 2);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 40);
-                 ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 40, 2);
+        ok = fusion("conv2d, bias, residual not in place", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 24, 40);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 24, 2);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 40);
+                 ggml_tensor * const r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 40, 2);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(b, 1.0f);
@@ -811,20 +1001,20 @@ int main(int argc, char ** argv) {
                  y = ggml_add_inplace(ctx, y, ggml_reshape_4d(ctx, b, 1, 1, 40, 1));
                  return ggml_add(ctx, y, r);
              }) && ok;
-        ok = fusion("conv2d of small images by Winograd, residual on the left", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 64, 48);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 16, 64, 2);
-                 ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 16, 48, 2);
+        ok = fusion("conv2d of small images by Winograd, residual on the left", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 64, 48);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 16, 64, 2);
+                 ggml_tensor * const r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 16, 16, 48, 2);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(r, 1.0f);
                  return ggml_add(ctx, r, ggml_conv_2d_direct(ctx, w, x, 1, 1, 1, 1, 1, 1));
              }) && ok;
-        ok = fusion("linear, bias, residual not in place", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 96, 70);
-                 ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 96, 50, 2);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 70);
-                 ggml_tensor * r = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 70, 50, 2);
+        ok = fusion("linear, bias, residual not in place", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 96, 70);
+                 ggml_tensor * const x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 96, 50, 2);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 70);
+                 ggml_tensor * const r = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 70, 50, 2);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(b, 1.0f);
@@ -834,11 +1024,11 @@ int main(int argc, char ** argv) {
         // Residual connections whose sum is written in the memory of the
         // residual, as the allocator often has it: begun from the residual. The
         // residual is a copy, made anew by each computation of the graph.
-        ok = fusion("conv2d, bias, residual in its own memory", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, 96, 40);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 96, 2);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 40);
-                 ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 40, 2);
+        ok = fusion("conv2d, bias, residual in its own memory", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, 1, 96, 40);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 96, 2);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 40);
+                 ggml_tensor * const r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 40, 36, 40, 2);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(b, 1.0f);
@@ -847,11 +1037,11 @@ int main(int argc, char ** argv) {
                  y = ggml_add_inplace(ctx, y, ggml_reshape_4d(ctx, b, 1, 1, 40, 1));
                  return ggml_add_inplace(ctx, ggml_dup(ctx, r), y);
              }, 1e-6) && ok;
-        ok = fusion("conv2d by Winograd, residual in its own memory", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 16, 24);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 66, 40, 16, 1);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
-                 ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 66, 40, 24, 1);
+        ok = fusion("conv2d by Winograd, residual in its own memory", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 16, 24);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 66, 40, 16, 1);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 24);
+                 ggml_tensor * const r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 66, 40, 24, 1);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(b, 1.0f);
@@ -860,39 +1050,39 @@ int main(int argc, char ** argv) {
                  y = ggml_add_inplace(ctx, y, ggml_reshape_4d(ctx, b, 1, 1, 24, 1));
                  return ggml_add_inplace(ctx, ggml_dup(ctx, r), y);
              }, 1e-6) && ok;
-        ok = fusion("conv2d of small images by Winograd, residual in its own memory", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 64, 48);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 15, 9, 64, 2);
-                 ggml_tensor * r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 15, 9, 48, 2);
+        ok = fusion("conv2d of small images by Winograd, residual in its own memory", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 64, 48);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 15, 9, 64, 2);
+                 ggml_tensor * const r = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 15, 9, 48, 2);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(r, 1.0f);
                  return ggml_add_inplace(ctx, ggml_dup(ctx, r), ggml_conv_2d_direct(ctx, w, x, 1, 1, 1, 1, 1, 1));
              }, 1e-6) && ok;
-        ok = fusion("linear, bias, residual in its own memory", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 300, 70);
-                 ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 300, 1100, 2);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 70);
-                 ggml_tensor * r = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 70, 1100, 2);
+        ok = fusion("linear, bias, residual in its own memory", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 300, 70);
+                 ggml_tensor * const x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 300, 1100, 2);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 70);
+                 ggml_tensor * const r = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 70, 1100, 2);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(b, 1.0f);
                  fill(r, 1.0f);
                  return ggml_add_inplace(ctx, ggml_dup(ctx, r), ggml_add_inplace(ctx, ggml_mul_mat(ctx, w, x), b));
              }, 1e-6) && ok;
-        ok = fusion("linear, bias", threads, [](ggml_context * ctx) {
-                 ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 96, 70);
-                 ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 96, 50, 2);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 70);
+        ok = fusion("linear, bias", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 96, 70);
+                 ggml_tensor * const x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 96, 50, 2);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 70);
                  fill(w, 0.25f);
                  fill(x, 1.0f);
                  fill(b, 1.0f);
                  return ggml_add_inplace(ctx, ggml_mul_mat(ctx, w, x), b);
              }) && ok;
-        ok = fusion("group norm, scale, shift, SiLU", threads, [](ggml_context * ctx) {
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 36, 20, 64, 2);
-                 ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 64, 1);
-                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 64, 1);
+        ok = fusion("group norm, scale, shift, SiLU", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 36, 20, 64, 2);
+                 ggml_tensor * const g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 64, 1);
+                 ggml_tensor * const b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 64, 1);
                  fill(x, 3.0f);
                  fill(g, 1.0f);
                  fill(b, 1.0f);
@@ -901,10 +1091,10 @@ int main(int argc, char ** argv) {
                  y = ggml_add_inplace(ctx, y, b);
                  return ggml_silu_inplace(ctx, y);
              }) && ok;
-        ok = fusion("group norm of rows of no multiple of eight, scale, shift", threads, [](ggml_context * ctx) {
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 13, 7, 30, 1);
-                 ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 30, 1);
-                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 30, 1);
+        ok = fusion("group norm of rows of no multiple of eight, scale, shift", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 13, 7, 30, 1);
+                 ggml_tensor * const g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 30, 1);
+                 ggml_tensor * const b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 30, 1);
                  fill(x, 3.0f);
                  fill(g, 1.0f);
                  fill(b, 1.0f);
@@ -913,10 +1103,10 @@ int main(int argc, char ** argv) {
                  y = ggml_add_inplace(ctx, y, b);
                  return ggml_silu_inplace(ctx, y);
              }) && ok;
-        ok = fusion("layer norm, scale, shift", threads, [](ggml_context * ctx) {
-                 ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 320, 77, 2);
-                 ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 320);
-                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 320);
+        ok = fusion("layer norm, scale, shift", threads, [](ggml_context * const ctx) {
+                 ggml_tensor * const x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 320, 77, 2);
+                 ggml_tensor * const g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 320);
+                 ggml_tensor * const b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 320);
                  fill(x, 3.0f);
                  fill(g, 1.0f);
                  fill(b, 1.0f);
@@ -928,35 +1118,63 @@ int main(int argc, char ** argv) {
     else if (what == "store") {
         // The store keeps nothing unless the environment gives it a budget.
         setenv("SDASM_STORE_MB", "1024", 0);
-        ok = store("conv2d", threads, [](ggml_context * ctx, ggml_tensor ** weights) {
+        ok = store("conv2d", threads, [](ggml_context * const ctx, ggml_tensor ** const weights) {
                  *weights = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 16, 24);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 20, 12, 16, 2);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 20, 12, 16, 2);
                  return ggml_conv_2d_direct(ctx, *weights, x, 1, 1, 1, 1, 1, 1);
              }) && ok;
-        ok = store("conv2d by Winograd", threads, [](ggml_context * ctx, ggml_tensor ** weights) {
+        ok = store("conv2d by Winograd", threads, [](ggml_context * const ctx, ggml_tensor ** const weights) {
                  *weights = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 16, 24);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 32, 16, 1);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, 32, 16, 1);
                  return ggml_conv_2d_direct(ctx, *weights, x, 1, 1, 1, 1, 1, 1);
              }) && ok;
-        ok = store("conv2d of shared columns", threads, [](ggml_context * ctx, ggml_tensor ** weights) {
+        ok = store("conv2d of shared columns", threads, [](ggml_context * const ctx, ggml_tensor ** const weights) {
                  *weights = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 3, 3, 40, 64);
-                 ggml_tensor * x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 8, 8, 40, 2);
+                 ggml_tensor * const x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 8, 8, 40, 2);
                  return ggml_conv_2d_direct(ctx, *weights, x, 1, 1, 1, 1, 1, 1);
              }) && ok;
-        ok = store("linear", threads, [](ggml_context * ctx, ggml_tensor ** weights) {
+        ok = store("linear", threads, [](ggml_context * const ctx, ggml_tensor ** const weights) {
                  *weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 80);
-                 ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 2000);
+                 ggml_tensor * const x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 2000);
                  return ggml_mul_mat(ctx, *weights, x);
              }) && ok;
-        ok = store("linear of shared rows", threads, [](ggml_context * ctx, ggml_tensor ** weights) {
+        ok = store("linear of shared rows", threads, [](ggml_context * const ctx, ggml_tensor ** const weights) {
                  *weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, 64, 80);
-                 ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 50);
+                 ggml_tensor * const x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 50);
                  return ggml_mul_mat(ctx, *weights, x);
              }) && ok;
     }
     else {
-        std::fprintf(stderr, "unknown operation '%s'\n", what.c_str());
+        std::print(stderr, "unknown operation '{}'\n", what);
         return 2;
     }
     return ok ? 0 : 1;
+}
+
+// A line of what went wrong on the standard error, which throws nothing: a
+// line that cannot be written goes unwritten.
+void report(std::string_view what, std::string_view detail) noexcept {
+    try {
+        std::print(stderr, "{}{}\n", what, detail);
+    }
+    catch (...) {
+        return;
+    }
+}
+
+}  // namespace
+
+// An exception -- of a container short of memory, say -- ends the test as a
+// failure, with what it says.
+int main(int argc, char ** const argv) {
+    try {
+        return run(argc, argv);
+    }
+    catch (const std::exception & e) {
+        report("FAIL: ", e.what());
+    }
+    catch (...) {
+        report("FAIL: ", "an exception of no known type");
+    }
+    return 1;
 }

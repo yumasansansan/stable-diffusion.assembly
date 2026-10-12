@@ -19,26 +19,29 @@
 # whatever stops is the kernels' own.
 #
 # The models, by default: Haswell (AVX2 alone), Skylake-SP (AVX-512 F, CD, VL,
-# BW, DQ), Ice Lake-SP (and VNNI, VBMI, VBMI2, BITALG, VPOPCNTDQ, IFMA, GFNI,
-# VAES, VPCLMULQDQ), Sapphire Rapids (and BF16, FP16, AMX-BF16), Arrow Lake
-# (AVX2 with AVX-VNNI and AVX-NE-CONVERT, no AVX-512) and Granite Rapids
-# (AVX10.1, AMX-FP16). Each operation is tested at every level of the kernels
+# BW, DQ), Cooper Lake (and AVX512-BF16, no AMX), Ice Lake-SP (and VNNI, VBMI,
+# VBMI2, BITALG, VPOPCNTDQ, IFMA, GFNI, VAES, VPCLMULQDQ), Sapphire Rapids (and
+# BF16, FP16, AMX-BF16), Arrow Lake (AVX2 with AVX-VNNI and AVX-NE-CONVERT, no
+# AVX-512), Granite Rapids (AVX10.1, AMX-FP16), Nova Lake (AVX10.2, no AMX) and
+# Diamond Rapids (AVX10.2 and AMX): every form of the products of 16 bits among
+# them. Each operation is tested at every level of the kernels
 # the model has (tests/ops_test.cc), and the convolutions of three by three
 # by F(2x2, 3x3) alone as well (f2x2), and directly, without Winograd's
 # transform (direct); and the products quantized to integers (quantized),
-# AVX512-VNNI's and AVX-VNNI's kernels against the C++ ones.
+# AVX512-VNNI's and AVX-VNNI's kernels and, on Haswell, vpmaddubsw's of seven
+# bits against the C++ ones, and those of 16 bits (half).
 set -euo pipefail
 
 sde=$1
 shift
 models=("$@")
 if [[ ${#models[@]} -eq 0 ]]; then
-  models=(hsw skx icx spr arl gnr)
+  models=(hsw skx cpx icx spr arl gnr nvl dmr)
 fi
 test=build/emulated/tests/sdasm_ops_test
 status=0
 for model in "${models[@]}"; do
-  for op in conv2d f2x2 direct mul_mat attention gated fusion store quantized; do
+  for op in conv2d f2x2 direct mul_mat attention gated fusion store quantized half; do
     if [[ $op == direct ]]; then
       log=$(SDASM_TUNE=winograd=0 "$sde" "-$model" -- "$test" conv2d 4 2>&1) || status=1
     elif [[ $op == f2x2 ]]; then
