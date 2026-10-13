@@ -215,6 +215,20 @@ struct Split_form {
 
 Split_form split_form(Split_use use);
 
+// The format of the products of 16 bits (Tuning::bits) on the vector units, at
+// the level avx512, by Tuning::half_format: 0 as fits -- AVX10.2's vdpphps of
+// FP16 where there is, else AVX512-FP16's vfmadd231ph, else AVX512-BF16's
+// vdpbf16ps -- 1 bfloat16 and 2 AVX512-FP16, wherever there are; none where the
+// processor has none of them. AVX512-FP16 before AVX512-BF16: the processors
+// with both are Intel's, since Sapphire Rapids, whose vdpbf16ps is four uops,
+// two cycles apart, half the products of their FMAs (uops.info, Emerald Rapids
+// and Alder Lake-P's cores), where vfmadd231ph makes twice them; and the FP16
+// weights' products are exact. On GitHub's Emerald and Granite Rapids, the
+// linear layers in bfloat16 were 0.54 to 0.67 times as fast as in single
+// precision, and in FP16 1.1 to 1.7 times, with half the error.
+enum class Half_vectors { none, avx10_2, fp16, bf16 };
+Half_vectors half_vectors();
+
 // The thread's tiles configured for the form, when it is on them, before its
 // first block; and given back after its last.
 void split_begin(const Split_form & form);

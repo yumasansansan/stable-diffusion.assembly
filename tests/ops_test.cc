@@ -311,10 +311,11 @@ struct Half_form {
     int format;
 };
 
-// The forms of the processor, each in the format the kernels take by default;
-// and at the level avx512, the formats they leave out where the processor has
-// more than one -- bfloat16 beside AVX10.2's, AVX512-FP16's beside either --
-// so that each kernel of 16 bits the processor can run is run.
+// The forms of the processor, each in the format the kernels take by default
+// (sdasm::half_vectors()); and at the level avx512, the formats they leave out
+// where the processor has more than one -- bfloat16 beside AVX10.2's or
+// AVX512-FP16's, AVX512-FP16's beside AVX10.2's -- so that each kernel of 16
+// bits the processor can run is run, attention's of bfloat16 among them.
 std::vector<Half_form> half_forms() {
     std::vector<Half_form> all;
     for (const Form & f : forms(false)) {
@@ -322,10 +323,10 @@ std::vector<Half_form> half_forms() {
     }
     const sdasm::Cpu & c = sdasm::cpu();
     if (sdasm::isa_available() >= sdasm::Isa::avx512) {
-        if (c.avx512_bf16 && c.avx10_2) {
+        if (c.avx512_bf16 && (c.avx10_2 || c.avx512_fp16)) {
             all.push_back({{"avx512 bfloat16", sdasm::Kernels::assembly, sdasm::Isa::avx512}, 1});
         }
-        if (c.avx512_fp16 && (c.avx10_2 || c.avx512_bf16)) {
+        if (c.avx512_fp16 && c.avx10_2) {
             all.push_back({{"avx512 fp16", sdasm::Kernels::assembly, sdasm::Isa::avx512}, 2});
         }
     }

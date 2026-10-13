@@ -97,10 +97,10 @@ SD 1.5 自身の活性で測ると，各演算の出力と正確な値との差�
 `SDASM_TUNE=bits=16` を指定すると，対応するプロセッサでは積を 16 ビットの数で，元の積 1 つにつき 1 つの積として計算します．厳密な経路が AMX のタイル上で各数を 2 つや 3 つの部分に分けるところを，最初の部分だけで計算します（`x86_64/half.S`）．
 
 - AMX のタイルでは bfloat16 の x1 w1 で，各積と正確な積との差は 2⁻⁸ 以内です．AMX-FP16（Granite Rapids）では FP16 の重みをそのまま使い，相手を FP16 に丸めた w x1 で，各積は正確です（ggml 自身の積と同じで，stable-diffusion.cpp と同じ精度）．attention は bfloat16 の x1 y1 です．
-- AMX がなく AVX-512 を持つプロセッサではベクトルユニットで計算します．AVX10.2 があれば `vdpphps`（FP16 のペアを単精度で足す．AMX-FP16 と同じ積）を使います．AVX10.2 がなければ AVX512-BF16 の `vdpbf16ps`（Zen 4・5）を使い，AVX512-FP16 はあって AVX512-BF16 がないプロセッサでは AVX512-FP16 の `vfmadd231ph` を使います．`vfmadd231ph` は FP16 で足すので，積 32 個ごとに和を単精度へ移します．`half_format=1` は bfloat16，`half_format=2` は AVX512-FP16 を，持っていれば必ず使います．
-- 単精度どうしの積である Winograd の積は，タイルでは bfloat16 で，ベクトルユニットでは単精度のままです．attention は AVX512-BF16 でも bfloat16 です．
+- AMX がなく AVX-512 を持つプロセッサではベクトルユニットで計算します．AVX10.2 があれば `vdpphps`（FP16 のペアを単精度で足す．AMX-FP16 と同じ積）を使います．AVX10.2 がなければ AVX512-FP16 の `vfmadd231ph`（Sapphire Rapids 以降の Intel のコア）を使います．FP16 の重みとの積は正確ですが，FP16 で足し，積 32 個ごとに和を単精度へ移すので，相手のオペランドと積 32 個の和は FP16 の範囲（65504）に収まる必要があります（AMX-FP16 のタイルと同じ）．どちらもなければ AVX512-BF16 の `vdpbf16ps`（Zen 4・5）を使います．Intel のコアは `vdpbf16ps` を 4 µop に分けて 2 サイクルに 1 回しか実行できず，FMA の半分の積しか計算できません．`vfmadd231ph` はその 2 倍で，誤差も bfloat16 の半分です．`half_format=1` は bfloat16，`half_format=2` は AVX512-FP16 を，持っていれば必ず使います．
+- 単精度どうしの積である Winograd の積は，タイルでは bfloat16 で，ベクトルユニットでは単精度のままです．16 ビットにすると F(2x2, 3x3) になり，単精度の F(4x4, 3x3) の 2.25 倍の積が要るからです．attention はタイルでは bfloat16 で，ベクトルユニットでは形式が bfloat16 のときだけ bfloat16，それ以外では単精度のままです．
 
-それ以外（i7-1360P のように AVX2 だけの場合）では，積は単精度のままです．`tests/ops_test.cc half` は各形態を足し合わせた積の絶対値の和の 8 × 10⁻³ 以内に保つことを確かめ，SDE 上で Cooper Lake・Sapphire Rapids・Granite Rapids・Nova Lake（AVX10.2）・Diamond Rapids として実行しています．速さは，ワークフロー `Measure` が GitHub のランナーで計時します（変種 `half`・`half-avx512`・`half-bf16`・`half-fp16`）．AVX512-BF16 のベクトルユニットでの線形層は，単精度に比べて Zen 4 で 1.5〜1.9 倍，Zen 5 で 1.0〜1.6 倍速い一方，Emerald Rapids と Granite Rapids では 0.55〜0.65 倍に遅くなります．これらの既定はタイルで，その上では厳密な経路のそれぞれ 1.3〜1.8 倍，1.1〜1.3 倍速くなります．
+それ以外（i7-1360P のように AVX2 だけの場合）では，積は単精度のままです．`tests/ops_test.cc half` は各形態を足し合わせた積の絶対値の和の 8 × 10⁻³ 以内に保つことを確かめ，SDE 上で Cooper Lake・Sapphire Rapids・Granite Rapids・Nova Lake（AVX10.2）・Diamond Rapids として実行しています．速さは，ワークフロー `Measure` が GitHub のランナーで計時します（変種 `half`・`half-avx512`・`half-bf16`・`half-fp16`）．AVX512-BF16 のベクトルユニットでの線形層は，単精度に比べて Zen 4 で 1.5〜1.9 倍，Zen 5 で 1.0〜1.6 倍速い一方，Emerald Rapids と Granite Rapids では 0.55〜0.65 倍に遅くなります．そのためこれらのベクトルユニットでは AVX512-FP16 を使い（1.1〜1.7 倍），既定はタイルで，その上では厳密な経路のそれぞれ 1.3〜1.8 倍，1.1〜1.3 倍速くなります．ベクトルユニットでの bfloat16 の Winograd は，Zen 4・5 の 32×32 の格子で 0.47〜0.68 倍，これらの Intel では 0.26〜0.66 倍，attention はこれらの Intel で 0.29〜0.65 倍でした．
 
 ### attention のキーと値を粗い格子から取る
 

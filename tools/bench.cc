@@ -368,6 +368,10 @@ int run(int argc, char ** const argv) {
                 std::print(stderr, "{}: this processor has no products of 16 bits; leaving {} out\n", program, c.label);
                 continue;
             }
+            if (c.tuning.half_format == 1 && !cpu.avx512_bf16) {
+                std::print(stderr, "{}: this processor has no AVX512-BF16; leaving {} out\n", program, c.label);
+                continue;
+            }
             if (c.tuning.half_format == 2 && !cpu.avx512_fp16) {
                 std::print(stderr, "{}: this processor has no AVX512-FP16; leaving {} out\n", program, c.label);
                 continue;

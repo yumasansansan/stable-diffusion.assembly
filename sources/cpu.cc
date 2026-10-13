@@ -311,41 +311,64 @@ Microkernel microkernel() {
     return gemm_6x16_cxx;
 }
 
+Half_vectors half_vectors() {
+    if (!avx512_kernels()) {
+        return Half_vectors::none;
+    }
+    const Cpu & c = cpu();
+    switch (tuning().half_format) {
+    case 1:
+        return c.avx512_bf16 ? Half_vectors::bf16 : Half_vectors::none;
+    case 2:
+        return c.avx512_fp16 ? Half_vectors::fp16 : Half_vectors::none;
+    default:
+        break;
+    }
+    if (c.avx10_2) {
+        return Half_vectors::avx10_2;
+    }
+    if (c.avx512_fp16) {
+        return Half_vectors::fp16;
+    }
+    return c.avx512_bf16 ? Half_vectors::bf16 : Half_vectors::none;
+}
+
 Split_form split_form(Split_use use) {
     Split_form f;
 #if SDASM_X86_64
     // With products of 16 bits (Tuning::bits), the same tiles, their first
     // parts multiplied alone (x86_64/half.S): on AMX's tiles; or on the vector
-    // units where there are none -- the products of FP16 weights by AVX10.2's
-    // vdpphps, pairs of FP16 summed in single precision, ggml's own rounding;
-    // or by AVX512-FP16's vfmadd231ph, summed in FP16 a block of k at a time,
-    // as on a processor with AVX512-FP16 and no AMX (and no AVX10.2) or when
-    // Tuning::half_format asks for it; otherwise, and of Winograd's two
-    // operands of single precision, AVX512-BF16's vdpbf16ps.
+    // units where there are none, in the format half_vectors() takes -- the
+    // products of FP16 weights by AVX10.2's vdpphps, pairs of FP16 summed in
+    // single precision, ggml's own rounding, or by AVX512-FP16's vfmadd231ph,
+    // summed in FP16 a block of k at a time; or of bfloat16 by AVX512-BF16's
+    // vdpbf16ps. Winograd's two operands of single precision stay so on the
+    // vector units: of 16 bits, Winograd's F(2x2, 3x3) takes 2.25 times the
+    // products of single precision's F(4x4, 3x3), and was 0.47 to 0.68 times
+    // as fast on the grids of 32 by 32 of Zen 4 and 5 (GitHub's runners).
+    // AVX512-BF16's products of two parts (Tuning::bf16) take them all.
     const bool half = tuning().bits == 16;
     const bool tiles = amx_kernels();
-    const int format = tuning().half_format;
-    if (half && !tiles && avx512_kernels() && use != Split_use::winograd) {
-        const bool avx10 = cpu().avx10_2 && format == 0;
-        const bool fp16 = !avx10 && cpu().avx512_fp16 && (format == 2 || (format == 0 && !cpu().avx512_bf16));
-        if (avx10 || fp16) {
-            f.fp16 = true;
-            if (use == Split_use::linear) {
-                f.kernel = avx10 ? sdasm_avx10_fp16_1x1_a2 : sdasm_fp16_1x1_a2_avx512;
-                f.b_bytes = kAmxTileBytes / 2;
-            }
-            else {
-                f.kernel = avx10 ? sdasm_avx10_fp16_1x1_b2 : sdasm_fp16_1x1_b2_avx512;
-                f.a_bytes = kAmxTileBytes / 2;
-            }
-            f.pack_rows = sdasm_amx_pack_rows_fp16;
-            f.pack_weights = sdasm_amx_pack_weights_fp16;
-            f.pack_weight_rows = sdasm_amx_pack_rows_f16_one;
-            f.pack_panel = sdasm_amx_pack_panel_fp16;
-            return f;
+    const Half_vectors v = half && !tiles ? half_vectors() : Half_vectors::none;
+    if (use != Split_use::winograd && (v == Half_vectors::avx10_2 || v == Half_vectors::fp16)) {
+        const bool avx10 = v == Half_vectors::avx10_2;
+        f.fp16 = true;
+        if (use == Split_use::linear) {
+            f.kernel = avx10 ? sdasm_avx10_fp16_1x1_a2 : sdasm_fp16_1x1_a2_avx512;
+            f.b_bytes = kAmxTileBytes / 2;
         }
+        else {
+            f.kernel = avx10 ? sdasm_avx10_fp16_1x1_b2 : sdasm_fp16_1x1_b2_avx512;
+            f.a_bytes = kAmxTileBytes / 2;
+        }
+        f.pack_rows = sdasm_amx_pack_rows_fp16;
+        f.pack_weights = sdasm_amx_pack_weights_fp16;
+        f.pack_weight_rows = sdasm_amx_pack_rows_f16_one;
+        f.pack_panel = sdasm_amx_pack_panel_fp16;
+        return f;
     }
-    const bool vector = !tiles && avx512_kernels() && cpu().avx512_bf16 && (tuning().bf16 != 0 || half);
+    const bool vector = !tiles && avx512_kernels() && cpu().avx512_bf16 &&
+                        (tuning().bf16 != 0 || (v == Half_vectors::bf16 && use != Split_use::winograd));
     if (!tiles && !vector) {
         return f;
     }

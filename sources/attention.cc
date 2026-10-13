@@ -307,14 +307,20 @@ constexpr std::int64_t kBlock = 32;           // the rows and columns of a block
 constexpr std::int64_t kBlockHalves = 1536;   // a block of k of a tile's rows or columns, three parts of two bytes
 
 // On the tiles, or, with products of 16 bits (Tuning::bits), on AVX512-BF16's
-// vector units where there are no tiles: the same tiles in memory, the first
-// parts of each multiplied alone (x86_64/half.S).
+// vector units where there are no tiles and the format of the products of 16
+// bits there is bfloat16 (half_vectors(): AVX512-BF16 without AVX512-FP16, or
+// half_format=1): the same tiles in memory, the first parts of each multiplied
+// alone (x86_64/half.S). Elsewhere attention stays in single precision: of
+// FP16 it has no kernel, and on the processors whose format is FP16, Intel's,
+// vdpbf16ps makes half the products of their FMAs -- attention in bfloat16
+// was 0.29 to 0.65 times as fast as in single precision on GitHub's Emerald
+// and Granite Rapids.
 bool half_products() {
     return tuning().bits == 16;
 }
 
 bool on_vectors(const Attention &) {
-    return half_products() && !amx_kernels() && avx512_kernels() && cpu().avx512_bf16;
+    return half_products() && !amx_kernels() && half_vectors() == Half_vectors::bf16;
 }
 
 // In single precision, attention on the tiles takes six products for each one,
